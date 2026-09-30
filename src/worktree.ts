@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { mkdir, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { git, GitError } from "./git.js";
 import { ensureExcluded } from "./paths.js";
@@ -53,7 +53,8 @@ export async function createWorktree(o: {
     throw e;
   }
   const head = (await git(["rev-parse", "HEAD"], path)).trim();
-  return { path, branch: o.branch, head, prunable: false };
+  // Canonical case and long names, matching what git records and listWorktrees returns.
+  return { path: await realpath(path), branch: o.branch, head, prunable: false };
 }
 
 export async function listWorktrees(repo: string): Promise<Worktree[]> {

@@ -120,6 +120,23 @@ describe("createWorktree rollback", () => {
   });
 });
 
+describe("path canonicalization", () => {
+  it.runIf(process.platform === "win32")(
+    "returns the same path createWorktree and listWorktrees agree on, whatever case the caller used",
+    async () => {
+      const lower = repo.toLowerCase();
+      const wt = await createWorktree({
+        repo: lower,
+        path: worktreePath(lower, "r1", "root"),
+        branch: "rivet/r1/root",
+        from: "main",
+      });
+      const listed = (await listWorktrees(repo))[1]!;
+      expect(wt.path).toBe(listed.path);
+    },
+  );
+});
+
 describe("listWorktrees", () => {
   it("lists the main checkout and created worktrees", async () => {
     const path = worktreePath(repo, "r1", "root");
