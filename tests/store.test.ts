@@ -1,22 +1,33 @@
-import { readdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { git } from "../src/git.js";
 import { assertId } from "../src/paths.js";
-import { listRuns, loadRun, newRunId, runFile, RunStoreError, saveRun, type Run } from "../src/store.js";
+import { newRunId, openStore, RunStoreError, type Run, type Store } from "../src/store.js";
 import { buildTree, setStatus } from "../src/tree.js";
-import { makeRepo, removeRepo } from "./helpers.js";
+import { makeDataDir, removeRepo } from "./helpers.js";
 
-let repo: string;
-beforeEach(async () => { repo = await makeRepo(); });
-afterEach(async () => { await removeRepo(repo); });
+let data: string;
+let store: Store;
+beforeEach(async () => {
+  data = await makeDataDir();
+  store = openStore(data);
+});
+afterEach(async () => {
+  store.close();
+  await removeRepo(data);
+});
 
-function sampleRun(id = "r1"): Run {
+function sampleRun(id = "r1", project = "proj"): Run {
   const nodes = buildTree({
-    runId: id, repo, defaultAgent: "claude",
-    plan: { title: "r", prompt: "p", children: [{ title: "a", prompt: "do a" }] },
+    runId: id, project, dataDir: data, defaultAgent: "claude",
+    plan: { title: "r", prompt: "p", children: [{ title: "a", prompt: "do a", files: ["src/a.ts"] }] },
   });
-  return { version: 1, id, repo, base: "main", task: "add login", createdAt: "2026-09-30T10:00:00.000Z", nodes };
+  return {
+    id, project, repo: join(data, "..", "repo"), base: "main", task: "add login",
+    createdAt: "2026-09-30T10:00:00.000Z", nodes,
+  };
 }
 
 describe("newRunId", () => {
@@ -27,124 +38,112 @@ describe("newRunId", () => {
   });
 });
 
+describe("openStore", () => {
+  it("keeps the database at <data>/rivet.db", () => {
+    expect(existsSync(join(data, "rivet.db"))).toBe(true);
+  });
+
+  it("keeps runs across reopening", () => {
+    store.saveRun(sampleRun());
+    store.close();
+    store = openStore(data);
+    expect(store.loadRun("r1").task).toBe("add login");
+  });
+});
+
 describe("saveRun / loadRun", () => {
-  it("round-trips a run", async () => {
+  it("round-trips a run, node order and every field", () => {
     const run = sampleRun();
-    await saveRun(run);
-    expect(await loadRun(repo, "r1")).toEqual(run);
-    expect(runFile(repo, "r1")).toBe(join(repo, ".rivet", "runs", "r1.json"));
+    run.nodes = run.nodes.map((n) =>
+      n.id === "root" ? { ...n, prStatus: "pr_open" as const } : { ...n, activity: "waiting_input" as const, summary: "s" },
+    );
+    store.saveRun(run);
+    expect(store.loadRun("r1")).toEqual(run);
   });
 
-  it("overwrites with the latest state and leaves no temp files", async () => {
+  it("overwrites with the latest state", () => {
     const run = sampleRun();
-    await saveRun(run);
-    await saveRun({ ...run, nodes: setStatus(run.nodes, "root.1", "running") });
-    expect((await loadRun(repo, "r1")).nodes[1]!.status).toBe("running");
-    expect(await readdir(dirname(runFile(repo, "r1")))).toEqual(["r1.json"]);
+    store.saveRun(run);
+    store.saveRun({ ...run, nodes: setStatus(run.nodes, "root.1", "running") });
+    expect(store.loadRun("r1").nodes[1]!.status).toBe("running");
+    expect(store.loadRun("r1").nodes).toHaveLength(2);
   });
 
-  it("ignores a temp file left by a crash mid-save", async () => {
-    await saveRun(sampleRun());
-    await writeFile(`${runFile(repo, "r1")}.123.abcd.tmp`, '{"version":1,"id":"r1","nodes":[');
-    expect((await loadRun(repo, "r1")).task).toBe("add login");
-    expect(await listRuns(repo)).toEqual(["r1"]);
+  it("reports a missing run clearly", () => {
+    expect(() => store.loadRun("nope")).toThrow(RunStoreError);
+    expect(() => store.loadRun("nope")).toThrow(/no run nope/);
   });
 
-  it("names the file when it is not valid JSON", async () => {
-    await saveRun(sampleRun());
-    await writeFile(runFile(repo, "r1"), '{"version":1,');
-    await expect(loadRun(repo, "r1")).rejects.toThrow(RunStoreError);
-    await expect(loadRun(repo, "r1")).rejects.toThrow(/r1\.json/);
-  });
-
-  it("rejects a file with the wrong shape", async () => {
-    await saveRun(sampleRun());
-    await writeFile(runFile(repo, "r1"), JSON.stringify({ version: 2, id: "r1", nodes: [] }));
-    await expect(loadRun(repo, "r1")).rejects.toThrow(/r1\.json.*version/);
-  });
-
-  it("rejects a run id that doesn't match the file", async () => {
-    await saveRun(sampleRun());
-    await writeFile(runFile(repo, "r1"), JSON.stringify({ ...sampleRun("r2") }));
-    await expect(loadRun(repo, "r1")).rejects.toThrow(/r1\.json.*id/);
-  });
-
-  it("reports a missing run clearly", async () => {
-    await expect(loadRun(repo, "nope")).rejects.toThrow(/no run nope/);
+  it.each([
+    ["an unknown kind", (r: any) => { r.nodes[0].kind = "bogus"; }],
+    ["an unknown status", (r: any) => { r.nodes[1].status = "zzz"; }],
+    ["an unknown agent", (r: any) => { r.nodes[1].agent = "gpt"; }],
+    ["an unknown activity", (r: any) => { r.nodes[1].activity = "sleeping"; }],
+    ["an unknown PR status", (r: any) => { r.nodes[0].prStatus = "shipped"; }],
+    ["negative attempts", (r: any) => { r.nodes[1].attempts = -1; }],
+    ["a bad node id", (r: any) => { r.nodes[1].id = "../x"; }],
+    ["a branch that is not the node's own", (r: any) => { r.nodes[1].branch = "main"; }],
+    ["a parent that does not exist", (r: any) => { r.nodes[1].parentId = "root.7"; }],
+  ])("refuses to save %s, and keeps the previous state", (_name, mutate) => {
+    store.saveRun(sampleRun());
+    const bad = structuredClone(sampleRun());
+    bad.task = "changed";
+    mutate(bad);
+    expect(() => store.saveRun(bad)).toThrow(RunStoreError);
+    expect(store.loadRun("r1").task).toBe("add login");
   });
 });
 
 describe("listRuns", () => {
-  it("is empty when nothing was saved", async () => {
-    expect(await listRuns(repo)).toEqual([]);
+  it("is empty when nothing was saved", () => {
+    expect(store.listRuns()).toEqual([]);
   });
 
-  it("lists saved runs sorted", async () => {
-    await saveRun(sampleRun("r2"));
-    await saveRun(sampleRun("r1"));
-    expect(await listRuns(repo)).toEqual(["r1", "r2"]);
-  });
-});
-
-describe("overlapping saves", () => {
-  it("never reject, and the last call wins even when an older save is bigger", async () => {
-    const base = sampleRun();
-    const saves = Array.from({ length: 40 }, (_, i) =>
-      saveRun({ ...base, task: `v${i}${"x".repeat((40 - i) * 2000)}` }),
-    );
-    let reading = true;
-    const reader = (async () => {
-      while (reading) await loadRun(repo, "r1").catch(() => {});
-    })();
-
-    const results = await Promise.allSettled(saves);
-    reading = false;
-    await reader;
-
-    expect(results.filter((r) => r.status === "rejected")).toEqual([]);
-    expect((await loadRun(repo, "r1")).task.startsWith("v39")).toBe(true);
-  });
-
-  it("writes the state as it was when saveRun was called", async () => {
-    const run = sampleRun();
-    const pending = saveRun(run);
-    run.task = "changed after the call";
-    await pending;
-    expect((await loadRun(repo, "r1")).task).toBe("add login");
+  it("lists runs sorted, optionally for one project", () => {
+    store.saveRun(sampleRun("r2", "a"));
+    store.saveRun(sampleRun("r1", "b"));
+    expect(store.listRuns()).toEqual(["r1", "r2"]);
+    expect(store.listRuns("a")).toEqual(["r2"]);
   });
 });
 
-describe("loadRun shape checks", () => {
-  type Mutate = (run: any) => void;
-  const cases: [string, Mutate, RegExp][] = [
-    ["a node that is not an object", (r) => { r.nodes[1] = 1; }, /node 1/],
-    ["an unknown kind", (r) => { r.nodes[0].kind = "bogus"; }, /root.*kind/],
-    ["an unknown status", (r) => { r.nodes[1].status = "zzz"; }, /root\.1.*status/],
-    ["an unknown agent", (r) => { r.nodes[1].agent = "gpt"; }, /root\.1.*agent/],
-    ["attempts that are not a count", (r) => { r.nodes[1].attempts = "a"; }, /root\.1.*attempts/],
-    ["a bad node id", (r) => { r.nodes[1].id = "../x"; }, /node 1.*id/],
-    ["a parent that does not exist", (r) => { r.nodes[1].parentId = "root.7"; }, /root\.1.*parent/],
-    ["a branch that is not the node's own", (r) => { r.nodes[1].branch = "main"; }, /root\.1.*branch/],
-    ["a worktree outside the run", (r) => { r.nodes[1].worktree = "C:\\Windows"; }, /root\.1.*worktree/],
-    ["a run from another repo", (r) => { r.repo = "D:\\elsewhere"; }, /repo/],
-    ["a missing task", (r) => { delete r.task; }, /task/],
-  ];
+describe("busy database", () => {
+  it("waits for another writer instead of failing", async () => {
+    store.saveRun(sampleRun());
+    const holder = spawn(process.execPath, [
+      "--no-warnings",
+      "-e",
+      `const { DatabaseSync } = require("node:sqlite");
+       const db = new DatabaseSync(process.argv[1]);
+       db.exec("BEGIN IMMEDIATE");
+       console.log("locked");
+       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+       db.exec("COMMIT");`,
+      join(data, "rivet.db"),
+    ]);
+    await new Promise<void>((ok) => holder.stdout.once("data", () => ok()));
 
-  it.each(cases)("rejects %s", async (_name, mutate, message) => {
-    await saveRun(sampleRun());
-    const run = JSON.parse(JSON.stringify(sampleRun()));
-    mutate(run);
-    await writeFile(runFile(repo, "r1"), JSON.stringify(run));
-    const err = await loadRun(repo, "r1").catch((e) => e);
-    expect(err).toBeInstanceOf(RunStoreError);
-    expect(err.message).toMatch(/r1\.json/);
-    expect(err.message).toMatch(message);
+    expect(() => store.saveRun({ ...sampleRun(), task: "after wait" })).not.toThrow();
+    expect(store.loadRun("r1").task).toBe("after wait");
+    await new Promise((ok) => holder.once("exit", ok));
   });
 });
 
-describe("run files and git", () => {
-  it("keep .rivet/ out of git status from the first save", async () => {
-    await saveRun(sampleRun());
-    expect((await git(["status", "--porcelain"], repo)).trim()).toBe("");
+describe("schema migrations", () => {
+  const versions = () => {
+    const db = new DatabaseSync(join(data, "rivet.db"));
+    try {
+      return (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[])
+        .map((r) => r.version);
+    } finally {
+      db.close();
+    }
+  };
+
+  it("records each applied migration once, across reopening", () => {
+    expect(versions()).toEqual([1]);
+    store.close();
+    store = openStore(data);
+    expect(versions()).toEqual([1]);
   });
 });

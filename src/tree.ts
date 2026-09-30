@@ -7,8 +7,20 @@ export const STATUSES = [
   "pending", "running", "integrating", "done", "failed", "escalated", "skipped",
 ] as const;
 
+// What a leaf's agent session is doing right now.
+export const ACTIVITY_STATES = ["active", "idle", "waiting_input", "blocked", "exited"] as const;
+// Where the root's pull request stands; only the root opens one.
+export const PR_STATUSES = [
+  "working", "pr_open", "draft", "ci_failed", "review_pending", "changes_requested",
+  "approved", "mergeable", "merged", "needs_input", "exited", "idle", "terminated",
+  // An agent that has never reported back: working or stuck can't be told apart.
+  "no_signal",
+] as const;
+
 export type Agent = (typeof AGENTS)[number];
 export type Status = (typeof STATUSES)[number];
+export type ActivityState = (typeof ACTIVITY_STATES)[number];
+export type PrStatus = (typeof PR_STATUSES)[number];
 
 export type PlanNode = {
   title: string;
@@ -32,6 +44,8 @@ export type Node = {
   status: Status;
   attempts: number;
   summary?: string;
+  activity?: ActivityState;
+  prStatus?: PrStatus;
 };
 
 // Every level adds a parent that waits on its children, so the tree stays shallow.
@@ -104,7 +118,8 @@ export function validatePlan(plan: PlanNode): string[] {
 
 export function buildTree(o: {
   runId: string;
-  repo: string;
+  project: string;
+  dataDir: string;
   plan: PlanNode;
   defaultAgent: Agent;
 }): Node[] {
@@ -123,7 +138,7 @@ export function buildTree(o: {
       files: (p.files ?? []).map(normalizeFile),
       agent: p.agent ?? o.defaultAgent,
       branch: branchName(o.runId, id),
-      worktree: worktreePath(o.repo, o.runId, id),
+      worktree: worktreePath(o.dataDir, o.project, o.runId, id),
       status: "pending",
       attempts: 0,
     });

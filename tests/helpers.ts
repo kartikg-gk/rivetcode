@@ -19,3 +19,7 @@ export async function makeRepo(): Promise<string> {
 export async function removeRepo(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
+
+export async function makeDataDir(): Promise<string> {
+  return realpath(await mkdtemp(join(tmpdir(), "rivet data ")));
+}

@@ -1,14 +1,15 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, realpath, rmdir, stat, unlink } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { mkdir, mkdtemp, readdir, realpath, rename, rm, rmdir } from "node:fs/promises";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { git, GitError } from "./git.js";
-import { ensureExcluded, samePath } from "./paths.js";
+import { samePath } from "./paths.js";
 
 export type Worktree = {
   path: string;
   branch: string | null;
   head: string;
   prunable: boolean;
+  locked: boolean;
 };
 
 export class WorktreeError extends Error {
@@ -64,7 +65,6 @@ async function create(o: { repo: string; path: string; branch: string; from: str
   if (await branchExists(o.repo, o.branch)) {
     throw new WorktreeError(`branch already exists: ${o.branch}`);
   }
-  await ensureExcluded(o.repo);
   await mkdir(dirname(path), { recursive: true });
   // Drops records of worktree directories deleted by hand, which would block this path.
   await prune(o.repo);
@@ -79,7 +79,7 @@ async function create(o: { repo: string; path: string; branch: string; from: str
   }
   const head = (await git(["rev-parse", "HEAD"], path)).trim();
   // Canonical case and long names, matching what git records and listWorktrees returns.
-  return { path: await realpath(path), branch: o.branch, head, prunable: false };
+  return { path: await realpath(path), branch: o.branch, head, prunable: false, locked: false };
 }
 
 export async function listWorktrees(repo: string): Promise<Worktree[]> {
@@ -88,7 +88,7 @@ export async function listWorktrees(repo: string): Promise<Worktree[]> {
   for (const block of out.split(/\r?\n\r?\n/)) {
     const lines = block.split(/\r?\n/).filter(Boolean);
     if (lines.length === 0) continue;
-    const wt: Worktree = { path: "", branch: null, head: "", prunable: false };
+    const wt: Worktree = { path: "", branch: null, head: "", prunable: false, locked: false };
     for (const line of lines) {
       const [key, ...rest] = line.split(" ");
       const value = rest.join(" ");
@@ -96,6 +96,7 @@ export async function listWorktrees(repo: string): Promise<Worktree[]> {
       else if (key === "HEAD") wt.head = value;
       else if (key === "branch") wt.branch = value.replace(/^refs\/heads\//, "");
       else if (key === "prunable") wt.prunable = true;
+      else if (key === "locked") wt.locked = true;
     }
     list.push(wt);
   }
@@ -124,30 +125,112 @@ export function pruneWorktrees(repo: string): Promise<void> {
 }
 
 // Never passes --force: a dirty worktree may hold an agent's only copy of its work.
-export function removeWorktree(repo: string, path: string): Promise<void> {
-  return withRepoLock(repo, () => remove(repo, path));
+export function removeWorktree(data: string, repo: string, path: string): Promise<void> {
+  return withRepoLock(repo, () => remove(data, repo, path));
 }
 
-async function remove(repo: string, path: string): Promise<void> {
+async function remove(data: string, repo: string, path: string): Promise<void> {
   const full = existsSync(path) ? await realpath(path) : resolve(path);
-  const registered = (await listWorktrees(repo)).some((w) => samePath(w.path, full));
+  const home = join(data, "worktrees");
+  if (!isInside(full, home)) throw new WorktreeError(`path is outside ${home}, not removing: ${full}`);
+
+  const registered = (await listWorktrees(repo)).find((w) => samePath(w.path, full));
   if (!existsSync(full)) {
     if (registered) await prune(repo);
     return;
   }
   if (!registered) {
-    // Left behind when an earlier removal unregistered the worktree but could not delete the folder.
-    if ((await readdir(full)).length === 0) {
-      await rmdir(full);
-      return;
-    }
-    throw new WorktreeError(`not a worktree of this repo, not removing: ${full}`);
+    // An earlier removal unregistered it but could not delete the folder.
+    if ((await readdir(full)).length > 0) throw new WorktreeError(`not a worktree of this repo, not removing: ${full}`);
+    await rmdir(full);
+    return;
   }
+  // A lock means someone wants the worktree kept: leave it where it is and let git refuse.
+  if (!registered.locked && (await removeThroughTrash(data, repo, full))) return;
   if (await isDirty(full)) throw new DirtyWorktreeError(full);
   await git(["worktree", "remove", full], repo);
 }
 
-const DEFAULT_LOCK_AGE_MS = 5 * 60 * 1000;
+// Deleting a big worktree is slow, renaming it is instant. So a clean worktree goes into
+// the trash, git forgets it, and the files are deleted in the background.
+// Returns false when this route could not be used and the worktree is back in place.
+async function removeThroughTrash(data: string, repo: string, full: string): Promise<boolean> {
+  const item = await moveToTrash(data, full);
+  if (item === null) return false;
+
+  // Judged after the move, so nothing can write into the tree between check and delete.
+  const dirty = await isDirty(item.path).catch(() => null);
+  const pruned = dirty === false && (await prune(repo).then(() => true, () => false));
+  if (!pruned) {
+    await item.putBack();
+    if (dirty) throw new DirtyWorktreeError(full);
+    return false;
+  }
+
+  // If git cannot be asked, the tree was clean anyway, so nothing uncommitted is lost.
+  const stillKnown = await listWorktrees(repo).then(
+    (list) => list.some((w) => samePath(w.path, full)),
+    () => false,
+  );
+  if (stillKnown) {
+    await item.putBack();
+    throw new WorktreeError(`refusing to remove ${full}: git still lists it after pruning`);
+  }
+  item.purge();
+  return true;
+}
+
+type TrashItem = { path: string; putBack(): Promise<void>; purge(): void };
+
+function trashDir(data: string): string {
+  return join(data, "worktrees", ".trash");
+}
+
+// Each removal gets its own fresh slot folder, so two removals never pick the same name.
+async function moveToTrash(data: string, full: string): Promise<TrashItem | null> {
+  let slot: string;
+  try {
+    await mkdir(trashDir(data), { recursive: true });
+    slot = await mkdtemp(join(trashDir(data), `${basename(full)}-`));
+  } catch {
+    return null;
+  }
+  const path = join(slot, "tree");
+  try {
+    await rename(full, path);
+  } catch {
+    await rmdir(slot).catch(() => {});
+    return null;
+  }
+  return {
+    path,
+    putBack: async () => {
+      await rename(path, full).catch(() => {});
+      await rmdir(slot).catch(() => {});
+    },
+    purge: () => deleteLater(slot),
+  };
+}
+
+const pendingDeletes = new Set<Promise<void>>();
+
+function deleteLater(path: string): void {
+  const job: Promise<void> = rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    .catch(() => {})
+    .finally(() => pendingDeletes.delete(job));
+  pendingDeletes.add(job);
+}
+
+// Deletes whatever an earlier process left in the trash. Call once at startup.
+export async function emptyTrash(data: string): Promise<void> {
+  const names = await readdir(trashDir(data)).catch(() => [] as string[]);
+  for (const name of names) deleteLater(join(trashDir(data), name));
+}
+
+// Waits for background deletes; tests and shutdown use this.
+export async function waitForTrash(): Promise<void> {
+  await Promise.all([...pendingDeletes]);
+}
 
 function isInside(child: string, parent: string): boolean {
   const c = resolve(child);
@@ -155,52 +238,4 @@ function isInside(child: string, parent: string): boolean {
   return process.platform === "win32"
     ? c.toLowerCase().startsWith(p.toLowerCase())
     : c.startsWith(p);
-}
-
-// Only locks Rivet can reason about: its own worktrees, its own branches, and packed-refs.
-// The main checkout's index.lock is left alone: an open commit-message editor holds it
-// for as long as the user takes to write the message.
-async function lockCandidates(repo: string, commonDir: string): Promise<string[]> {
-  const files = [join(commonDir, "packed-refs.lock")];
-  const nodeRoot = join(repo, ".rivet", "wt");
-  const wtRoot = join(commonDir, "worktrees");
-  for (const name of await readdir(wtRoot).catch(() => [] as string[])) {
-    const gitdir = await readFile(join(wtRoot, name, "gitdir"), "utf8").catch(() => "");
-    if (!gitdir.trim() || !isInside(gitdir.trim(), nodeRoot)) continue;
-    files.push(join(wtRoot, name, "index.lock"), join(wtRoot, name, "HEAD.lock"));
-  }
-  const rivetRefs = join(commonDir, "refs", "heads", "rivet");
-  const refs = await readdir(rivetRefs, { recursive: true }).catch(() => [] as string[]);
-  for (const rel of refs) {
-    if (rel.endsWith(".lock")) files.push(join(rivetRefs, rel));
-  }
-  return files;
-}
-
-// A git lock left behind by a killed process blocks every later git command.
-// Only locks older than maxAgeMs are removed; a younger one may belong to a running git.
-export async function clearStaleLocks(
-  repo: string,
-  opts: { maxAgeMs?: number; now?: number } = {},
-): Promise<string[]> {
-  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_LOCK_AGE_MS;
-  const now = opts.now ?? Date.now();
-  const main = (await listWorktrees(repo))[0]!.path;
-  const commonDir = resolve(repo, (await git(["rev-parse", "--git-common-dir"], repo)).trim());
-  const removed: string[] = [];
-  for (const file of await lockCandidates(main, commonDir)) {
-    const info = await stat(file).catch(() => null);
-    if (!info || !info.isFile()) continue;
-    if (now - info.mtimeMs <= maxAgeMs) continue;
-    // Re-check just before deleting: another cleaner or a new git may have replaced it.
-    const again = await stat(file).catch(() => null);
-    if (!again || again.ino !== info.ino || again.mtimeMs !== info.mtimeMs) continue;
-    try {
-      await unlink(file);
-      removed.push(resolve(file));
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    }
-  }
-  return removed;
 }

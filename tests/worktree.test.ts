@@ -1,25 +1,36 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { branchName, worktreePath } from "../src/paths.js";
 import {
-  clearStaleLocks,
   createWorktree,
   DirtyWorktreeError,
   isDirty,
   listWorktrees,
   pruneWorktrees,
   removeWorktree,
+  emptyTrash,
+  waitForTrash,
   WorktreeError,
 } from "../src/worktree.js";
-import { makeRepo, removeRepo } from "./helpers.js";
+import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
-beforeEach(async () => { repo = await makeRepo(); });
-afterEach(async () => { await removeRepo(repo); });
+let data: string;
+beforeEach(async () => {
+  repo = await makeRepo();
+  data = await makeDataDir();
+});
+afterEach(async () => {
+  await waitForTrash();
+  await removeRepo(repo);
+  await removeRepo(data);
+});
+
+const wtPath = (run: string, node: string) => worktreePath(data, "proj", run, node);
 
 async function branchExists(branch: string): Promise<boolean> {
   const out = await git(["branch", "--list", branch], repo);
@@ -28,7 +39,7 @@ async function branchExists(branch: string): Promise<boolean> {
 
 describe("createWorktree", () => {
   it("creates a worktree on a new branch from a start point", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     const wt = await createWorktree({ repo, path, branch: branchName("r1", "root"), from: "main" });
 
     expect(wt.path).toBe(resolve(path));
@@ -39,26 +50,26 @@ describe("createWorktree", () => {
   });
 
   it("branches a child from its parent's branch", async () => {
-    const parentPath = worktreePath(repo, "r1", "root");
+    const parentPath = wtPath("r1", "root");
     await createWorktree({ repo, path: parentPath, branch: "rivet/r1/root", from: "main" });
     await writeFile(join(parentPath, "parent.txt"), "p\n");
     await git(["add", "."], parentPath);
     await git(["commit", "-m", "parent work"], parentPath);
 
-    const childPath = worktreePath(repo, "r1", "root.1");
+    const childPath = wtPath("r1", "root.1");
     await createWorktree({ repo, path: childPath, branch: "rivet/r1/root.1", from: "rivet/r1/root" });
 
     expect(existsSync(join(childPath, "parent.txt"))).toBe(true);
   });
 
-  it("keeps the main checkout clean (.rivet/ is excluded)", async () => {
-    await createWorktree({ repo, path: worktreePath(repo, "r1", "root"), branch: "rivet/r1/root", from: "main" });
+  it("keeps the main checkout clean", async () => {
+    await createWorktree({ repo, path: wtPath("r1", "root"), branch: "rivet/r1/root", from: "main" });
     expect((await git(["status", "--porcelain"], repo)).trim()).toBe("");
   });
 
   it("refuses an existing branch and leaves no directory", async () => {
     await git(["branch", "rivet/r1/root"], repo);
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await expect(
       createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" }),
     ).rejects.toThrow(WorktreeError);
@@ -66,7 +77,7 @@ describe("createWorktree", () => {
   });
 
   it("refuses an existing path and creates no branch", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await expect(
       createWorktree({ repo, path, branch: "rivet/r1/other", from: "main" }),
@@ -75,7 +86,7 @@ describe("createWorktree", () => {
   });
 
   it("fails on a missing start point and leaves nothing behind", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await expect(
       createWorktree({ repo, path, branch: "rivet/r1/root", from: "no-such-branch" }),
     ).rejects.toThrow();
@@ -97,7 +108,7 @@ describe("createWorktree rollback", () => {
 
   it("deletes the branch it created when checkout fails, so a retry works", async () => {
     const bad = await uncheckoutableCommit();
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
 
     await expect(
       createWorktree({ repo, path, branch: "rivet/r1/root", from: bad }),
@@ -109,7 +120,7 @@ describe("createWorktree rollback", () => {
   });
 
   it("re-creates at a path whose worktree was deleted by hand", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await rm(path, { recursive: true, force: true });
 
@@ -127,7 +138,7 @@ describe("path canonicalization", () => {
       const lower = repo.toLowerCase();
       const wt = await createWorktree({
         repo: lower,
-        path: worktreePath(lower, "r1", "root"),
+        path: worktreePath(data.toLowerCase(), "proj", "r1", "root"),
         branch: "rivet/r1/root",
         from: "main",
       });
@@ -139,7 +150,7 @@ describe("path canonicalization", () => {
 
 describe("listWorktrees", () => {
   it("lists the main checkout and created worktrees", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
 
     const list = await listWorktrees(repo);
@@ -152,20 +163,20 @@ describe("listWorktrees", () => {
 
 describe("isDirty", () => {
   it("is false for a fresh worktree", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     expect(await isDirty(path)).toBe(false);
   });
 
   it("is true for a modified tracked file", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await writeFile(join(path, "README.txt"), "changed\n");
     expect(await isDirty(path)).toBe(true);
   });
 
   it("is true for an untracked file nobody added", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await writeFile(join(path, "new.ts"), "export {}\n");
     expect(await isDirty(path)).toBe(true);
@@ -174,49 +185,49 @@ describe("isDirty", () => {
 
 describe("removeWorktree", () => {
   it("removes a clean worktree and keeps its branch", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
-    await removeWorktree(repo, path);
+    await removeWorktree(data, repo, path);
     expect(existsSync(path)).toBe(false);
     expect(await branchExists("rivet/r1/root")).toBe(true);
     expect((await listWorktrees(repo)).map((w) => w.path)).toEqual([resolve(repo)]);
   });
 
   it("refuses a worktree with only an untracked file, and leaves it intact", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await writeFile(join(path, "new.ts"), "export {}\n");
-    await expect(removeWorktree(repo, path)).rejects.toThrow(DirtyWorktreeError);
+    await expect(removeWorktree(data, repo, path)).rejects.toThrow(DirtyWorktreeError);
     expect(existsSync(join(path, "new.ts"))).toBe(true);
   });
 
   it("handles a worktree directory deleted by hand", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await rm(path, { recursive: true, force: true });
-    await removeWorktree(repo, path);
+    await removeWorktree(data, repo, path);
     expect((await listWorktrees(repo)).map((w) => w.path)).toEqual([resolve(repo)]);
   });
 });
 
 describe("removeWorktree after a partial removal", () => {
   it("cleans up an empty leftover directory git no longer tracks", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await git(["worktree", "remove", path], repo);
     await mkdir(path, { recursive: true });
 
-    await removeWorktree(repo, path);
+    await removeWorktree(data, repo, path);
 
     expect(existsSync(path)).toBe(false);
   });
 
   it("refuses a non-empty directory that is not a worktree, and leaves it intact", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await mkdir(path, { recursive: true });
     await writeFile(join(path, "keep.txt"), "k\n");
 
-    await expect(removeWorktree(repo, path)).rejects.toThrow(WorktreeError);
+    await expect(removeWorktree(data, repo, path)).rejects.toThrow(WorktreeError);
     expect(existsSync(join(path, "keep.txt"))).toBe(true);
   });
 
@@ -231,7 +242,7 @@ describe("removeWorktree after a partial removal", () => {
 
 describe("pruneWorktrees", () => {
   it("drops records of missing worktree directories", async () => {
-    const path = worktreePath(repo, "r1", "root");
+    const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await rm(path, { recursive: true, force: true });
     expect((await listWorktrees(repo))[1]!.prunable).toBe(true);
@@ -240,104 +251,19 @@ describe("pruneWorktrees", () => {
   });
 });
 
-describe("clearStaleLocks", () => {
-  const HOUR = 60 * 60 * 1000;
-
-  async function age(file: string, msAgo: number) {
-    const t = new Date(Date.now() - msAgo);
-    await utimes(file, t, t);
-  }
-
-  async function adminDir(worktree: string): Promise<string> {
-    return resolve(worktree, (await git(["rev-parse", "--git-dir"], worktree)).trim());
-  }
-
-  it("removes an old index.lock in a node worktree so git works there again", async () => {
-    const path = worktreePath(repo, "r1", "root");
-    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
-    const lock = join(await adminDir(path), "index.lock");
-    await writeFile(lock, "");
-    await age(lock, HOUR);
-    await writeFile(join(path, "a.txt"), "a\n");
-    await expect(git(["add", "a.txt"], path)).rejects.toThrow(/index\.lock/);
-
-    const removed = await clearStaleLocks(repo);
-
-    expect(removed).toEqual([resolve(lock)]);
-    await git(["add", "a.txt"], path);
-  });
-
-  it("keeps a fresh lock (a live git operation may own it)", async () => {
-    const path = worktreePath(repo, "r1", "root");
-    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
-    const lock = join(await adminDir(path), "index.lock");
-    await writeFile(lock, "");
-    expect(await clearStaleLocks(repo)).toEqual([]);
-    expect(existsSync(lock)).toBe(true);
-  });
-
-  it("keeps an old index.lock in the main checkout (a commit editor may hold it for hours)", async () => {
-    const lock = join(repo, ".git", "index.lock");
-    await writeFile(lock, "");
-    await age(lock, HOUR);
-    expect(await clearStaleLocks(repo)).toEqual([]);
-    expect(existsSync(lock)).toBe(true);
-  });
-
-  it("keeps old locks of worktrees Rivet did not create", async () => {
-    const own = join(repo, "..", `${basename(repo)} own wt`);
-    await git(["worktree", "add", "-b", "mine", own, "main"], repo);
-    try {
-      const lock = join(await adminDir(own), "index.lock");
-      await writeFile(lock, "");
-      await age(lock, HOUR);
-      expect(await clearStaleLocks(repo)).toEqual([]);
-    } finally {
-      await rm(own, { recursive: true, force: true });
-    }
-  });
-
-  it("removes old locks under refs/heads/rivet/ and packed-refs.lock, keeps other ref locks", async () => {
-    const rivetRefLock = join(repo, ".git", "refs", "heads", "rivet", "r1", "root.lock");
-    const otherRefLock = join(repo, ".git", "refs", "heads", "feature.lock");
-    const packed = join(repo, ".git", "packed-refs.lock");
-    await mkdir(join(repo, ".git", "refs", "heads", "rivet", "r1"), { recursive: true });
-    for (const f of [rivetRefLock, otherRefLock, packed]) {
-      await writeFile(f, "");
-      await age(f, HOUR);
-    }
-
-    const removed = await clearStaleLocks(repo);
-
-    expect(removed.sort()).toEqual([resolve(rivetRefLock), resolve(packed)].sort());
-    expect(existsSync(otherRefLock)).toBe(true);
-  });
-});
-
 describe("concurrency", () => {
-  it("parallel creates write the exclude line once", async () => {
-    await Promise.all(
-      Array.from({ length: 12 }, (_, i) =>
-        createWorktree({ repo, path: worktreePath(repo, "r1", `n${i}`), branch: `rivet/r1/n${i}`, from: "main" }),
-      ),
-    );
-    const exclude = await readFile(join(repo, ".git", "info", "exclude"), "utf8");
-    expect(exclude.split(/\r?\n/).filter((l) => l === ".rivet/")).toHaveLength(1);
-    expect(await listWorktrees(repo)).toHaveLength(13);
-  });
-
   it("a burst of parallel creates and removes never fails", async () => {
     for (let round = 0; round < 3; round++) {
-      const old = Array.from({ length: 12 }, (_, i) => worktreePath(repo, `r${round}`, `a${i}`));
+      const old = Array.from({ length: 12 }, (_, i) => wtPath(`r${round}`, `a${i}`));
       await Promise.all(
         old.map((path, i) => createWorktree({ repo, path, branch: `rivet/r${round}/a${i}`, from: "main" })),
       );
       await Promise.all([
-        ...old.map((path) => removeWorktree(repo, path)),
+        ...old.map((path) => removeWorktree(data, repo, path)),
         ...Array.from({ length: 12 }, (_, i) =>
           createWorktree({
             repo,
-            path: worktreePath(repo, `r${round}`, `b${i}`),
+            path: wtPath(`r${round}`, `b${i}`),
             branch: `rivet/r${round}/b${i}`,
             from: "main",
           }),
@@ -347,4 +273,59 @@ describe("concurrency", () => {
     }
     expect(await listWorktrees(repo)).toHaveLength(1 + 3 * 12);
   }, 180_000);
+});
+
+describe("removal through the trash", () => {
+  const trash = () => join(data, "worktrees", ".trash");
+
+  it("moves a clean worktree aside and deletes it in the background", async () => {
+    const path = wtPath("r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+
+    await removeWorktree(data, repo, path);
+
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo)).map((w) => w.path)).toEqual([resolve(repo)]);
+    await waitForTrash();
+    expect(existsSync(trash()) ? await readdir(trash()) : []).toEqual([]);
+  });
+
+  it("puts a dirty worktree back where it was", async () => {
+    const path = wtPath("r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await writeFile(join(path, "new.ts"), "export {}\n");
+
+    await expect(removeWorktree(data, repo, path)).rejects.toThrow(DirtyWorktreeError);
+
+    expect(existsSync(join(path, "new.ts"))).toBe(true);
+    expect(existsSync(trash()) ? await readdir(trash()) : []).toEqual([]);
+    expect(await isDirty(path)).toBe(true);
+    expect((await listWorktrees(repo)).map((w) => w.path)).toContain(resolve(path));
+  });
+
+  it("does not move a locked worktree; git refuses it in place", async () => {
+    const path = wtPath("r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await git(["worktree", "lock", path], repo);
+
+    await expect(removeWorktree(data, repo, path)).rejects.toThrow(/locked/);
+
+    expect(existsSync(join(path, "README.txt"))).toBe(true);
+    expect(existsSync(trash()) ? await readdir(trash()) : []).toEqual([]);
+    expect((await listWorktrees(repo)).find((w) => w.path === resolve(path))!.locked).toBe(true);
+  });
+
+  it("refuses a path outside the data dir's worktrees folder", async () => {
+    await expect(removeWorktree(data, repo, join(repo, "..", "elsewhere"))).rejects.toThrow(/outside/);
+  });
+
+  it("sweeps leftovers from an earlier crash", async () => {
+    await mkdir(join(trash(), "root-abc123", "deep"), { recursive: true });
+    await writeFile(join(trash(), "root-abc123", "deep", "f.txt"), "x");
+
+    await emptyTrash(data);
+    await waitForTrash();
+
+    expect(await readdir(trash())).toEqual([]);
+  });
 });

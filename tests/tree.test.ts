@@ -1,17 +1,17 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildTree, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
+import { buildTree, PR_STATUSES, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
 
 const leaf = (title: string, files: string[] = []): PlanNode => ({ title, prompt: `do ${title}`, files });
-const repo = join("C:", "repo x");
+const data = join("C:", "data x");
 
 describe("buildTree", () => {
   it("builds a single-leaf (flat) run", () => {
-    const nodes = buildTree({ runId: "r1", repo, plan: leaf("fix bug"), defaultAgent: "claude" });
+    const nodes = buildTree({ runId: "r1", project: "proj", dataDir: data, plan: leaf("fix bug"), defaultAgent: "claude" });
     expect(nodes).toHaveLength(1);
     expect(nodes[0]).toMatchObject({
       id: "root", parentId: null, depth: 0, kind: "leaf", agent: "claude",
-      branch: "rivet/r1/root", worktree: join(repo, ".rivet", "wt", "r1", "root"),
+      branch: "rivet/r1/root", worktree: join(data, "worktrees", "proj", "r1-root"),
       status: "pending", attempts: 0, files: [],
     });
   });
@@ -21,7 +21,7 @@ describe("buildTree", () => {
       title: "login", prompt: "integrate",
       children: [leaf("db", ["db/"]), { title: "api", prompt: "integrate api", children: [leaf("routes", ["api/routes.ts"]), leaf("auth", ["api/auth.ts"])] }],
     };
-    const nodes = buildTree({ runId: "r1", repo, plan, defaultAgent: "codex" });
+    const nodes = buildTree({ runId: "r1", project: "proj", dataDir: data, plan, defaultAgent: "codex" });
     expect(nodes.map((n) => [n.id, n.parentId, n.depth, n.kind])).toEqual([
       ["root", null, 0, "parent"],
       ["root.1", "root", 1, "leaf"],
@@ -34,13 +34,13 @@ describe("buildTree", () => {
 
   it("uses a node's own agent over the default", () => {
     const plan: PlanNode = { title: "t", prompt: "p", children: [{ ...leaf("a"), agent: "codex" }, leaf("b")] };
-    const nodes = buildTree({ runId: "r1", repo, plan, defaultAgent: "claude" });
+    const nodes = buildTree({ runId: "r1", project: "proj", dataDir: data, plan, defaultAgent: "claude" });
     expect(nodes.map((n) => n.agent)).toEqual(["claude", "codex", "claude"]);
   });
 
   it("throws TreeError listing every problem", () => {
     const plan: PlanNode = { title: "", prompt: "p", children: [leaf("a", ["x.ts"]), leaf("b", ["x.ts"])] };
-    const err = (() => { try { buildTree({ runId: "r1", repo, plan, defaultAgent: "claude" }); } catch (e) { return e; } })();
+    const err = (() => { try { buildTree({ runId: "r1", project: "proj", dataDir: data, plan, defaultAgent: "claude" }); } catch (e) { return e; } })();
     expect(err).toBeInstanceOf(TreeError);
     expect((err as TreeError).problems).toHaveLength(2);
   });
@@ -96,7 +96,7 @@ describe("validatePlan", () => {
 
 describe("setStatus", () => {
   const plan: PlanNode = { title: "r", prompt: "p", children: [leaf("a"), leaf("b")] };
-  const fresh = () => buildTree({ runId: "r1", repo, plan, defaultAgent: "claude" });
+  const fresh = () => buildTree({ runId: "r1", project: "proj", dataDir: data, plan, defaultAgent: "claude" });
 
   it("moves a leaf through a retry and counts attempts", () => {
     let nodes = fresh();
@@ -156,4 +156,13 @@ describe("file claims", () => {
       expect(validatePlan(plan)).toEqual([`root.1 has invalid file "${f}"`]);
     },
   );
+});
+
+describe("state lists", () => {
+  it("has every PR status the root can report", () => {
+    expect([...PR_STATUSES].sort()).toEqual([
+      "approved", "changes_requested", "ci_failed", "draft", "exited", "idle", "mergeable",
+      "merged", "needs_input", "no_signal", "pr_open", "review_pending", "terminated", "working",
+    ]);
+  });
 });
