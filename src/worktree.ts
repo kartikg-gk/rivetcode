@@ -28,12 +28,37 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
   }
 }
 
-export async function createWorktree(o: {
+// git reads every worktree's admin folder while adding or removing one, so concurrent
+// changes to the same repo can fail. Changes are queued per repo inside this process.
+const queues = new Map<string, Promise<unknown>>();
+
+async function withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+  const common = resolve(repo, (await git(["rev-parse", "--git-common-dir"], repo)).trim());
+  const key = process.platform === "win32" ? common.toLowerCase() : common;
+  const run = (queues.get(key) ?? Promise.resolve()).then(fn, fn);
+  const tail = run.catch(() => {});
+  queues.set(key, tail);
+  try {
+    return await run;
+  } finally {
+    if (queues.get(key) === tail) queues.delete(key);
+  }
+}
+
+async function prune(repo: string): Promise<void> {
+  await git(["worktree", "prune"], repo);
+}
+
+export function createWorktree(o: {
   repo: string;
   path: string;
   branch: string;
   from: string;
 }): Promise<Worktree> {
+  return withRepoLock(o.repo, () => create(o));
+}
+
+async function create(o: { repo: string; path: string; branch: string; from: string }): Promise<Worktree> {
   const path = resolve(o.path);
   if (existsSync(path)) throw new WorktreeError(`path already exists: ${path}`);
   if (await branchExists(o.repo, o.branch)) {
@@ -42,13 +67,13 @@ export async function createWorktree(o: {
   await ensureExcluded(o.repo);
   await mkdir(dirname(path), { recursive: true });
   // Drops records of worktree directories deleted by hand, which would block this path.
-  await pruneWorktrees(o.repo);
+  await prune(o.repo);
   // Branch first, checkout second: if checkout fails we know the branch is ours to delete.
   await git(["branch", o.branch, o.from], o.repo);
   try {
     await git(["worktree", "add", path, o.branch], o.repo);
   } catch (e) {
-    await pruneWorktrees(o.repo).catch(() => {});
+    await prune(o.repo).catch(() => {});
     await git(["branch", "-D", o.branch], o.repo).catch(() => {});
     throw e;
   }
@@ -94,16 +119,20 @@ export async function isDirty(path: string): Promise<boolean> {
   return out.trim() !== "";
 }
 
-export async function pruneWorktrees(repo: string): Promise<void> {
-  await git(["worktree", "prune"], repo);
+export function pruneWorktrees(repo: string): Promise<void> {
+  return withRepoLock(repo, () => prune(repo));
 }
 
 // Never passes --force: a dirty worktree may hold an agent's only copy of its work.
-export async function removeWorktree(repo: string, path: string): Promise<void> {
+export function removeWorktree(repo: string, path: string): Promise<void> {
+  return withRepoLock(repo, () => remove(repo, path));
+}
+
+async function remove(repo: string, path: string): Promise<void> {
   const full = existsSync(path) ? await realpath(path) : resolve(path);
   const registered = (await listWorktrees(repo)).some((w) => samePath(w.path, full));
   if (!existsSync(full)) {
-    if (registered) await pruneWorktrees(repo);
+    if (registered) await prune(repo);
     return;
   }
   if (!registered) {

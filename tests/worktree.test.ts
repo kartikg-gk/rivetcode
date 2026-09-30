@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
@@ -312,4 +312,39 @@ describe("clearStaleLocks", () => {
     expect(removed.sort()).toEqual([resolve(rivetRefLock), resolve(packed)].sort());
     expect(existsSync(otherRefLock)).toBe(true);
   });
+});
+
+describe("concurrency", () => {
+  it("parallel creates write the exclude line once", async () => {
+    await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        createWorktree({ repo, path: worktreePath(repo, "r1", `n${i}`), branch: `rivet/r1/n${i}`, from: "main" }),
+      ),
+    );
+    const exclude = await readFile(join(repo, ".git", "info", "exclude"), "utf8");
+    expect(exclude.split(/\r?\n/).filter((l) => l === ".rivet/")).toHaveLength(1);
+    expect(await listWorktrees(repo)).toHaveLength(13);
+  });
+
+  it("a burst of parallel creates and removes never fails", async () => {
+    for (let round = 0; round < 3; round++) {
+      const old = Array.from({ length: 12 }, (_, i) => worktreePath(repo, `r${round}`, `a${i}`));
+      await Promise.all(
+        old.map((path, i) => createWorktree({ repo, path, branch: `rivet/r${round}/a${i}`, from: "main" })),
+      );
+      await Promise.all([
+        ...old.map((path) => removeWorktree(repo, path)),
+        ...Array.from({ length: 12 }, (_, i) =>
+          createWorktree({
+            repo,
+            path: worktreePath(repo, `r${round}`, `b${i}`),
+            branch: `rivet/r${round}/b${i}`,
+            from: "main",
+          }),
+        ),
+        pruneWorktrees(repo),
+      ]);
+    }
+    expect(await listWorktrees(repo)).toHaveLength(1 + 3 * 12);
+  }, 180_000);
 });
