@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { git, GitError } from "./git.js";
 import { ensureExcluded } from "./paths.js";
 
@@ -91,4 +91,39 @@ export async function removeWorktree(repo: string, path: string): Promise<void> 
   }
   if (await isDirty(full)) throw new DirtyWorktreeError(full);
   await git(["worktree", "remove", full], repo);
+}
+
+const DEFAULT_LOCK_AGE_MS = 5 * 60 * 1000;
+
+async function lockCandidates(commonDir: string): Promise<string[]> {
+  const files = [join(commonDir, "index.lock"), join(commonDir, "HEAD.lock")];
+  const wtRoot = join(commonDir, "worktrees");
+  for (const name of await readdir(wtRoot).catch(() => [] as string[])) {
+    files.push(join(wtRoot, name, "index.lock"), join(wtRoot, name, "HEAD.lock"));
+  }
+  const refs = await readdir(join(commonDir, "refs"), { recursive: true }).catch(() => [] as string[]);
+  for (const rel of refs) {
+    if (rel.endsWith(".lock")) files.push(join(commonDir, "refs", rel));
+  }
+  return files;
+}
+
+// A git lock left behind by a killed process blocks every later git command.
+// Only locks older than maxAgeMs are removed; a younger one may belong to a running git.
+export async function clearStaleLocks(
+  repo: string,
+  opts: { maxAgeMs?: number; now?: number } = {},
+): Promise<string[]> {
+  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_LOCK_AGE_MS;
+  const now = opts.now ?? Date.now();
+  const commonDir = resolve(repo, (await git(["rev-parse", "--git-common-dir"], repo)).trim());
+  const removed: string[] = [];
+  for (const file of await lockCandidates(commonDir)) {
+    const info = await stat(file).catch(() => null);
+    if (!info || !info.isFile()) continue;
+    if (now - info.mtimeMs <= maxAgeMs) continue;
+    await unlink(file);
+    removed.push(resolve(file));
+  }
+  return removed;
 }

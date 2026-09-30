@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { branchName, worktreePath } from "../src/paths.js";
 import {
+  clearStaleLocks,
   createWorktree,
   DirtyWorktreeError,
   isDirty,
@@ -152,5 +153,51 @@ describe("pruneWorktrees", () => {
     expect((await listWorktrees(repo))[1]!.prunable).toBe(true);
     await pruneWorktrees(repo);
     expect(await listWorktrees(repo)).toHaveLength(1);
+  });
+});
+
+describe("clearStaleLocks", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  async function age(file: string, msAgo: number) {
+    const t = new Date(Date.now() - msAgo);
+    await utimes(file, t, t);
+  }
+
+  it("removes an old index.lock so git works again", async () => {
+    const lock = join(repo, ".git", "index.lock");
+    await writeFile(lock, "");
+    await age(lock, HOUR);
+    await writeFile(join(repo, "a.txt"), "a\n");
+    await expect(git(["add", "a.txt"], repo)).rejects.toThrow(/index\.lock/);
+
+    const removed = await clearStaleLocks(repo);
+
+    expect(removed).toEqual([resolve(lock)]);
+    await git(["add", "a.txt"], repo);
+  });
+
+  it("keeps a fresh lock (a live git operation may own it)", async () => {
+    const lock = join(repo, ".git", "index.lock");
+    await writeFile(lock, "");
+    expect(await clearStaleLocks(repo)).toEqual([]);
+    expect(existsSync(lock)).toBe(true);
+  });
+
+  it("finds stale locks inside a worktree's git dir and under refs/", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    const wtGitDir = resolve(path, (await git(["rev-parse", "--git-dir"], path)).trim());
+    const wtLock = join(wtGitDir, "index.lock");
+    const refLock = join(repo, ".git", "refs", "heads", "rivet", "r1", "root.lock");
+    await writeFile(wtLock, "");
+    await mkdir(join(repo, ".git", "refs", "heads", "rivet", "r1"), { recursive: true });
+    await writeFile(refLock, "");
+    await age(wtLock, HOUR);
+    await age(refLock, HOUR);
+
+    const removed = await clearStaleLocks(repo);
+
+    expect(removed.sort()).toEqual([resolve(wtLock), resolve(refLock)].sort());
   });
 });
