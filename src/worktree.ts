@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, realpath, rmdir, stat, unlink } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readdir, readFile, realpath, rmdir, stat, unlink } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 import { git, GitError } from "./git.js";
 import { ensureExcluded, samePath } from "./paths.js";
 
@@ -120,15 +120,30 @@ export async function removeWorktree(repo: string, path: string): Promise<void> 
 
 const DEFAULT_LOCK_AGE_MS = 5 * 60 * 1000;
 
-async function lockCandidates(commonDir: string): Promise<string[]> {
-  const files = [join(commonDir, "index.lock"), join(commonDir, "HEAD.lock")];
+function isInside(child: string, parent: string): boolean {
+  const c = resolve(child);
+  const p = resolve(parent) + sep;
+  return process.platform === "win32"
+    ? c.toLowerCase().startsWith(p.toLowerCase())
+    : c.startsWith(p);
+}
+
+// Only locks Rivet can reason about: its own worktrees, its own branches, and packed-refs.
+// The main checkout's index.lock is left alone: an open commit-message editor holds it
+// for as long as the user takes to write the message.
+async function lockCandidates(repo: string, commonDir: string): Promise<string[]> {
+  const files = [join(commonDir, "packed-refs.lock")];
+  const nodeRoot = join(repo, ".rivet", "wt");
   const wtRoot = join(commonDir, "worktrees");
   for (const name of await readdir(wtRoot).catch(() => [] as string[])) {
+    const gitdir = await readFile(join(wtRoot, name, "gitdir"), "utf8").catch(() => "");
+    if (!gitdir.trim() || !isInside(gitdir.trim(), nodeRoot)) continue;
     files.push(join(wtRoot, name, "index.lock"), join(wtRoot, name, "HEAD.lock"));
   }
-  const refs = await readdir(join(commonDir, "refs"), { recursive: true }).catch(() => [] as string[]);
+  const rivetRefs = join(commonDir, "refs", "heads", "rivet");
+  const refs = await readdir(rivetRefs, { recursive: true }).catch(() => [] as string[]);
   for (const rel of refs) {
-    if (rel.endsWith(".lock")) files.push(join(commonDir, "refs", rel));
+    if (rel.endsWith(".lock")) files.push(join(rivetRefs, rel));
   }
   return files;
 }
@@ -141,14 +156,22 @@ export async function clearStaleLocks(
 ): Promise<string[]> {
   const maxAgeMs = opts.maxAgeMs ?? DEFAULT_LOCK_AGE_MS;
   const now = opts.now ?? Date.now();
+  const main = (await listWorktrees(repo))[0]!.path;
   const commonDir = resolve(repo, (await git(["rev-parse", "--git-common-dir"], repo)).trim());
   const removed: string[] = [];
-  for (const file of await lockCandidates(commonDir)) {
+  for (const file of await lockCandidates(main, commonDir)) {
     const info = await stat(file).catch(() => null);
     if (!info || !info.isFile()) continue;
     if (now - info.mtimeMs <= maxAgeMs) continue;
-    await unlink(file);
-    removed.push(resolve(file));
+    // Re-check just before deleting: another cleaner or a new git may have replaced it.
+    const again = await stat(file).catch(() => null);
+    if (!again || again.ino !== info.ino || again.mtimeMs !== info.mtimeMs) continue;
+    try {
+      await unlink(file);
+      removed.push(resolve(file));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
   }
   return removed;
 }

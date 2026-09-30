@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { branchName, worktreePath } from "../src/paths.js";
@@ -248,40 +248,68 @@ describe("clearStaleLocks", () => {
     await utimes(file, t, t);
   }
 
-  it("removes an old index.lock so git works again", async () => {
-    const lock = join(repo, ".git", "index.lock");
+  async function adminDir(worktree: string): Promise<string> {
+    return resolve(worktree, (await git(["rev-parse", "--git-dir"], worktree)).trim());
+  }
+
+  it("removes an old index.lock in a node worktree so git works there again", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    const lock = join(await adminDir(path), "index.lock");
     await writeFile(lock, "");
     await age(lock, HOUR);
-    await writeFile(join(repo, "a.txt"), "a\n");
-    await expect(git(["add", "a.txt"], repo)).rejects.toThrow(/index\.lock/);
+    await writeFile(join(path, "a.txt"), "a\n");
+    await expect(git(["add", "a.txt"], path)).rejects.toThrow(/index\.lock/);
 
     const removed = await clearStaleLocks(repo);
 
     expect(removed).toEqual([resolve(lock)]);
-    await git(["add", "a.txt"], repo);
+    await git(["add", "a.txt"], path);
   });
 
   it("keeps a fresh lock (a live git operation may own it)", async () => {
-    const lock = join(repo, ".git", "index.lock");
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    const lock = join(await adminDir(path), "index.lock");
     await writeFile(lock, "");
     expect(await clearStaleLocks(repo)).toEqual([]);
     expect(existsSync(lock)).toBe(true);
   });
 
-  it("finds stale locks inside a worktree's git dir and under refs/", async () => {
-    const path = worktreePath(repo, "r1", "root");
-    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
-    const wtGitDir = resolve(path, (await git(["rev-parse", "--git-dir"], path)).trim());
-    const wtLock = join(wtGitDir, "index.lock");
-    const refLock = join(repo, ".git", "refs", "heads", "rivet", "r1", "root.lock");
-    await writeFile(wtLock, "");
+  it("keeps an old index.lock in the main checkout (a commit editor may hold it for hours)", async () => {
+    const lock = join(repo, ".git", "index.lock");
+    await writeFile(lock, "");
+    await age(lock, HOUR);
+    expect(await clearStaleLocks(repo)).toEqual([]);
+    expect(existsSync(lock)).toBe(true);
+  });
+
+  it("keeps old locks of worktrees Rivet did not create", async () => {
+    const own = join(repo, "..", `${basename(repo)} own wt`);
+    await git(["worktree", "add", "-b", "mine", own, "main"], repo);
+    try {
+      const lock = join(await adminDir(own), "index.lock");
+      await writeFile(lock, "");
+      await age(lock, HOUR);
+      expect(await clearStaleLocks(repo)).toEqual([]);
+    } finally {
+      await rm(own, { recursive: true, force: true });
+    }
+  });
+
+  it("removes old locks under refs/heads/rivet/ and packed-refs.lock, keeps other ref locks", async () => {
+    const rivetRefLock = join(repo, ".git", "refs", "heads", "rivet", "r1", "root.lock");
+    const otherRefLock = join(repo, ".git", "refs", "heads", "feature.lock");
+    const packed = join(repo, ".git", "packed-refs.lock");
     await mkdir(join(repo, ".git", "refs", "heads", "rivet", "r1"), { recursive: true });
-    await writeFile(refLock, "");
-    await age(wtLock, HOUR);
-    await age(refLock, HOUR);
+    for (const f of [rivetRefLock, otherRefLock, packed]) {
+      await writeFile(f, "");
+      await age(f, HOUR);
+    }
 
     const removed = await clearStaleLocks(repo);
 
-    expect(removed.sort()).toEqual([resolve(wtLock), resolve(refLock)].sort());
+    expect(removed.sort()).toEqual([resolve(rivetRefLock), resolve(packed)].sort());
+    expect(existsSync(otherRefLock)).toBe(true);
   });
 });
