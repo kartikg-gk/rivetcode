@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import { branchName, worktreePath } from "./paths.js";
 
 export type Agent = "claude" | "codex";
@@ -39,20 +40,30 @@ export class TreeError extends Error {
   }
 }
 
+// Repo-relative, forward slashes, no "." / ".." segments, no trailing slash.
 function normalizeFile(f: string): string {
-  return f.trim().replace(/\\/g, "/").replace(/^(\.\/)+/, "");
+  return posix.normalize(f.trim().replace(/\\/g, "/")).replace(/\/+$/, "");
 }
 
-// "src/" claims everything under src; "src/a.ts" claims one file.
+// A claim must name something inside the repo, literally (no globs).
+function isValidFile(f: unknown): f is string {
+  if (typeof f !== "string") return false;
+  const raw = f.trim().replace(/\\/g, "/");
+  if (raw === "" || raw.startsWith("/") || /^[a-zA-Z]:/.test(raw)) return false;
+  if (/[*?[\]{}]/.test(raw)) return false;
+  const n = normalizeFile(raw);
+  return n !== "" && n !== "." && n !== ".." && !n.startsWith("../");
+}
+
+// Every claim covers its whole subtree: "src" and "src/a.ts" overlap.
 function claimsOverlap(a: string, b: string): boolean {
-  if (a === b) return true;
-  if (a.endsWith("/") && b.startsWith(a)) return true;
-  if (b.endsWith("/") && a.startsWith(b)) return true;
-  return false;
+  const [x, y] = process.platform === "win32" ? [a.toLowerCase(), b.toLowerCase()] : [a, b];
+  return x === y || y.startsWith(`${x}/`) || x.startsWith(`${y}/`);
 }
 
 function subtreeFiles(p: PlanNode): string[] {
-  return [...(p.files ?? []).map(normalizeFile), ...(p.children ?? []).flatMap(subtreeFiles)];
+  const own = (p.files ?? []).filter(isValidFile).map(normalizeFile);
+  return [...own, ...(p.children ?? []).flatMap(subtreeFiles)];
 }
 
 export function validatePlan(plan: PlanNode): string[] {
@@ -64,6 +75,9 @@ export function validatePlan(plan: PlanNode): string[] {
     }
     if (!p.title?.trim()) problems.push(`${id} has an empty title`);
     if (!p.prompt?.trim()) problems.push(`${id} has an empty prompt`);
+    for (const f of p.files ?? []) {
+      if (!isValidFile(f)) problems.push(`${id} has invalid file "${String(f)}"`);
+    }
     const children = p.children ?? [];
     if (children.length > MAX_CHILDREN) {
       problems.push(`${id} has ${children.length} children (max ${MAX_CHILDREN})`);

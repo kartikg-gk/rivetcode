@@ -131,3 +131,29 @@ describe("setStatus", () => {
     expect(() => setStatus(fresh(), "root.9", "running")).toThrow(/unknown node root\.9/);
   });
 });
+
+describe("file claims", () => {
+  const pair = (a: string[], b: string[]): PlanNode => ({ title: "r", prompt: "p", children: [leaf("a", a), leaf("b", b)] });
+
+  it.each([
+    [["src"], ["src/a.ts"]],
+    [["src"], ["src/"]],
+    [["src//a.ts"], ["src/a.ts"]],
+    [["src/./a.ts"], ["src/a.ts"]],
+    [["src/x/../a.ts"], ["src/a.ts"]],
+  ])("treats %j and %j as the same claim", (a, b) => {
+    expect(validatePlan(pair(a, b))).toEqual([expect.stringMatching(/both claim/)]);
+  });
+
+  it.runIf(process.platform === "win32")("ignores case on Windows", () => {
+    expect(validatePlan(pair(["SRC/a.ts"], ["src/a.ts"]))).toEqual([expect.stringMatching(/both claim/)]);
+  });
+
+  it.each(["../x", "a/../../b", "C:\\x", "/etc/passwd", "", "   ", ".", "./", "src/*.ts", "src/[ab].ts"])(
+    "rejects file %j",
+    (f) => {
+      const plan: PlanNode = { title: "r", prompt: "p", children: [leaf("a", [f])] };
+      expect(validatePlan(plan)).toEqual([`root.1 has invalid file "${f}"`]);
+    },
+  );
+});
