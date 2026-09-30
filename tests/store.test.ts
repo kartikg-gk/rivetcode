@@ -112,3 +112,31 @@ describe("overlapping saves", () => {
     expect((await loadRun(repo, "r1")).task).toBe("add login");
   });
 });
+
+describe("loadRun shape checks", () => {
+  type Mutate = (run: any) => void;
+  const cases: [string, Mutate, RegExp][] = [
+    ["a node that is not an object", (r) => { r.nodes[1] = 1; }, /node 1/],
+    ["an unknown kind", (r) => { r.nodes[0].kind = "bogus"; }, /root.*kind/],
+    ["an unknown status", (r) => { r.nodes[1].status = "zzz"; }, /root\.1.*status/],
+    ["an unknown agent", (r) => { r.nodes[1].agent = "gpt"; }, /root\.1.*agent/],
+    ["attempts that are not a count", (r) => { r.nodes[1].attempts = "a"; }, /root\.1.*attempts/],
+    ["a bad node id", (r) => { r.nodes[1].id = "../x"; }, /node 1.*id/],
+    ["a parent that does not exist", (r) => { r.nodes[1].parentId = "root.7"; }, /root\.1.*parent/],
+    ["a branch that is not the node's own", (r) => { r.nodes[1].branch = "main"; }, /root\.1.*branch/],
+    ["a worktree outside the run", (r) => { r.nodes[1].worktree = "C:\\Windows"; }, /root\.1.*worktree/],
+    ["a run from another repo", (r) => { r.repo = "D:\\elsewhere"; }, /repo/],
+    ["a missing task", (r) => { delete r.task; }, /task/],
+  ];
+
+  it.each(cases)("rejects %s", async (_name, mutate, message) => {
+    await saveRun(sampleRun());
+    const run = JSON.parse(JSON.stringify(sampleRun()));
+    mutate(run);
+    await writeFile(runFile(repo, "r1"), JSON.stringify(run));
+    const err = await loadRun(repo, "r1").catch((e) => e);
+    expect(err).toBeInstanceOf(RunStoreError);
+    expect(err.message).toMatch(/r1\.json/);
+    expect(err.message).toMatch(message);
+  });
+});

@@ -1,9 +1,14 @@
 import { posix } from "node:path";
 import { branchName, worktreePath } from "./paths.js";
 
-export type Agent = "claude" | "codex";
-export type Status =
-  | "pending" | "running" | "integrating" | "done" | "failed" | "escalated" | "skipped";
+export const AGENTS = ["claude", "codex"] as const;
+export const KINDS = ["leaf", "parent"] as const;
+export const STATUSES = [
+  "pending", "running", "integrating", "done", "failed", "escalated", "skipped",
+] as const;
+
+export type Agent = (typeof AGENTS)[number];
+export type Status = (typeof STATUSES)[number];
 
 export type PlanNode = {
   title: string;
@@ -17,7 +22,7 @@ export type Node = {
   id: string;
   parentId: string | null;
   depth: number;
-  kind: "leaf" | "parent";
+  kind: (typeof KINDS)[number];
   title: string;
   prompt: string;
   files: string[];

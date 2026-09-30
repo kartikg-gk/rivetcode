@@ -2,8 +2,8 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { assertId } from "./paths.js";
-import type { Node } from "./tree.js";
+import { assertId, branchName, samePath, worktreePath } from "./paths.js";
+import { AGENTS, KINDS, STATUSES, type Node } from "./tree.js";
 
 export type Run = {
   version: 1;
@@ -99,7 +99,46 @@ export async function loadRun(repo: string, runId: string): Promise<Run> {
   if (run?.version !== 1) throw new RunStoreError(`${file}: unsupported version ${String(run?.version)}`);
   if (run.id !== runId) throw new RunStoreError(`${file}: id ${String(run.id)} does not match file name`);
   if (!Array.isArray(run.nodes)) throw new RunStoreError(`${file}: nodes is not a list`);
+  const problem = checkRun(run as Run, repo);
+  if (problem) throw new RunStoreError(`${file}: ${problem}`);
   return run as Run;
+}
+
+const isString = (v: unknown): v is string => typeof v === "string";
+
+// Later steps run git on these branches and paths, so a hand-edited file must not
+// be able to point them anywhere else.
+function checkRun(run: Run, repo: string): string | null {
+  if (!isString(run.repo) || !samePath(run.repo, repo)) return `repo ${String(run.repo)} is not ${repo}`;
+  for (const key of ["base", "task", "createdAt"] as const) {
+    if (!isString(run[key])) return `${key} is missing or not text`;
+  }
+  const ids = new Set<string>();
+  for (const [i, n] of run.nodes.entries()) {
+    if (typeof n !== "object" || n === null) return `node ${i} is not an object`;
+    try {
+      assertId("node", n.id);
+    } catch {
+      return `node ${i} has an invalid id ${String(n.id)}`;
+    }
+    ids.add(n.id);
+  }
+  for (const n of run.nodes) {
+    const where = `node ${n.id}`;
+    if (!(KINDS as readonly string[]).includes(n.kind)) return `${where} has unknown kind ${String(n.kind)}`;
+    if (!(STATUSES as readonly string[]).includes(n.status)) return `${where} has unknown status ${String(n.status)}`;
+    if (!(AGENTS as readonly string[]).includes(n.agent)) return `${where} has unknown agent ${String(n.agent)}`;
+    if (!Number.isInteger(n.attempts) || n.attempts < 0) return `${where} has invalid attempts ${String(n.attempts)}`;
+    if (n.parentId !== null && !ids.has(n.parentId)) return `${where} has unknown parent ${String(n.parentId)}`;
+    if (n.branch !== branchName(run.id, n.id)) return `${where} has unexpected branch ${String(n.branch)}`;
+    if (!isString(n.worktree) || !samePath(n.worktree, worktreePath(repo, run.id, n.id))) {
+      return `${where} has unexpected worktree ${String(n.worktree)}`;
+    }
+    if (!isString(n.title) || !isString(n.prompt) || !Array.isArray(n.files) || !n.files.every(isString)) {
+      return `${where} has a missing title, prompt or files`;
+    }
+  }
+  return null;
 }
 
 export async function listRuns(repo: string): Promise<string[]> {
