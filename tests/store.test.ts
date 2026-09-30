@@ -1,6 +1,7 @@
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { git } from "../src/git.js";
 import { assertId } from "../src/paths.js";
 import { listRuns, loadRun, newRunId, runFile, RunStoreError, saveRun, type Run } from "../src/store.js";
 import { buildTree, setStatus } from "../src/tree.js";
@@ -138,5 +139,12 @@ describe("loadRun shape checks", () => {
     expect(err).toBeInstanceOf(RunStoreError);
     expect(err.message).toMatch(/r1\.json/);
     expect(err.message).toMatch(message);
+  });
+});
+
+describe("run files and git", () => {
+  it("keep .rivet/ out of git status from the first save", async () => {
+    await saveRun(sampleRun());
+    expect((await git(["status", "--porcelain"], repo)).trim()).toBe("");
   });
 });

@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { assertId, branchName, samePath, worktreePath } from "./paths.js";
+import { assertId, branchName, ensureExcluded, samePath, worktreePath } from "./paths.js";
 import { AGENTS, KINDS, STATUSES, type Node } from "./tree.js";
 
 export type Run = {
@@ -42,7 +42,7 @@ export function saveRun(run: Run): Promise<void> {
   // Serialize now: the caller may keep changing `run` while the save waits its turn.
   const text = JSON.stringify(run, null, 2) + "\n";
   const key = process.platform === "win32" ? file.toLowerCase() : file;
-  const write = () => writeAtomically(file, text);
+  const write = () => writeAtomically(run.repo, file, text);
   const task = (queues.get(key) ?? Promise.resolve()).then(write, write);
   const tail = task.catch(() => {});
   queues.set(key, tail);
@@ -52,7 +52,8 @@ export function saveRun(run: Run): Promise<void> {
   return task;
 }
 
-async function writeAtomically(file: string, text: string): Promise<void> {
+async function writeAtomically(repo: string, file: string, text: string): Promise<void> {
+  await ensureExcluded(repo);
   await mkdir(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
