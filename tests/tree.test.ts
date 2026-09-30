@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildTree, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
+import { buildTree, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
 
 const leaf = (title: string, files: string[] = []): PlanNode => ({ title, prompt: `do ${title}`, files });
 const repo = join("C:", "repo x");
@@ -91,5 +91,43 @@ describe("validatePlan", () => {
   it("allows different files and similar prefixes", () => {
     const plan: PlanNode = { title: "r", prompt: "p", children: [leaf("a", ["src/a.ts"]), leaf("b", ["src/ab.ts", "srcx/"])] };
     expect(validatePlan(plan)).toEqual([]);
+  });
+});
+
+describe("setStatus", () => {
+  const plan: PlanNode = { title: "r", prompt: "p", children: [leaf("a"), leaf("b")] };
+  const fresh = () => buildTree({ runId: "r1", repo, plan, defaultAgent: "claude" });
+
+  it("moves a leaf through a retry and counts attempts", () => {
+    let nodes = fresh();
+    nodes = setStatus(nodes, "root.1", "running");
+    nodes = setStatus(nodes, "root.1", "failed");
+    nodes = setStatus(nodes, "root.1", "running");
+    nodes = setStatus(nodes, "root.1", "done", "added table");
+    const n = nodes.find((x) => x.id === "root.1")!;
+    expect(n).toMatchObject({ status: "done", attempts: 2, summary: "added table" });
+  });
+
+  it("does not mutate the input", () => {
+    const nodes = fresh();
+    setStatus(nodes, "root.1", "running");
+    expect(nodes[1]!.status).toBe("pending");
+  });
+
+  it("parents integrate, they never run", () => {
+    expect(() => setStatus(fresh(), "root", "running")).toThrow(/root.*parent.*pending.*running/);
+    const n = setStatus(fresh(), "root", "integrating").find((x) => x.id === "root")!;
+    expect(n).toMatchObject({ status: "integrating", attempts: 1 });
+  });
+
+  it("rejects leaving a final state", () => {
+    let nodes = setStatus(setStatus(fresh(), "root.1", "running"), "root.1", "done");
+    expect(() => setStatus(nodes, "root.1", "running")).toThrow(/done.*running/);
+    nodes = setStatus(fresh(), "root.2", "skipped");
+    expect(() => setStatus(nodes, "root.2", "running")).toThrow(/skipped/);
+  });
+
+  it("rejects an unknown node", () => {
+    expect(() => setStatus(fresh(), "root.9", "running")).toThrow(/unknown node root\.9/);
   });
 });

@@ -113,3 +113,35 @@ export function buildTree(o: {
   visit(o.plan, "root", null, 0);
   return nodes;
 }
+
+const TRANSITIONS: Record<Node["kind"], Partial<Record<Status, Status[]>>> = {
+  leaf: {
+    pending: ["running", "skipped"],
+    running: ["done", "failed", "escalated", "skipped"],
+    failed: ["running", "escalated", "skipped"],
+    escalated: ["running", "skipped"],
+  },
+  parent: {
+    pending: ["integrating"],
+    integrating: ["done", "failed", "escalated"],
+    failed: ["integrating", "escalated"],
+    escalated: ["integrating"],
+  },
+};
+
+export function setStatus(nodes: Node[], id: string, to: Status, summary?: string): Node[] {
+  const i = nodes.findIndex((n) => n.id === id);
+  if (i < 0) throw new Error(`unknown node ${id}`);
+  const n = nodes[i]!;
+  if (!(TRANSITIONS[n.kind][n.status] ?? []).includes(to)) {
+    throw new Error(`${id} (${n.kind}) cannot go from ${n.status} to ${to}`);
+  }
+  const working = to === "running" || to === "integrating";
+  const next: Node = {
+    ...n,
+    status: to,
+    attempts: working ? n.attempts + 1 : n.attempts,
+    ...(summary !== undefined ? { summary } : {}),
+  };
+  return nodes.map((x, j) => (j === i ? next : x));
+}
