@@ -65,3 +65,30 @@ export async function listWorktrees(repo: string): Promise<Worktree[]> {
   }
   return list;
 }
+
+export class DirtyWorktreeError extends WorktreeError {
+  constructor(path: string) {
+    super(`worktree has uncommitted or untracked changes, not removing: ${path}`);
+    this.name = "DirtyWorktreeError";
+  }
+}
+
+export async function isDirty(path: string): Promise<boolean> {
+  const out = await git(["status", "--porcelain", "--untracked-files=all"], path);
+  return out.trim() !== "";
+}
+
+export async function pruneWorktrees(repo: string): Promise<void> {
+  await git(["worktree", "prune"], repo);
+}
+
+// Never passes --force: a dirty worktree may hold an agent's only copy of its work.
+export async function removeWorktree(repo: string, path: string): Promise<void> {
+  const full = resolve(path);
+  if (!existsSync(full)) {
+    await pruneWorktrees(repo);
+    return;
+  }
+  if (await isDirty(full)) throw new DirtyWorktreeError(full);
+  await git(["worktree", "remove", full], repo);
+}

@@ -1,10 +1,18 @@
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { branchName, worktreePath } from "../src/paths.js";
-import { createWorktree, listWorktrees, WorktreeError } from "../src/worktree.js";
+import {
+  createWorktree,
+  DirtyWorktreeError,
+  isDirty,
+  listWorktrees,
+  pruneWorktrees,
+  removeWorktree,
+  WorktreeError,
+} from "../src/worktree.js";
 import { makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
@@ -84,5 +92,65 @@ describe("listWorktrees", () => {
     expect(list[0]!.branch).toBe("main");
     expect(list[1]!.branch).toBe("rivet/r1/root");
     expect(list.every((w) => w.prunable === false)).toBe(true);
+  });
+});
+
+describe("isDirty", () => {
+  it("is false for a fresh worktree", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    expect(await isDirty(path)).toBe(false);
+  });
+
+  it("is true for a modified tracked file", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await writeFile(join(path, "README.txt"), "changed\n");
+    expect(await isDirty(path)).toBe(true);
+  });
+
+  it("is true for an untracked file nobody added", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await writeFile(join(path, "new.ts"), "export {}\n");
+    expect(await isDirty(path)).toBe(true);
+  });
+});
+
+describe("removeWorktree", () => {
+  it("removes a clean worktree and keeps its branch", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await removeWorktree(repo, path);
+    expect(existsSync(path)).toBe(false);
+    expect(await branchExists("rivet/r1/root")).toBe(true);
+    expect((await listWorktrees(repo)).map((w) => w.path)).toEqual([resolve(repo)]);
+  });
+
+  it("refuses a worktree with only an untracked file, and leaves it intact", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await writeFile(join(path, "new.ts"), "export {}\n");
+    await expect(removeWorktree(repo, path)).rejects.toThrow(DirtyWorktreeError);
+    expect(existsSync(join(path, "new.ts"))).toBe(true);
+  });
+
+  it("handles a worktree directory deleted by hand", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await rm(path, { recursive: true, force: true });
+    await removeWorktree(repo, path);
+    expect((await listWorktrees(repo)).map((w) => w.path)).toEqual([resolve(repo)]);
+  });
+});
+
+describe("pruneWorktrees", () => {
+  it("drops records of missing worktree directories", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await rm(path, { recursive: true, force: true });
+    expect((await listWorktrees(repo))[1]!.prunable).toBe(true);
+    await pruneWorktrees(repo);
+    expect(await listWorktrees(repo)).toHaveLength(1);
   });
 });
