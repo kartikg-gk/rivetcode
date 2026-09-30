@@ -35,3 +35,10 @@ export async function ensureExcluded(repo: string): Promise<void> {
   const sep = current === "" || current.endsWith("\n") ? "" : "\n";
   await appendFile(file, `${sep}${EXCLUDE_LINE}\n`);
 }
+
+// Windows paths are case-insensitive; compare them that way there.
+export function samePath(a: string, b: string): boolean {
+  const x = resolve(a);
+  const y = resolve(b);
+  return process.platform === "win32" ? x.toLowerCase() === y.toLowerCase() : x === y;
+}

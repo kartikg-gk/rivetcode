@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { mkdir, readdir, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { git, GitError } from "./git.js";
-import { ensureExcluded } from "./paths.js";
+import { ensureExcluded, samePath } from "./paths.js";
 
 export type Worktree = {
   path: string;
@@ -85,6 +85,11 @@ export class DirtyWorktreeError extends WorktreeError {
 }
 
 export async function isDirty(path: string): Promise<boolean> {
+  // Inside a checkout but not at a worktree root, git status would report the enclosing repo.
+  const top = (await git(["rev-parse", "--show-toplevel"], path)).trim();
+  if (!samePath(top, await realpath(path))) {
+    throw new WorktreeError(`not a worktree root: ${path}`);
+  }
   const out = await git(["status", "--porcelain", "--untracked-files=all"], path);
   return out.trim() !== "";
 }
@@ -95,10 +100,19 @@ export async function pruneWorktrees(repo: string): Promise<void> {
 
 // Never passes --force: a dirty worktree may hold an agent's only copy of its work.
 export async function removeWorktree(repo: string, path: string): Promise<void> {
-  const full = resolve(path);
+  const full = existsSync(path) ? await realpath(path) : resolve(path);
+  const registered = (await listWorktrees(repo)).some((w) => samePath(w.path, full));
   if (!existsSync(full)) {
-    await pruneWorktrees(repo);
+    if (registered) await pruneWorktrees(repo);
     return;
+  }
+  if (!registered) {
+    // Left behind when an earlier removal unregistered the worktree but could not delete the folder.
+    if ((await readdir(full)).length === 0) {
+      await rmdir(full);
+      return;
+    }
+    throw new WorktreeError(`not a worktree of this repo, not removing: ${full}`);
   }
   if (await isDirty(full)) throw new DirtyWorktreeError(full);
   await git(["worktree", "remove", full], repo);

@@ -199,6 +199,36 @@ describe("removeWorktree", () => {
   });
 });
 
+describe("removeWorktree after a partial removal", () => {
+  it("cleans up an empty leftover directory git no longer tracks", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await git(["worktree", "remove", path], repo);
+    await mkdir(path, { recursive: true });
+
+    await removeWorktree(repo, path);
+
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("refuses a non-empty directory that is not a worktree, and leaves it intact", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, "keep.txt"), "k\n");
+
+    await expect(removeWorktree(repo, path)).rejects.toThrow(WorktreeError);
+    expect(existsSync(join(path, "keep.txt"))).toBe(true);
+  });
+
+  it("isDirty refuses a directory that is not a worktree root", async () => {
+    const dir = join(repo, ".rivet", "wt", "r1", "root");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(repo, "README.txt"), "main repo is dirty\n");
+
+    await expect(isDirty(dir)).rejects.toThrow(WorktreeError);
+  });
+});
+
 describe("pruneWorktrees", () => {
   it("drops records of missing worktree directories", async () => {
     const path = worktreePath(repo, "r1", "root");
