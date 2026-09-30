@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -80,6 +81,42 @@ describe("createWorktree", () => {
     ).rejects.toThrow();
     expect(existsSync(path)).toBe(false);
     expect(await branchExists("rivet/r1/root")).toBe(false);
+  });
+});
+
+describe("createWorktree rollback", () => {
+  // A start commit git accepts as a ref but refuses to check out: its tree has a ".git" entry.
+  async function uncheckoutableCommit(): Promise<string> {
+    const blob = (await git(["rev-parse", "HEAD:README.txt"], repo)).trim();
+    const tree = execFileSync("git", ["mktree"], {
+      cwd: repo,
+      input: `100644 blob ${blob}\tREADME.txt\n100644 blob ${blob}\t.git\n`,
+    }).toString().trim();
+    return (await git(["commit-tree", tree, "-p", "HEAD", "-m", "bad"], repo)).trim();
+  }
+
+  it("deletes the branch it created when checkout fails, so a retry works", async () => {
+    const bad = await uncheckoutableCommit();
+    const path = worktreePath(repo, "r1", "root");
+
+    await expect(
+      createWorktree({ repo, path, branch: "rivet/r1/root", from: bad }),
+    ).rejects.toThrow();
+
+    expect(await branchExists("rivet/r1/root")).toBe(false);
+    expect(existsSync(path)).toBe(false);
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+  });
+
+  it("re-creates at a path whose worktree was deleted by hand", async () => {
+    const path = worktreePath(repo, "r1", "root");
+    await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
+    await rm(path, { recursive: true, force: true });
+
+    const wt = await createWorktree({ repo, path, branch: "rivet/r1/again", from: "main" });
+
+    expect(wt.branch).toBe("rivet/r1/again");
+    expect(existsSync(join(path, "README.txt"))).toBe(true);
   });
 });
 

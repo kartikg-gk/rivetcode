@@ -41,7 +41,17 @@ export async function createWorktree(o: {
   }
   await ensureExcluded(o.repo);
   await mkdir(dirname(path), { recursive: true });
-  await git(["worktree", "add", "-b", o.branch, path, o.from], o.repo);
+  // Drops records of worktree directories deleted by hand, which would block this path.
+  await pruneWorktrees(o.repo);
+  // Branch first, checkout second: if checkout fails we know the branch is ours to delete.
+  await git(["branch", o.branch, o.from], o.repo);
+  try {
+    await git(["worktree", "add", path, o.branch], o.repo);
+  } catch (e) {
+    await pruneWorktrees(o.repo).catch(() => {});
+    await git(["branch", "-D", o.branch], o.repo).catch(() => {});
+    throw e;
+  }
   const head = (await git(["rev-parse", "HEAD"], path)).trim();
   return { path, branch: o.branch, head, prunable: false };
 }
