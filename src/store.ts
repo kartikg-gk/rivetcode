@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { assertId } from "./paths.js";
 import type { Node } from "./tree.js";
 
@@ -31,18 +32,51 @@ export function runFile(repo: string, runId: string): string {
   return join(repo, ".rivet", "runs", `${runId}.json`);
 }
 
+// Saves of the same run are queued so the last call always wins.
+const queues = new Map<string, Promise<void>>();
+
 // Write to a temp file and rename it over the old one, so a crash mid-write
 // never leaves a half-written run file.
-export async function saveRun(run: Run): Promise<void> {
+export function saveRun(run: Run): Promise<void> {
   const file = runFile(run.repo, run.id);
+  // Serialize now: the caller may keep changing `run` while the save waits its turn.
+  const text = JSON.stringify(run, null, 2) + "\n";
+  const key = process.platform === "win32" ? file.toLowerCase() : file;
+  const write = () => writeAtomically(file, text);
+  const task = (queues.get(key) ?? Promise.resolve()).then(write, write);
+  const tail = task.catch(() => {});
+  queues.set(key, tail);
+  void tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key);
+  });
+  return task;
+}
+
+async function writeAtomically(file: string, text: string): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    await writeFile(tmp, JSON.stringify(run, null, 2) + "\n");
-    await rename(tmp, file);
+    await writeFile(tmp, text);
+    await renameWithRetry(tmp, file);
   } catch (e) {
     await rm(tmp, { force: true });
     throw e;
+  }
+}
+
+// Windows refuses to replace a file another handle has open (a reader, an antivirus scan).
+// Those locks are brief, so retry for a few seconds before giving up.
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      const busy = code === "EPERM" || code === "EACCES" || code === "EBUSY";
+      if (!busy || attempt >= 20) throw e;
+      await sleep(25 * (attempt + 1));
+    }
   }
 }
 

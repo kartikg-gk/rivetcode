@@ -84,3 +84,31 @@ describe("listRuns", () => {
     expect(await listRuns(repo)).toEqual(["r1", "r2"]);
   });
 });
+
+describe("overlapping saves", () => {
+  it("never reject, and the last call wins even when an older save is bigger", async () => {
+    const base = sampleRun();
+    const saves = Array.from({ length: 40 }, (_, i) =>
+      saveRun({ ...base, task: `v${i}${"x".repeat((40 - i) * 2000)}` }),
+    );
+    let reading = true;
+    const reader = (async () => {
+      while (reading) await loadRun(repo, "r1").catch(() => {});
+    })();
+
+    const results = await Promise.allSettled(saves);
+    reading = false;
+    await reader;
+
+    expect(results.filter((r) => r.status === "rejected")).toEqual([]);
+    expect((await loadRun(repo, "r1")).task.startsWith("v39")).toBe(true);
+  });
+
+  it("writes the state as it was when saveRun was called", async () => {
+    const run = sampleRun();
+    const pending = saveRun(run);
+    run.task = "changed after the call";
+    await pending;
+    expect((await loadRun(repo, "r1")).task).toBe("add login");
+  });
+});
