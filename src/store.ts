@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
-import { ACTIVITY_STATES, AGENTS, KINDS, PR_STATUSES, STATUSES, type Node } from "./tree.js";
+import { ACTIVITY_STATES, AGENTS, KINDS, PR_STATUSES, STATUSES, type ActivityState, type Node } from "./tree.js";
 
 export type Run = {
   id: string;
@@ -19,6 +19,9 @@ export type Store = {
   saveRun(run: Run): void;
   loadRun(runId: string): Run;
   listRuns(project?: string): string[];
+  setActivity(runId: string, nodeId: string, state: ActivityState, agentSessionId?: string): boolean;
+  createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
+  queueMessage(runId: string, nodeId: string, message: string, from?: string): number | null;
   close(): void;
 };
 
@@ -71,6 +74,28 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 `;
 MIGRATIONS.push({ version: 1, sql: INIT });
+MIGRATIONS.push({ version: 2, sql: `
+ALTER TABLE nodes ADD COLUMN agent_session_id TEXT;
+CREATE TABLE reports (
+  id INTEGER PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('done', 'stuck', 'needs-input')),
+  message TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+CREATE TABLE outbox (
+  id INTEGER PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  from_session TEXT,
+  message TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+` });
 
 function migrate(db: DatabaseSync): void {
   db.exec(
@@ -98,7 +123,7 @@ type RunRow = { id: string; project: string; repo: string; base: string; task: s
 type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
-  summary: string | null; activity: string | null; pr_status: string | null;
+  summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -118,10 +143,17 @@ export function openStore(data: string): Store {
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
-      branch, worktree, status, attempts, summary, activity, pr_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
+  const updateActivity = db.prepare(`UPDATE nodes SET activity = ?, agent_session_id = COALESCE(?, agent_session_id)
+    WHERE run_id = ? AND id = ?`);
+  const sessionExists = db.prepare("SELECT 1 FROM nodes WHERE run_id = ? AND id = ?");
+  const insertReport = db.prepare(`INSERT INTO reports (run_id, node_id, kind, message, created_at)
+    VALUES (?, ?, ?, ?, ?)`);
+  const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at)
+    VALUES (?, ?, ?, ?, ?)`);
 
   function check(run: Run): void {
     assertId("run", run.id);
@@ -157,7 +189,7 @@ export function openStore(data: string): Store {
           insertNode.run(
             run.id, n.id, position, n.parentId, n.depth, n.kind, n.title, n.prompt,
             JSON.stringify(n.files), n.agent, n.branch, n.worktree, n.status, n.attempts,
-            n.summary ?? null, n.activity ?? null, n.prStatus ?? null,
+            n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
           );
         });
         db.exec("COMMIT");
@@ -185,6 +217,7 @@ export function openStore(data: string): Store {
         attempts: n.attempts,
         ...(n.summary !== null ? { summary: n.summary } : {}),
         ...(n.activity !== null ? { activity: n.activity as Node["activity"] } : {}),
+        ...(n.agent_session_id !== null ? { agentSessionId: n.agent_session_id } : {}),
         ...(n.pr_status !== null ? { prStatus: n.pr_status as Node["prStatus"] } : {}),
       }));
       return {
@@ -198,6 +231,20 @@ export function openStore(data: string): Store {
         ? db.prepare("SELECT id FROM runs ORDER BY id").all()
         : db.prepare("SELECT id FROM runs WHERE project = ? ORDER BY id").all(project)) as { id: string }[];
       return rows.map((r) => r.id);
+    },
+
+    setActivity(runId, nodeId, state, agentSessionId) {
+      return updateActivity.run(state, agentSessionId ?? null, runId, nodeId).changes > 0;
+    },
+
+    createReport(runId, nodeId, kind, message) {
+      if (!sessionExists.get(runId, nodeId)) return null;
+      return Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
+    },
+
+    queueMessage(runId, nodeId, message, from) {
+      if (!sessionExists.get(runId, nodeId)) return null;
+      return Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString()).lastInsertRowid);
     },
 
     close() {

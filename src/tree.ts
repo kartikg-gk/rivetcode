@@ -45,6 +45,7 @@ export type Node = {
   attempts: number;
   summary?: string;
   activity?: ActivityState;
+  agentSessionId?: string;
   prStatus?: PrStatus;
 };
 

@@ -141,9 +141,24 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1]);
+    expect(versions()).toEqual([1, 2]);
     store.close();
     store = openStore(data);
+    expect(versions()).toEqual([1, 2]);
+  });
+
+  it("applies migration 2 once to a version 1 database", () => {
+    store.saveRun(sampleRun());
+    store.close();
+    const db = new DatabaseSync(join(data, "rivet.db"));
+    db.exec("DROP TABLE reports; DROP TABLE outbox; ALTER TABLE nodes DROP COLUMN agent_session_id; DELETE FROM schema_migrations WHERE version = 2");
+    db.close();
     expect(versions()).toEqual([1]);
+    store = openStore(data);
+    expect(versions()).toEqual([1, 2]);
+    expect(store.loadRun("r1").nodes).toHaveLength(2);
+    store.close();
+    store = openStore(data);
+    expect(versions()).toEqual([1, 2]);
   });
 });
