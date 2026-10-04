@@ -19,7 +19,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -395,6 +395,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           data, repo: payload.repo, task: payload.task, plan: payload.plan as never,
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
           defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
+          copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
         });
       } catch (error) {
         if (error instanceof RunInputError) throw new HttpError(400, error.message);

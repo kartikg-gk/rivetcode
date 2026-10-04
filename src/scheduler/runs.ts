@@ -1,4 +1,6 @@
-import { realpath } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { cp, mkdir, realpath } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { git } from "../git.js";
 import { assertProjectId, defaultProjectId } from "../paths.js";
 import { newRunId, type Run } from "../store.js";
@@ -21,6 +23,8 @@ export type NewRun = {
   agent?: string;
   // The project's configured default agent, used when no agent is given.
   defaultAgentFor?(project: string): string | undefined;
+  // Untracked files to copy from the repo into every worktree (e.g. .env).
+  copyFor?(project: string): string[];
 };
 
 async function repoRoot(dir: string): Promise<string> {
@@ -61,6 +65,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
     for (const n of nodes) {
       const from = n.parentId === null ? base : nodes.find((p) => p.id === n.parentId)!.branch;
       await createWorktree({ repo, path: n.worktree, branch: n.branch, from });
+      await copyListed(repo, n.worktree, o.copyFor?.(project) ?? []);
       made.push({ path: n.worktree, branch: n.branch });
     }
   } catch (e) {
@@ -71,6 +76,27 @@ export async function prepareRun(o: NewRun): Promise<Run> {
     throw e;
   }
   return { id, project, repo, base, task: o.task.trim(), createdAt: new Date().toISOString(), nodes };
+}
+
+// Only the listed files, never everything untracked; a missing one is skipped. They are
+// local files git does not track, so they go away with the worktree.
+async function copyListed(repo: string, worktree: string, files: string[]): Promise<void> {
+  for (const file of files) {
+    const rel = file.trim().replace(/\\/g, "/");
+    if (!rel || rel.startsWith("/") || /^[a-zA-Z]:/.test(rel) || rel.split("/").includes("..")) {
+      throw new RunInputError(`copy entry must be a path inside the repo: "${file}"`);
+    }
+    const from = join(repo, rel);
+    if (!existsSync(from)) continue;
+    // A copied file that git tracks or would add could end up committed (a .env with secrets).
+    try {
+      await git(["check-ignore", "-q", "--no-index", rel], repo);
+    } catch {
+      throw new RunInputError(`copy only takes files git ignores; "${rel}" is not ignored`);
+    }
+    await mkdir(dirname(join(worktree, rel)), { recursive: true });
+    await cp(from, join(worktree, rel), { recursive: true });
+  }
 }
 
 // Removes a run's worktrees. Branches stay (they hold the work); dirty worktrees stay too.
