@@ -16,6 +16,8 @@ export type StartOptions = {
   argv: string[];
   // Added on top of the daemon's own environment.
   env: Record<string, string>;
+  // Given when the caller already told the agent its launch id; otherwise one is made.
+  launchId?: string;
 };
 
 export type Launch = { sessionId: string; launchId: string };
@@ -33,6 +35,10 @@ export type Runtime = {
   liveSessions(): string[];
   onExit(listener: ExitListener): () => void;
 };
+
+export function newLaunchId(): string {
+  return randomBytes(8).toString("hex");
+}
 
 // One agent process and everything it printed.
 type Proc = {
@@ -86,7 +92,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
     }
 
     mkdirSync(o.logDir, { recursive: true });
-    const launchId = randomBytes(8).toString("hex");
+    const launchId = opts.launchId ?? newLaunchId();
     let markClosed!: () => void;
     const p: Proc = {
       launchId, child, alive: true, exitCode: null, lines: [], partial: "",
