@@ -1,8 +1,9 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, GitError } from "./git.js";
+import { signalTree } from "./proc.js";
 import { isDirty } from "./worktree.js";
 
 export async function headOf(worktree: string): Promise<string> {
@@ -91,16 +92,6 @@ export type CommandResult = { ok: boolean; output: string };
 
 const OUTPUT_LIMIT = 20_000;
 
-// Ends a command and everything it started (a shell's children would otherwise
-// keep running and keep the worktree busy).
-function killTree(pid: number): void {
-  if (process.platform === "win32") {
-    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, () => {});
-  } else {
-    try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
-  }
-}
-
 // Runs a user-configured check or test command through the shell, in the given worktree.
 export function runCommand(command: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
   return new Promise((resolve) => {
@@ -115,7 +106,7 @@ export function runCommand(command: string, cwd: string, timeoutMs: number): Pro
     child.stderr.on("data", collect);
     const timer = setTimeout(() => {
       timedOut = true;
-      if (child.pid !== undefined) killTree(child.pid);
+      if (child.pid !== undefined) signalTree(child.pid, "SIGKILL");
     }, timeoutMs);
     const finish = (ok: boolean) => {
       clearTimeout(timer);
