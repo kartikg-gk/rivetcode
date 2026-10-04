@@ -1,5 +1,6 @@
 import type { Permission, PromptVia } from "./command.js";
 import { claudeAgent } from "./claude.js";
+import { codexAgent } from "./codex.js";
 import { fakeAgent } from "./fake.js";
 
 export type AgentLaunch = {
@@ -34,12 +35,14 @@ export type Agent = {
   hooksInstalled(workspace: string): Promise<boolean>;
 };
 
-export type AgentName = "claude" | "fake";
+export type AgentName = "claude" | "codex" | "fake";
 
 export function getAgent(name: AgentName, opts: { binary?: string } = {}): Agent {
   switch (name) {
     case "claude":
       return claudeAgent(opts.binary ?? "claude");
+    case "codex":
+      return codexAgent(opts.binary ?? "codex");
     case "fake":
       return fakeAgent();
     default:

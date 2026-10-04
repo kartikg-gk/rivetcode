@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
-import { findClaude } from "../agents/locate.js";
+import { findClaude, findCodex } from "../agents/locate.js";
 import { claudePlanner } from "../planner/claude-runner.js";
 import { extractReplan, replanPrompt } from "../planner/planner.js";
 import { dataDir, assertId } from "../paths.js";
@@ -133,8 +133,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   } catch (error) { store.close(); throw error; }
 
   let claudeBinary: string | undefined;
+  let codexBinary: string | undefined;
   const agents = opts.agents ?? ((name: Node["agent"]) => {
-    if (name === "codex") throw new HttpError(409, `agent "${name}" is not supported yet`);
+    if (name === "codex") {
+      try { codexBinary ??= findCodex(); }
+      catch (e) { throw new HttpError(409, (e as Error).message); }
+      return getAgent("codex", { binary: codexBinary });
+    }
     if (name === "claude") {
       try { claudeBinary ??= findClaude(); }
       catch (e) { throw new HttpError(409, (e as Error).message); }

@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { claudeCandidates, findClaude } from "../src/agents/locate.js";
+import { claudeCandidates, findClaude, findCodex } from "../src/agents/locate.js";
 import { makeDataDir, removeRepo } from "./helpers.js";
 
 let dir: string;
@@ -56,5 +56,24 @@ describe("findClaude", () => {
   it("honours an explicit RIVET_CLAUDE_BIN", async () => {
     const custom = await touch("custom", "my-claude");
     expect(findClaude({ platform: "linux", env: { PATH: "", RIVET_CLAUDE_BIN: custom }, home: dir })).toBe(custom);
+  });
+});
+
+describe("findCodex", () => {
+  it("finds codex on the PATH, skipping Windows Store aliases", async () => {
+    const alias = await touch("WindowsApps", "codex.exe");
+    const real = await touch("OpenAI", "codex.exe");
+    expect(findCodex({ platform: "win32", env: { PATH: [join(dir, "WindowsApps"), join(dir, "OpenAI")].join(";") }, home: dir })).toBe(real);
+    expect(alias).toBeTruthy();
+  });
+
+  it("prefers npm's native executable and unwraps the shim", async () => {
+    await touch("roaming", "npm", "codex.cmd");
+    const native = await touch("roaming", "npm", "node_modules", "@openai", "codex", "bin", "codex.exe");
+    expect(findCodex({ platform: "win32", env: { PATH: "", APPDATA: join(dir, "roaming") }, home: dir })).toBe(native);
+  });
+
+  it("says clearly when codex is missing", () => {
+    expect(() => findCodex({ platform: "linux", env: { PATH: "" }, home: dir })).toThrow(/codex was not found/);
   });
 });
