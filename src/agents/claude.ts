@@ -41,7 +41,10 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath()): Ag
     promptVia: "argv",
     // Print mode reads stdin only at start, so a headless claude takes no messages.
     acceptsInput: ({ headless }) => !headless,
-    launchCommand: ({ headless, ...cfg }) => claudeStartCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
+    // An agent Rivet starts in a terminal must not stop at a browser question or drive the user's browser.
+    launchCommand: ({ headless, ...cfg }) => claudeStartCommand({
+      binary, ...cfg, ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+    }),
     restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
     installHooks: (workspace) => claudeHooks.install(workspace),
     uninstallHooks: (workspace) => claudeHooks.uninstall(workspace),
