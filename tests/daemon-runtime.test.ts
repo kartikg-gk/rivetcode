@@ -99,6 +99,7 @@ describe("starting agents", () => {
       RIVET_DATA_DIR: data,
       RIVET_RUN_FILE: runFile,
       RIVET_LAUNCH_ID: launchId,
+      RIVET_ATTEMPT: "0",
     });
     await until(() => activity() === "exited");
   });
