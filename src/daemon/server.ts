@@ -17,7 +17,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "planner.model"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -235,11 +235,54 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       res.end(JSON.stringify({ status: "shutting_down", pid: process.pid }), () => { void stop(); });
       return;
     }
-    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output)$/.exec(path);
+    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output|attach|input|resize)$/.exec(path);
     if (control) {
       const [, id, action] = control;
       const { runId, nodeId } = session(id);
       const sessionId = sessionIdOf(runId, nodeId);
+      if (action === "attach") {
+        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+        // Streams the terminal: recent output first, then everything new, until exit.
+        let ended = false;
+        let watch: { replay: string; detach(): void } | null = null;
+        const finish = () => {
+          if (ended) return;
+          ended = true;
+          watch?.detach();
+          offExit();
+          res.end();
+        };
+        const offExit = runtime.onExit((s) => { if (s === sessionId) finish(); });
+        watch = runtime.attach(sessionId, (chunk) => { if (!ended) res.write(chunk); });
+        if (!watch) { offExit(); throw new HttpError(404, "session has not been started"); }
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        res.write(watch.replay);
+        req.on("close", finish);
+        if (!runtime.isAlive(sessionId)) finish();
+        return;
+      }
+      if (action === "input" || action === "resize") {
+        if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+        if (!runtime.isAlive(sessionId)) throw new HttpError(404, "session is not running");
+        const payload = await body(req);
+        try {
+          if (action === "input") {
+            if (typeof payload.data !== "string") throw new HttpError(400, "data must be a string");
+            runtime.input(sessionId, payload.data);
+          } else {
+            const { cols, rows } = payload;
+            if (!Number.isInteger(cols) || !Number.isInteger(rows) || (cols as number) < 1 || (rows as number) < 1) {
+              throw new HttpError(400, "cols and rows must be positive integers");
+            }
+            runtime.resize(sessionId, cols as number, rows as number);
+          }
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(409, (error as Error).message);
+        }
+        reply(res, 204);
+        return;
+      }
       if (action === "output") {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         const raw = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("lines");

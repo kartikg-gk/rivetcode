@@ -229,3 +229,51 @@ describe("hook activity from agents", () => {
     finally { store.close(); }
   });
 });
+
+describe("interactive mode (terminal sessions)", () => {
+  async function interactive(): Promise<void> {
+    await start();
+    const res = await fetch(url("/api/v1/projects/proj/config"), {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "worker.mode", value: "interactive" }),
+    });
+    expect(res.status).toBe(204);
+  }
+
+  it("streams the terminal to an attached client and takes typed lines", async () => {
+    await interactive();
+    const db = new DatabaseSync(join(data, "rivet.db"));
+    db.exec("UPDATE nodes SET status = 'running'");
+    db.close();
+    // A manual start uses the prompt as given; the scheduler path is covered elsewhere.
+    expect((await startLeaf({ files: { "a.txt": "a" }, listen: true })).status).toBe(202);
+    const attached = await fetch(url("/api/v1/sessions/r1-root.1/attach"));
+    expect(attached.status).toBe(200);
+    const reader = attached.body!.getReader();
+    let text = "";
+    const readUntil = async (needle: string) => {
+      const end = Date.now() + 10_000;
+      while (!text.includes(needle)) {
+        if (Date.now() > end) throw new Error(`no "${needle}" in ${JSON.stringify(text)}`);
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += new TextDecoder().decode(value);
+      }
+    };
+    await readUntil("wrote a.txt");
+    expect((await post("/api/v1/sessions/r1-root.1/send", { message: "hello there" })).status).toBe(202);
+    await readUntil("got hello there");
+    expect((await post("/api/v1/sessions/r1-root.1/resize", { cols: 100, rows: 30 })).status).toBe(204);
+    expect((await post("/api/v1/sessions/r1-root.1/resize", { cols: 0, rows: 30 })).status).toBe(400);
+    expect((await post("/api/v1/sessions/r1-root.1/input", { data: "/exit\r" })).status).toBe(204);
+    await readUntil("");
+    await reader.cancel();
+    await until(() => activity() === "exited");
+    expect((await post("/api/v1/sessions/r1-root.1/input", { data: "x" })).status).toBe(404);
+  });
+
+  it("input to a piped session is refused", async () => {
+    await start();
+    await startLeaf({ stayFor: 5000 });
+    expect((await post("/api/v1/sessions/r1-root.1/input", { data: "x" })).status).toBe(409);
+  });
+});
