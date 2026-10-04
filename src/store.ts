@@ -40,10 +40,12 @@ export type NodeUpdate = {
   attempts?: number;
   summary?: string | null;
   finishedAt?: string | null;
+  // A re-plan replaces a leaf's instructions.
+  prompt?: string;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
-  status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at",
+  status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt",
 };
 
 export class RunStoreError extends Error {

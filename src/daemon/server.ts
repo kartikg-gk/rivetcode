@@ -2,19 +2,21 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude } from "../agents/locate.js";
+import { claudePlanner } from "../planner/claude-runner.js";
+import { extractReplan, replanPrompt } from "../planner/planner.js";
 import { dataDir, assertId } from "../paths.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { cleanRun, prepareRun, RunInputError } from "../scheduler/runs.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
-import { openStore, RunStoreError } from "../store.js";
+import { openStore, RunStoreError, type Run } from "../store.js";
 import { ACTIVITY_STATES, type ActivityState, type Node } from "../tree.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "planner.model"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -28,6 +30,8 @@ export type DaemonOptions = {
   agents?: (name: Node["agent"]) => Agent;
   stopGraceMs?: number;
   checkTimeoutMs?: number;
+  // Rewrites a twice-failed leaf's instructions; defaults to a read-only claude planner.
+  replan?(run: Run, node: Node, why: string): Promise<string | null>;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -148,8 +152,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return result;
   }
 
+  const replan = opts.replan ?? (async (run: Run, node: Node, why: string): Promise<string | null> => {
+    // A scripted test agent has nothing to re-plan.
+    if (node.agent === "fake") return null;
+    let binary: string;
+    try { binary = claudeBinary ??= findClaude(); } catch { return null; }
+    const config = await write(() => store.getConfig(run.project));
+    const model = config["planner.model"] ?? config["worker.model"];
+    const planner = claudePlanner({ binary, repo: node.worktree, ...(model ? { model } : {}) });
+    return extractReplan(await planner(replanPrompt(run.task, node, why), { resume: false }));
+  });
   const scheduler = createScheduler({
-    data, runFile, store, write, runtime, agents, launches,
+    data, runFile, store, write, runtime, agents, launches, replan,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
   });
