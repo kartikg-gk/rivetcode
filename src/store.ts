@@ -22,6 +22,10 @@ export type Store = {
   setActivity(runId: string, nodeId: string, state: ActivityState, agentSessionId?: string): boolean;
   createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
   queueMessage(runId: string, nodeId: string, message: string, from?: string): number | null;
+  undeliveredMessages(runId: string, nodeId: string): { id: number; message: string }[];
+  markDelivered(id: number): void;
+  // After a daemon restart no agent is running; returns how many nodes were changed.
+  exitStaleSessions(): number;
   close(): void;
 };
 
@@ -154,6 +158,10 @@ export function openStore(data: string): Store {
     VALUES (?, ?, ?, ?, ?)`);
   const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at)
     VALUES (?, ?, ?, ?, ?)`);
+  const selectUndelivered = db.prepare(`SELECT id, message FROM outbox
+    WHERE run_id = ? AND node_id = ? AND delivered_at IS NULL ORDER BY id`);
+  const updateDelivered = db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
+  const updateStale = db.prepare("UPDATE nodes SET activity = 'exited' WHERE activity IS NOT NULL AND activity <> 'exited'");
 
   function check(run: Run): void {
     assertId("run", run.id);
@@ -245,6 +253,19 @@ export function openStore(data: string): Store {
     queueMessage(runId, nodeId, message, from) {
       if (!sessionExists.get(runId, nodeId)) return null;
       return Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString()).lastInsertRowid);
+    },
+
+    undeliveredMessages(runId, nodeId) {
+      return (selectUndelivered.all(runId, nodeId) as { id: number; message: string }[])
+        .map((r) => ({ id: Number(r.id), message: r.message }));
+    },
+
+    markDelivered(id) {
+      updateDelivered.run(new Date().toISOString(), id);
+    },
+
+    exitStaleSessions() {
+      return Number(updateStale.run().changes);
     },
 
     close() {
