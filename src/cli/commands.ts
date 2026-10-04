@@ -6,6 +6,8 @@ import type { Run } from "../store.js";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { readRunFile } from "../runfile.js";
+import { makePlan, planFiles, renderPlan, type PlannerRunner } from "../planner/planner.js";
+import { claimsOverlap, type PlanNode } from "../tree.js";
 import { agentSessionIdOf, deriveActivity } from "./activity.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
 
@@ -13,13 +15,18 @@ export type CliIo = {
   env: Record<string, string | undefined>;
   cwd: string;
   readStdin(): Promise<string>;
+  // Asks the user a question (only when a terminal is attached).
+  ask?(question: string): Promise<string>;
+  // Replaces the claude planner (tests).
+  planner?(repo: string): PlannerRunner;
   out(line: string): void;
   err(line: string): void;
 };
 
 const USAGE = `usage: rivet <command>
-  run --plan <file> [--repo <dir>] [--base <branch>] [--agent <name>] <task>
-                                        start a run from a plan (JSON task tree)
+  plan [--repo <dir>] <task>             let the planner propose a task tree and preview it
+  run [--plan <file>] [--yes] [--repo <dir>] [--base <branch>] [--agent <name>] <task>
+                                        start a run (plans first when no --plan is given)
   status [<run>]                        list runs, or show one run's tree
   resume <run>                          retry what was escalated or interrupted
   clean <run>                           remove a run's worktrees (branches stay)
@@ -169,21 +176,98 @@ async function daemon(args: string[], io: CliIo): Promise<number> {
   }
 }
 
+async function repoTop(dir: string): Promise<string> {
+  try {
+    return (await git(["rev-parse", "--show-toplevel"], dir)).trim();
+  } catch {
+    throw new Error(`not a git repository: ${dir}`);
+  }
+}
+
+// The planner's model comes from the project settings when the daemon is up.
+async function defaultPlanner(io: CliIo, repo: string): Promise<PlannerRunner> {
+  const { findClaude } = await import("../agents/locate.js");
+  const { claudePlanner } = await import("../planner/claude-runner.js");
+  const config = await callDaemon(io.env, "GET", `/api/v1/projects/${encodeURIComponent(defaultProjectId(repo))}/config`, undefined, HOOK_TIMEOUT_MS)
+    .catch(() => ({})) as Record<string, string>;
+  const model = config["planner.model"] ?? config["worker.model"];
+  return claudePlanner({ binary: findClaude(), repo, ...(model ? { model } : {}) });
+}
+
+// Files the plan claims that a run in flight is already touching.
+async function overlaps(io: CliIo, repo: string, plan: PlanNode): Promise<string[]> {
+  const result = await callDaemon(io.env, "GET", `/api/v1/projects/${encodeURIComponent(defaultProjectId(repo))}/active-files`, undefined, COMMAND_TIMEOUT_MS)
+    .catch(() => ({ files: [] })) as { files: { file: string; runId: string; nodeId: string }[] };
+  const warnings: string[] = [];
+  for (const mine of planFiles(plan)) {
+    for (const theirs of result.files) {
+      if (claimsOverlap(mine, theirs.file)) warnings.push(`${mine} overlaps ${theirs.file} (run ${theirs.runId}, ${theirs.nodeId})`);
+    }
+  }
+  return warnings;
+}
+
+async function planAndPreview(io: CliIo, repo: string, task: string, agent: string): Promise<{ plan: PlanNode; file: string; warnings: string[] }> {
+  io.out("planning...");
+  const runner = io.planner ? io.planner(repo) : await defaultPlanner(io, repo);
+  const plan = await makePlan(task, runner);
+  const dir = join(dataDirFrom(io.env), "plans");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `plan-${Date.now()}.json`);
+  await writeFile(file, `${JSON.stringify(plan, null, 2)}\n`);
+  for (const line of renderPlan(plan, agent)) io.out(line);
+  const warnings = await overlaps(io, repo, plan);
+  for (const w of warnings) io.out(`warning: ${w}`);
+  io.out(`plan saved to ${file}`);
+  return { plan, file, warnings };
+}
+
+async function planCommand(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["repo", "agent"]);
+  const task = rest.join(" ").trim();
+  if (!task) throw new UsageError("plan needs a task description");
+  const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
+  const agent = typeof flags.get("agent") === "string" ? (flags.get("agent") as string) : "claude";
+  const { file } = await planAndPreview(io, repo, task, agent);
+  io.out(`start it with: rivet run --plan "${file}" ${task}`);
+  return 0;
+}
+
 async function run(args: string[], io: CliIo): Promise<number> {
   const { flags, rest } = parseFlags(args, ["plan", "repo", "base", "agent"]);
   const planFile = flags.get("plan");
   const task = rest.join(" ").trim();
-  if (typeof planFile !== "string") throw new UsageError("run needs --plan <file>");
   if (!task) throw new UsageError("run needs a task description");
-  let plan: unknown;
-  try {
-    plan = JSON.parse(await readFile(resolve(io.cwd, planFile), "utf8"));
-  } catch (e) {
-    throw new Error(`could not read plan ${planFile}: ${(e as Error).message}`);
-  }
-  const repo = resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : ".");
+  const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
   const base = flags.get("base");
   const agent = flags.get("agent");
+  let plan: unknown;
+  if (typeof planFile === "string") {
+    try {
+      plan = JSON.parse(await readFile(resolve(io.cwd, planFile), "utf8"));
+    } catch (e) {
+      throw new Error(`could not read plan ${planFile}: ${(e as Error).message}`);
+    }
+  } else {
+    // No plan given: the planner proposes one and the user decides.
+    const preview = await planAndPreview(io, repo, task, typeof agent === "string" ? agent : "claude");
+    plan = preview.plan;
+    if (!flags.has("yes")) {
+      if (!io.ask) {
+        io.out(`not starting without confirmation; rerun with --yes or: rivet run --plan "${preview.file}" ${task}`);
+        return 1;
+      }
+      const answer = (await io.ask("run this plan? [y]es / [e]dit / [n]o: ")).trim().toLowerCase();
+      if (answer.startsWith("e")) {
+        io.out(`edit ${preview.file}, then: rivet run --plan "${preview.file}" ${task}`);
+        return 0;
+      }
+      if (!answer.startsWith("y")) {
+        io.out("cancelled");
+        return 0;
+      }
+    }
+  }
   const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
     repo, task, plan,
     ...(typeof base === "string" ? { base } : {}),
@@ -311,6 +395,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "send": return await send(args, io);
       case "daemon": return await daemon(args, io);
       case "run": return await run(args, io);
+      case "plan": return await planCommand(args, io);
       case "status": return await status(args, io);
       case "resume": return await runAction("resume", args, io);
       case "clean": return await runAction("clean", args, io);

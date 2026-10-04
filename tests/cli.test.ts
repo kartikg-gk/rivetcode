@@ -259,8 +259,77 @@ describe("run, status, resume, clean, project", () => {
   it("run needs a readable plan and a task", async () => {
     daemon = await startDaemon({ data, runFile, port: 0 });
     expect(await runCli(["run", "--plan", join(data, "missing.json"), "task"], inRepo())).toBe(1);
-    expect(await runCli(["run", "task"], inRepo())).toBe(2);
+    expect(await runCli(["run"], inRepo())).toBe(2);
+    expect(await runCli(["plan"], inRepo())).toBe(2);
     expect(await runCli(["resume"], inRepo())).toBe(2);
     expect(await runCli(["resume", "r404"], inRepo())).toBe(1);
+  });
+});
+
+describe("planning from the CLI", () => {
+  let repo: string;
+  beforeEach(async () => {
+    const { makeRepo } = await import("./helpers.js");
+    repo = await makeRepo();
+  });
+  afterEach(async () => {
+    await daemon?.stop();
+    daemon = undefined;
+    const { waitForTrash } = await import("../src/worktree.js");
+    await waitForTrash();
+    await removeRepo(repo);
+  });
+
+  const plan = {
+    title: "root", prompt: "r", children: [
+      { title: "a", prompt: JSON.stringify({ files: { "a.txt": "a" }, commit: "a" }), agent: "fake", files: ["a.txt"] },
+    ],
+  };
+  const withPlanner = (answers: string[], ask?: string): CliIo => ({
+    ...io({}), cwd: repo,
+    planner: () => async () => answers.shift() ?? "",
+    ...(ask !== undefined ? { ask: async () => ask } : {}),
+  });
+
+  it("plan previews the tree and saves it", async () => {
+    expect(await runCli(["plan", "add", "a"], withPlanner([JSON.stringify(plan)]))).toBe(0);
+    const text = out.join("\n");
+    expect(text).toMatch(/root root +\(integrates\)/);
+    expect(text).toMatch(/root\.1 a +\(leaf, fake\) +files: a\.txt/);
+    const saved = /plan saved to (.+)/.exec(text)![1]!;
+    expect(JSON.parse(await readFile(saved, "utf8"))).toEqual(plan);
+  });
+
+  it("run without a plan asks, and starts on yes", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    expect(await runCli(["run", "add", "a"], withPlanner([JSON.stringify(plan)], "y"))).toBe(0);
+    expect(out.join("\n")).toMatch(/run r\w+ started/);
+  });
+
+  it("edit and no do not start; no terminal needs --yes", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    expect(await runCli(["run", "t"], withPlanner([JSON.stringify(plan)], "e"))).toBe(0);
+    expect(out.join("\n")).toMatch(/edit .*plan-\d+\.json, then: rivet run --plan/);
+    expect(await runCli(["run", "t"], withPlanner([JSON.stringify(plan)], "n"))).toBe(0);
+    expect(await runCli(["run", "t"], withPlanner([JSON.stringify(plan)]))).toBe(1);
+    expect(out.join("\n")).not.toMatch(/started/);
+    expect(await runCli(["run", "--yes", "t"], withPlanner([JSON.stringify(plan)]))).toBe(0);
+    expect(out.join("\n")).toMatch(/started/);
+  });
+
+  it("warns when planned files overlap a run in flight", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    const busy = { title: "root", prompt: "r", children: [
+      { title: "busy", prompt: JSON.stringify({ stayFor: 60_000 }), agent: "fake", files: ["a.txt"] },
+    ] };
+    expect(await runCli(["run", "--yes", "first"], withPlanner([JSON.stringify(busy)]))).toBe(0);
+    out = [];
+    expect(await runCli(["plan", "second"], withPlanner([JSON.stringify(plan)]))).toBe(0);
+    expect(out.join("\n")).toMatch(/warning: a\.txt overlaps a\.txt \(run r\w+, root\.1\)/);
+  });
+
+  it("reports a plan that stays invalid", async () => {
+    expect(await runCli(["plan", "t"], withPlanner(["nonsense", "still nonsense"]))).toBe(1);
+    expect(err.join("\n")).toMatch(/still invalid after one fix attempt/);
   });
 });
