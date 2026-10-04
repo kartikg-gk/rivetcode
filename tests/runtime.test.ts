@@ -197,3 +197,43 @@ describe("closed stdin", () => {
     expect(runtime.output("r1-a", 5)!.lines).toContain("eof");
   });
 });
+
+describe("terminal sessions", () => {
+  // Echoes every key it gets, quits on "q".
+  const ECHO = [
+    "process.stdout.write('tty=' + process.stdout.isTTY + ' cols=' + process.stdout.columns + String.fromCharCode(10));",
+    "process.stdin.setRawMode(true);",
+    "process.stdin.on('data', (d) => { const s = d.toString(); if (s.includes('q')) process.exit(0); process.stdout.write('[' + JSON.stringify(s) + ']'); });",
+  ].join("\n");
+
+  it("runs in a real terminal, takes typed lines and raw keys, and resizes", async () => {
+    const script = join(ws, "echo.js");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(script, ECHO);
+    const launch = await runtime.start({ sessionId: "r1-t", workspace: ws, argv: [process.execPath, script], env: {}, terminal: { cols: 100, rows: 30 } });
+    expect(launch.launchId).toBeTruthy();
+    await until(() => (runtime.output("r1-t", 5)?.lines ?? []).some((l) => l.includes("tty=true cols=100")));
+    const seen: string[] = [];
+    const attached = runtime.attach("r1-t", (c) => seen.push(c))!;
+    expect(attached.replay).toContain("tty=true");
+    await runtime.write("r1-t", "hi");
+    // The typed line arrives with the carriage return that submits it.
+    await until(() => seen.join("").includes('"hi\\r"'));
+    runtime.resize("r1-t", 120, 40);
+    const done = exited("r1-t");
+    runtime.input("r1-t", "q");
+    expect(await done).toBe(0);
+    attached.detach();
+  });
+
+  it("refuses raw input to a piped session", async () => {
+    await runtime.start({ sessionId: "r1-p", workspace: ws, argv: await fakeArgv({ stayFor: 5000 }), env: {} });
+    expect(() => runtime.input("r1-p", "x")).toThrow(/no terminal/);
+  });
+
+  it("stops a terminal session", async () => {
+    await runtime.start({ sessionId: "r1-s", workspace: ws, argv: [process.execPath, "-e", "setInterval(() => {}, 1000)"], env: {}, terminal: { cols: 80, rows: 24 } });
+    await runtime.stop("r1-s");
+    expect(runtime.isAlive("r1-s")).toBe(false);
+  });
+});
