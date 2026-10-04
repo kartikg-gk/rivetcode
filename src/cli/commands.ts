@@ -1,7 +1,6 @@
 import { appendFile, stat, writeFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { startDaemon } from "../daemon/server.js";
 import { readRunFile } from "../runfile.js";
 import { agentSessionIdOf, deriveActivity } from "./activity.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
@@ -126,6 +125,8 @@ async function daemon(args: string[], io: CliIo): Promise<number> {
   const runFile = runFileFrom(io.env);
   switch (args[0]) {
     case "start": {
+      // Loaded only here: hooks run often and should not pay for the daemon's code.
+      const { startDaemon } = await import("../daemon/server.js");
       const d = await startDaemon({
         data: dataDirFrom(io.env),
         runFile,

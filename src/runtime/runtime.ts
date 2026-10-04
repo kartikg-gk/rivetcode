@@ -36,6 +36,20 @@ export type Runtime = {
   onExit(listener: ExitListener): () => void;
 };
 
+// Windows treats env names case-insensitively, so an override replaces "Path" as well as "PATH".
+function mergeEnv(base: NodeJS.ProcessEnv, extra: Record<string, string>): NodeJS.ProcessEnv {
+  const merged: NodeJS.ProcessEnv = { ...base };
+  for (const [key, value] of Object.entries(extra)) {
+    if (process.platform === "win32") {
+      for (const existing of Object.keys(merged)) {
+        if (existing.toUpperCase() === key.toUpperCase()) delete merged[existing];
+      }
+    }
+    merged[key] = value;
+  }
+  return merged;
+}
+
 export function newLaunchId(): string {
   return randomBytes(8).toString("hex");
 }
@@ -92,7 +106,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
 
     const child = spawn(argv[0], argv.slice(1), {
       cwd: workspace,
-      env: { ...process.env, ...opts.env },
+      env: mergeEnv(process.env, opts.env),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
