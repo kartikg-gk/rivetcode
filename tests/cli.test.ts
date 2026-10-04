@@ -69,6 +69,7 @@ afterEach(async () => {
 function io(env: Record<string, string>, stdin = ""): CliIo {
   return {
     env: { RIVET_DATA_DIR: data, RIVET_RUN_FILE: runFile, ...env },
+    cwd: data,
     readStdin: async () => stdin,
     out: (line) => out.push(line),
     err: (line) => err.push(line),
@@ -194,5 +195,72 @@ describe("rivet (top level)", () => {
     expect(await runCli(["daemon", "status"], io({}))).toBe(0);
     expect(out.join("\n")).toMatch(/running \(pid \d+, port \d+\)/);
     expect(existsSync(runFile)).toBe(true);
+  });
+});
+
+describe("run, status, resume, clean, project", () => {
+  let repo: string;
+  beforeEach(async () => {
+    const { makeRepo } = await import("./helpers.js");
+    repo = await makeRepo();
+  });
+  afterEach(async () => {
+    await daemon?.stop();
+    daemon = undefined;
+    const { waitForTrash } = await import("../src/worktree.js");
+    await waitForTrash();
+    await removeRepo(repo);
+  });
+
+  const inRepo = (env: Record<string, string> = {}): CliIo => ({ ...io(env), cwd: repo });
+
+  async function waitForRoot(runId: string, status: string): Promise<void> {
+    const end = Date.now() + 20_000;
+    for (;;) {
+      out = [];
+      await runCli(["status", runId], inRepo());
+      if (out.join("\n").includes(`root  ${status}`) || out[0]?.includes(`root: ${status}`)) return;
+      if (Date.now() > end) throw new Error(out.join("\n"));
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
+  it("runs a plan file end to end and shows the tree", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    const plan = join(data, "plan.json");
+    await writeFile(plan, JSON.stringify({
+      title: "root", prompt: "r", children: [
+        { title: "add a", prompt: JSON.stringify({ files: { "a.txt": "a" }, commit: "a" }), agent: "fake" },
+        { title: "add b", prompt: JSON.stringify({ files: { "b.txt": "b" }, commit: "b" }), agent: "fake" },
+      ],
+    }));
+    expect(await runCli(["run", "--plan", plan, "add", "two", "files"], inRepo())).toBe(0);
+    const runId = /run (r\w+) started/.exec(out.join("\n"))![1]!;
+    await waitForRoot(runId, "done");
+    expect(out.join("\n")).toMatch(/root\.1 +add a +done/);
+    out = [];
+    expect(await runCli(["status"], inRepo())).toBe(0);
+    expect(out.join("\n")).toMatch(new RegExp(`${runId} +done +add two files`));
+    out = [];
+    expect(await runCli(["clean", runId], inRepo())).toBe(0);
+    expect(out.join("\n")).toMatch(/removed 3 worktrees/);
+  });
+
+  it("sets and shows project settings for the repo it runs in", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    expect(await runCli(["project", "set", "check", "npm run typecheck"], inRepo())).toBe(0);
+    out = [];
+    expect(await runCli(["project", "get"], inRepo())).toBe(0);
+    expect(out.join("\n")).toMatch(/check += npm run typecheck/);
+    expect(await runCli(["project", "unset", "check"], inRepo())).toBe(0);
+    expect(await runCli(["project", "set", "colour", "red"], inRepo())).toBe(1);
+  });
+
+  it("run needs a readable plan and a task", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    expect(await runCli(["run", "--plan", join(data, "missing.json"), "task"], inRepo())).toBe(1);
+    expect(await runCli(["run", "task"], inRepo())).toBe(2);
+    expect(await runCli(["resume"], inRepo())).toBe(2);
+    expect(await runCli(["resume", "r404"], inRepo())).toBe(1);
   });
 });

@@ -1,4 +1,8 @@
-import { appendFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, readFile, stat, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { git } from "../git.js";
+import { defaultProjectId } from "../paths.js";
+import type { Run } from "../store.js";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { readRunFile } from "../runfile.js";
@@ -7,12 +11,20 @@ import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } fr
 
 export type CliIo = {
   env: Record<string, string | undefined>;
+  cwd: string;
   readStdin(): Promise<string>;
   out(line: string): void;
   err(line: string): void;
 };
 
 const USAGE = `usage: rivet <command>
+  run --plan <file> [--repo <dir>] [--base <branch>] [--agent <name>] <task>
+                                        start a run from a plan (JSON task tree)
+  status [<run>]                        list runs, or show one run's tree
+  resume <run>                          retry what was escalated or interrupted
+  clean <run>                           remove a run's worktrees (branches stay)
+  project get|set <key> <value>|unset <key>
+                                        settings for this repo: check, test, worker.agent
   daemon start|stop|status              run or control the background daemon
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
@@ -156,6 +168,117 @@ async function daemon(args: string[], io: CliIo): Promise<number> {
   }
 }
 
+async function run(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["plan", "repo", "base", "agent"]);
+  const planFile = flags.get("plan");
+  const task = rest.join(" ").trim();
+  if (typeof planFile !== "string") throw new UsageError("run needs --plan <file>");
+  if (!task) throw new UsageError("run needs a task description");
+  let plan: unknown;
+  try {
+    plan = JSON.parse(await readFile(resolve(io.cwd, planFile), "utf8"));
+  } catch (e) {
+    throw new Error(`could not read plan ${planFile}: ${(e as Error).message}`);
+  }
+  const repo = resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : ".");
+  const base = flags.get("base");
+  const agent = flags.get("agent");
+  const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
+    repo, task, plan,
+    ...(typeof base === "string" ? { base } : {}),
+    ...(typeof agent === "string" ? { agent } : {}),
+  }, COMMAND_TIMEOUT_MS) as { runId: string };
+  io.out(`run ${result.runId} started; follow it with: rivet status ${result.runId}`);
+  return 0;
+}
+
+function ago(iso: string | undefined, now: number): string {
+  if (!iso) return "";
+  const s = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+
+// One line per node: what it is, where it stands, and how long its agent has been quiet.
+function renderRun(run: Run, live: Record<string, boolean>, now: number): string[] {
+  const lines = [`run ${run.id} (root: ${run.nodes[0]!.status}) ${run.task}`];
+  for (const n of run.nodes) {
+    const name = `${"  ".repeat(n.depth)}${n.id} ${n.title}`;
+    const parts = [name.padEnd(34), n.status.padEnd(11)];
+    if (n.kind === "leaf" && n.activity) {
+      const quiet = n.activity !== "active" && n.activity !== "exited" ? ` for ${ago(n.activityAt, now)}` : "";
+      parts.push(`${n.activity}${quiet}`.padEnd(20));
+    } else {
+      parts.push("".padEnd(20));
+    }
+    if (live[n.id]) parts.push("[agent running]");
+    if (n.finishedAt && n.status === "running") parts.push("[finished, waiting to merge]");
+    if (n.summary) parts.push(n.summary.split(/\r?\n/)[0]!.slice(0, 120));
+    lines.push(parts.join(" ").trimEnd());
+  }
+  return lines;
+}
+
+async function status(args: string[], io: CliIo): Promise<number> {
+  const [runId] = args;
+  if (!runId) {
+    const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as {
+      runs: { id: string; status: string; task: string; project: string }[];
+    };
+    if (runs.length === 0) io.out("no runs yet");
+    for (const r of runs) io.out(`${r.id}  ${r.status.padEnd(11)} ${r.task}  [${r.project}]`);
+    return 0;
+  }
+  const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
+    run: Run; live: Record<string, boolean>; now: string;
+  };
+  for (const line of renderRun(result.run, result.live, Date.parse(result.now))) io.out(line);
+  return 0;
+}
+
+async function runAction(action: "resume" | "clean", args: string[], io: CliIo): Promise<number> {
+  const [runId] = args;
+  if (!runId) throw new UsageError(`${action} needs a run id`);
+  const result = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/${action}`, undefined, COMMAND_TIMEOUT_MS);
+  if (action === "resume") {
+    io.out(`run ${runId} resumed`);
+  } else {
+    const { removed, kept } = result as { removed: string[]; kept: string[] };
+    io.out(`removed ${removed.length} worktrees` + (kept.length ? `; kept ${kept.join(", ")} (uncommitted work)` : ""));
+  }
+  return 0;
+}
+
+async function projectOf(io: CliIo): Promise<string> {
+  try {
+    return defaultProjectId((await git(["rev-parse", "--show-toplevel"], io.cwd)).trim());
+  } catch {
+    throw new Error("run this inside the project's git repository");
+  }
+}
+
+async function project(args: string[], io: CliIo): Promise<number> {
+  const [action, key, ...valueParts] = args;
+  const path = `/api/v1/projects/${encodeURIComponent(await projectOf(io))}/config`;
+  if (action === "get") {
+    const config = await callDaemon(io.env, "GET", path, undefined, COMMAND_TIMEOUT_MS) as Record<string, string>;
+    const keys = Object.keys(config);
+    if (keys.length === 0) io.out("no settings");
+    for (const k of keys) io.out(`${k} = ${config[k]}`);
+    return 0;
+  }
+  if (action === "set" && key && valueParts.length > 0) {
+    await callDaemon(io.env, "PUT", path, { key, value: valueParts.join(" ") }, COMMAND_TIMEOUT_MS);
+    io.out(`${key} set`);
+    return 0;
+  }
+  if (action === "unset" && key) {
+    await callDaemon(io.env, "PUT", path, { key, value: null }, COMMAND_TIMEOUT_MS);
+    io.out(`${key} removed`);
+    return 0;
+  }
+  throw new UsageError("project needs get, set <key> <value> or unset <key>");
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
@@ -165,6 +288,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "report": return await report(args, io);
       case "send": return await send(args, io);
       case "daemon": return await daemon(args, io);
+      case "run": return await run(args, io);
+      case "status": return await status(args, io);
+      case "resume": return await runAction("resume", args, io);
+      case "clean": return await runAction("clean", args, io);
+      case "project": return await project(args, io);
       default: throw new UsageError(command ? `unknown command "${command}"` : "no command given");
     }
   } catch (e) {
