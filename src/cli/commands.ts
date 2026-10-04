@@ -19,6 +19,10 @@ export type CliIo = {
   ask?(question: string): Promise<string>;
   // Replaces the claude planner (tests).
   planner?(repo: string): PlannerRunner;
+  // The real terminal, for attach (raw keys in, resize events).
+  tty?: { input: NodeJS.ReadStream; output: NodeJS.WriteStream };
+  // Writes output exactly as received (a session's screen), without a newline.
+  raw?(chunk: string): void;
   out(line: string): void;
   err(line: string): void;
 };
@@ -33,6 +37,8 @@ const USAGE = `usage: rivet <command>
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
   bench <spec.json>                     compare ways of splitting one task (e.g. single, flat, tree)
+  attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
+  panes <run>                           show every running agent of a run side by side
   daemon start|stop|status              run or control the background daemon
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
@@ -385,6 +391,95 @@ async function bench(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
+const DETACH_KEY = "\u001d"; // Ctrl-]
+
+// Your terminal becomes the session's: its screen streams in, your keys go to it.
+async function attach(args: string[], io: CliIo): Promise<number> {
+  const [sessionId] = args;
+  if (!sessionId) throw new UsageError("attach needs a session id (see rivet status <run>)");
+  const info = await readRunFile(runFileFrom(io.env));
+  if (!info) throw new DaemonDownError();
+  const base = `http://127.0.0.1:${info.port}/api/v1/sessions/${encodeURIComponent(sessionId)}`;
+  const post = (action: string, body: unknown) => fetch(`${base}/${action}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }).catch(() => undefined);
+  const response = await fetch(`${base}/attach`).catch(() => { throw new DaemonDownError(); });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new DaemonError(response.status, (JSON.parse(text || "{}") as { error?: string }).error ?? `HTTP ${response.status}`);
+  }
+  const reader = response.body!.getReader();
+  const tty = io.tty;
+  let detached = false;
+  const onKeys = (data: Buffer) => {
+    const text = data.toString("utf8");
+    if (text.includes(DETACH_KEY)) { detached = true; void reader.cancel(); return; }
+    void post("input", { data: text });
+  };
+  const onResize = () => { if (tty) void post("resize", { cols: tty.output.columns, rows: tty.output.rows }); };
+  if (tty) {
+    io.err(`attached to ${sessionId}; press Ctrl-] to detach`);
+    tty.input.setRawMode?.(true);
+    tty.input.resume();
+    tty.input.on("data", onKeys);
+    tty.output.on("resize", onResize);
+    onResize();
+  }
+  const decoder = new TextDecoder();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      (io.raw ?? io.out)(decoder.decode(value, { stream: true }));
+    }
+  } catch {
+    // Cancelled by the detach key.
+  } finally {
+    if (tty) {
+      tty.input.off("data", onKeys);
+      tty.output.off("resize", onResize);
+      tty.input.setRawMode?.(false);
+      tty.input.pause();
+    }
+  }
+  io.err(detached ? `\r\ndetached from ${sessionId}` : `\r\nsession ${sessionId} ended`);
+  return 0;
+}
+
+async function panes(args: string[], io: CliIo): Promise<number> {
+  const [runId] = args;
+  if (!runId) throw new UsageError("panes needs a run id");
+  const { run, live } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
+    run: Run; live: Record<string, boolean>;
+  };
+  const sessions = run.nodes.filter((n) => live[n.id]).map((n) => ({ id: `${run.id}-${n.id}`, title: `${n.id} ${n.title}` }));
+  if (sessions.length === 0) {
+    io.out(`no agent of run ${runId} is running right now`);
+    return 1;
+  }
+  const { panesPlan } = await import("./panes.js");
+  const { rivetBinDir } = await import("../runtime/env.js");
+  const { execFileSync, spawn } = await import("node:child_process");
+  const have = (tool: string) => {
+    try { execFileSync(process.platform === "win32" ? "where" : "which", [tool], { stdio: "ignore" }); return true; } catch { return false; }
+  };
+  const rivet = join(rivetBinDir(), process.platform === "win32" ? "rivet.cmd" : "rivet");
+  const plan = panesPlan({ platform: process.platform, rivet, runId, sessions, have });
+  if (plan.kind === "print") {
+    io.out("no terminal multiplexer found; attach to each session in its own terminal:");
+    for (const line of plan.lines) io.out(line);
+    return 0;
+  }
+  if (plan.kind === "wt") {
+    spawn(plan.file, plan.args, { detached: true, stdio: "ignore" }).unref();
+    io.out(`opened ${sessions.length} panes in Windows Terminal`);
+    return 0;
+  }
+  for (const step of plan.steps.slice(0, -1)) execFileSync("tmux", step, { stdio: "inherit" });
+  execFileSync("tmux", plan.steps.at(-1)!, { stdio: "inherit" });
+  return 0;
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
@@ -396,6 +491,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "daemon": return await daemon(args, io);
       case "run": return await run(args, io);
       case "plan": return await planCommand(args, io);
+      case "attach": return await attach(args, io);
+      case "panes": return await panes(args, io);
       case "status": return await status(args, io);
       case "resume": return await runAction("resume", args, io);
       case "clean": return await runAction("clean", args, io);

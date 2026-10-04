@@ -333,3 +333,40 @@ describe("planning from the CLI", () => {
     expect(err.join("\n")).toMatch(/still invalid after one fix attempt/);
   });
 });
+
+describe("attach and panes", () => {
+  let repo: string;
+  beforeEach(async () => {
+    const { makeRepo } = await import("./helpers.js");
+    repo = await makeRepo();
+  });
+  afterEach(async () => {
+    await daemon?.stop();
+    daemon = undefined;
+    const { waitForTrash } = await import("../src/worktree.js");
+    await waitForTrash();
+    await removeRepo(repo);
+  });
+
+  it("streams a session's screen until it ends", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    const planFile = join(data, "p.json");
+    await writeFile(planFile, JSON.stringify({ title: "solo", agent: "fake", prompt: JSON.stringify({ files: { "x.txt": "x" }, stayFor: 300 }) }));
+    const raw: string[] = [];
+    const cli: CliIo = { ...io({}), cwd: repo, raw: (c) => raw.push(c) };
+    expect(await runCli(["run", "--plan", planFile, "solo"], cli)).toBe(0);
+    const runId = /run (r\w+) started/.exec(out.join("\n"))![1]!;
+    expect(await runCli(["attach", `${runId}-root`], cli)).toBe(0);
+    expect(raw.join("")).toContain("wrote x.txt");
+    expect(err.join("\n")).toMatch(/session .* ended/);
+  });
+
+  it("attach and panes explain what is missing", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    expect(await runCli(["attach"], io({}))).toBe(2);
+    expect(await runCli(["attach", "r1-root.1"], io({}))).toBe(1);
+    expect(err.join("\n")).toMatch(/has not been started/);
+    expect(await runCli(["panes", "r1"], io({}))).toBe(1);
+    expect(out.join("\n")).toMatch(/no agent of run r1 is running/);
+  });
+});
