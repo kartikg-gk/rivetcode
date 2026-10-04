@@ -346,3 +346,20 @@ describe("clean", () => {
 function projectOf(dir: string): string {
   return dir.split(/[\\/]/).pop()!.toLowerCase().trim().replace(/ /g, "-");
 }
+
+describe("active files", () => {
+  it("lists files claimed or changed by runs still in flight", async () => {
+    await start();
+    const runId = await runPlan({ title: "root", prompt: "r", children: [
+      { ...leaf("busy", { files: { "src/changed.ts": "x" }, commit: "c", stayFor: 60_000 }), files: ["src/claimed.ts"] },
+    ] });
+    const tree = (await getRun(runId)).nodes[1]!.worktree;
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !(await git(["log", "--oneline", "-1"], tree)).includes(" c")) await new Promise((r) => setTimeout(r, 50));
+    const res = await api("GET", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/active-files`);
+    expect(res.json.files).toEqual(expect.arrayContaining([
+      { file: "src/claimed.ts", runId, nodeId: "root.1" },
+      { file: "src/changed.ts", runId, nodeId: "root.1" },
+    ]));
+  });
+});

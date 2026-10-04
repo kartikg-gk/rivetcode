@@ -5,6 +5,7 @@ import { findClaude } from "../agents/locate.js";
 import { claudePlanner } from "../planner/claude-runner.js";
 import { extractReplan, replanPrompt } from "../planner/planner.js";
 import { dataDir, assertId } from "../paths.js";
+import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
@@ -358,6 +359,24 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       for (const n of run.nodes) await scheduler.stopSession(sessionIdOf(run.id, n.id));
       reply(res, 200, await cleanRun(data, run));
+      return;
+    }
+    const active = /^\/api\/v1\/projects\/([^/]+)\/active-files$/.exec(path);
+    if (active) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const project = decodeURIComponent(active[1]!);
+      const runs = await write(() => store.listRuns(project).map((id) => store.loadRun(id)));
+      const files: { file: string; runId: string; nodeId: string }[] = [];
+      for (const r of runs) {
+        const root = r.nodes[0]!;
+        if (["done", "failed", "skipped"].includes(root.status) || r.nodes.every((n) => n.status === "pending")) continue;
+        for (const n of r.nodes.filter((x) => x.kind === "leaf" && x.status !== "skipped")) {
+          const changed = await git(["diff", "--name-only", `${r.base}...${n.branch}`], r.repo)
+            .then((out) => out.split(/\r?\n/).filter(Boolean), () => [] as string[]);
+          for (const file of new Set([...n.files, ...changed])) files.push({ file, runId: r.id, nodeId: n.id });
+        }
+      }
+      reply(res, 200, { files });
       return;
     }
     const config = /^\/api\/v1\/projects\/([^/]+)\/config$/.exec(path);
