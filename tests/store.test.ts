@@ -221,3 +221,26 @@ describe("migration 3 and project config", () => {
     expect(store.getConfig("proj")).toEqual({ check: "npm run typecheck" });
   });
 });
+
+describe("updateNode", () => {
+  it("changes only the given fields and leaves activity alone", () => {
+    store.saveRun(sampleRun());
+    store.setActivity("r1", "root.1", "blocked", "conv");
+    store.updateNode("r1", "root.1", { status: "running", attempts: 1, finishedAt: "2026-10-04T00:00:00.000Z" });
+    store.updateNode("r1", "root.1", { summary: "half way" });
+    expect(store.loadRun("r1").nodes[1]).toMatchObject({
+      status: "running", attempts: 1, summary: "half way", activity: "blocked", agentSessionId: "conv",
+      finishedAt: "2026-10-04T00:00:00.000Z",
+    });
+    store.updateNode("r1", "root.1", { finishedAt: null, summary: null });
+    const n = store.loadRun("r1").nodes[1]!;
+    expect(n.finishedAt).toBeUndefined();
+    expect(n.summary).toBeUndefined();
+  });
+
+  it("rejects unknown nodes and invalid statuses", () => {
+    store.saveRun(sampleRun());
+    expect(() => store.updateNode("r1", "root.9", { status: "done" })).toThrow(/no node root\.9/);
+    expect(() => store.updateNode("r1", "root.1", { status: "bogus" as never })).toThrow();
+  });
+});

@@ -27,10 +27,23 @@ export type Store = {
   markDelivered(id: number): void;
   // After a daemon restart no agent is running; returns how many nodes were changed.
   exitStaleSessions(): number;
+  // Changes some fields of one node in place; null clears an optional field.
+  updateNode(runId: string, nodeId: string, fields: NodeUpdate): void;
   // Per-project settings such as the check and test commands.
   getConfig(project: string): Record<string, string>;
   setConfig(project: string, key: string, value: string | null): void;
   close(): void;
+};
+
+export type NodeUpdate = {
+  status?: Node["status"];
+  attempts?: number;
+  summary?: string | null;
+  finishedAt?: string | null;
+};
+
+const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
+  status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at",
 };
 
 export class RunStoreError extends Error {
@@ -322,6 +335,14 @@ export function openStore(data: string): Store {
 
     exitStaleSessions() {
       return Number(updateStale.run().changes);
+    },
+
+    updateNode(runId, nodeId, fields) {
+      const keys = (Object.keys(fields) as (keyof NodeUpdate)[]).filter((k) => fields[k] !== undefined);
+      if (keys.length === 0) return;
+      const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
+      const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
+      if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
     },
 
     getConfig(project) {
