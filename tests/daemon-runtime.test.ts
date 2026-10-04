@@ -186,3 +186,27 @@ describe("daemon lifecycle with agents", () => {
     expect(activity()).toBe("exited");
   });
 });
+
+describe("concurrent requests", () => {
+  it("two starts at once run one agent and still track its exit", async () => {
+    await start();
+    const results = await Promise.all([startLeaf({ stayFor: 300 }), startLeaf({ stayFor: 300 })]);
+    expect(results.map((r) => r.status).sort()).toEqual([202, 409]);
+    await until(() => activity() === "exited");
+  });
+
+  it("two sends at once deliver each message exactly once", async () => {
+    await start();
+    await post("/api/v1/sessions/r1-root.1/send", { message: "queued" });
+    await startLeaf({ listen: true, stayFor: 0 });
+    await Promise.all([
+      post("/api/v1/sessions/r1-root.1/send", { message: "a" }),
+      post("/api/v1/sessions/r1-root.1/send", { message: "b" }),
+    ]);
+    await until(async () => existsSync(join(leaf, "inbox.txt")) &&
+      (await readFile(join(leaf, "inbox.txt"), "utf8")).split("\n").length >= 4);
+    await new Promise((r) => setTimeout(r, 200));
+    const lines = (await readFile(join(leaf, "inbox.txt"), "utf8")).split("\n").filter(Boolean);
+    expect(lines.sort()).toEqual(["a", "b", "queued"]);
+  });
+});

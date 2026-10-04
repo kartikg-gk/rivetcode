@@ -61,6 +61,16 @@ describe("start", () => {
       .rejects.toThrow(/already running/);
   });
 
+  it("refuses a second start issued in the same moment", async () => {
+    const argv = await fakeArgv({ stayFor: 5000 });
+    const results = await Promise.allSettled([
+      runtime.start({ sessionId: "r1-a", workspace: ws, argv, env: {} }),
+      runtime.start({ sessionId: "r1-a", workspace: ws, argv, env: {} }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(runtime.liveSessions()).toEqual(["r1-a"]);
+  });
+
   it("refuses a missing workspace or a command that does not exist", async () => {
     await expect(runtime.start({ sessionId: "r1-a", workspace: join(data, "nope"), argv: await fakeArgv({}), env: {} }))
       .rejects.toThrow(RuntimeError);

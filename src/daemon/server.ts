@@ -149,8 +149,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     void write(() => store.setActivity(runId, nodeId, "exited"));
   });
 
-  // Types every queued message into a running session, oldest first.
-  async function deliver(runId: string, nodeId: string): Promise<void> {
+  // Types every queued message into a running session, oldest first. One delivery
+  // pass per session at a time, so two sends never type the same message twice.
+  const delivering = new Map<string, Promise<void>>();
+  function deliver(runId: string, nodeId: string): Promise<void> {
+    const sessionId = sessionIdOf(runId, nodeId);
+    const next = (delivering.get(sessionId) ?? Promise.resolve()).then(() => deliverNow(runId, nodeId));
+    const tail = next.catch(() => {});
+    delivering.set(sessionId, tail);
+    void tail.then(() => { if (delivering.get(sessionId) === tail) delivering.delete(sessionId); });
+    return next;
+  }
+
+  async function deliverNow(runId: string, nodeId: string): Promise<void> {
     const sessionId = sessionIdOf(runId, nodeId);
     const pending = await write(() => store.undeliveredMessages(runId, nodeId));
     for (const m of pending) {
@@ -179,7 +190,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const launchId = newLaunchId();
     const argv = await agent.launchCommand({ sessionId, workspace: node.worktree, ...(prompt !== undefined ? { prompt } : {}) });
     await agent.installHooks(node.worktree);
-    launches.set(sessionId, launchId);
     try {
       await runtime.start({
         sessionId, workspace: node.worktree, argv, launchId,
@@ -189,6 +199,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (runtime.isAlive(sessionId)) throw new HttpError(409, "session is already running");
       throw error;
     }
+    // Set only once this launch really runs, so a refused duplicate start cannot hide its exit.
+    launches.set(sessionId, launchId);
     await write(() => store.setActivity(runId, nodeId, "active"));
     await deliver(runId, nodeId);
     return launchId;

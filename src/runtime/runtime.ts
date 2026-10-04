@@ -59,6 +59,8 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
   const grace = o.stopGraceMs ?? 5000;
   const procs = new Map<string, Proc>();
   const listeners = new Set<ExitListener>();
+  // Sessions between "start called" and "process spawned": a second start must see them.
+  const starting = new Set<string>();
 
   function record(p: Proc, chunk: Buffer): void {
     p.log.write(chunk);
@@ -70,11 +72,23 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
 
   async function start(opts: StartOptions): Promise<Launch> {
     const { sessionId, workspace, argv } = opts;
-    if (procs.get(sessionId)?.alive) throw new RuntimeError(`session ${sessionId} is already running`);
+    if (procs.get(sessionId)?.alive || starting.has(sessionId)) {
+      throw new RuntimeError(`session ${sessionId} is already running`);
+    }
     if (!existsSync(workspace) || !statSync(workspace).isDirectory()) {
       throw new RuntimeError(`workspace does not exist: ${workspace}`);
     }
     if (argv.length === 0 || !argv[0]) throw new RuntimeError("empty command");
+    starting.add(sessionId);
+    try {
+      return await spawnProcess(opts);
+    } finally {
+      starting.delete(sessionId);
+    }
+  }
+
+  async function spawnProcess(opts: StartOptions): Promise<Launch> {
+    const { sessionId, workspace, argv } = opts;
 
     const child = spawn(argv[0], argv.slice(1), {
       cwd: workspace,
