@@ -10,6 +10,7 @@ import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
+import { radar } from "../scheduler/radar.js";
 import { cleanRun, prepareRun, RunInputError } from "../scheduler/runs.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
@@ -247,11 +248,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       res.end(JSON.stringify({ status: "shutting_down", pid: process.pid }), () => { void stop(); });
       return;
     }
-    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output|attach|input|resize)$/.exec(path);
+    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output|attach|input|resize|sync)$/.exec(path);
     if (control) {
       const [, id, action] = control;
       const { runId, nodeId } = session(id);
       const sessionId = sessionIdOf(runId, nodeId);
+      if (action === "sync") {
+        if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+        const payload = await body(req);
+        try { await write(() => store.loadRun(runId)); } catch { throw new HttpError(404, "unknown session"); }
+        reply(res, 200, await scheduler.sync(runId, nodeId, { byAgent: payload.byAgent === true }));
+        return;
+      }
       if (action === "attach") {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         // Streams the terminal: recent output first, then everything new, until exit.
@@ -397,7 +405,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 201, { runId: run.id });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|skip|radar))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -412,7 +420,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 200, { run, live, pr, now: new Date().toISOString() });
         return;
       }
+      if (action === "radar") {
+        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+        reply(res, 200, { conflicts: await radar(run) });
+        return;
+      }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      if (action === "skip") {
+        const payload = await body(req);
+        if (typeof payload.node !== "string") throw new HttpError(400, "node must be a string");
+        await scheduler.skip(run.id, payload.node);
+        reply(res, 204);
+        return;
+      }
       if (action === "pr") {
         reply(res, 200, await scheduler.publish(run.id));
         return;

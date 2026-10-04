@@ -162,3 +162,78 @@ describe("watching the pull request", () => {
     expect((await runOf(runId)).run.nodes[0]!.prStatus).toBe("merged");
   });
 });
+
+describe("sync", () => {
+  it("brings a finished sibling's work into a running leaf", async () => {
+    await start();
+    const runId = await startRun({ title: "root", prompt: "r", children: [
+      leaf("fast", { files: { "a.txt": "a" }, commit: "a" }),
+      leaf("slow", { files: { "b.txt": "b" }, commit: "b", stayFor: 60_000 }),
+    ] });
+    const slow = await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
+    const res = await api("POST", `/api/v1/sessions/${runId}-root.2/sync`, {});
+    expect(res.json).toMatchObject({ synced: true, conflicts: [] });
+    expect(await git(["show", "HEAD:a.txt"], slow.run.nodes[2]!.worktree)).toBe("a");
+  });
+
+  it("undoes a conflicting sync for an agent that cannot be told, and leaves it for an agent that asked", async () => {
+    await start();
+    const runId = await startRun({ title: "root", prompt: "r", children: [
+      leaf("one", { files: { "s.txt": "one" }, commit: "one" }),
+      leaf("two", { files: { "s.txt": "two" }, commit: "two", stayFor: 60_000 }),
+    ] });
+    const { run } = await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
+    const tree = run.nodes[2]!.worktree;
+    await until(() => git(["log", "--format=%s", "-1"], tree), (s) => s.trim() === "two");
+    // The fake agent listens on stdin, so it is told; make it one that cannot be.
+    const told = await api("POST", `/api/v1/sessions/${runId}-root.2/sync`, {});
+    expect(told.json).toMatchObject({ synced: false, conflicts: ["s.txt"] });
+    if (/undone/.test(told.json.note)) expect((await git(["status", "--porcelain"], tree)).trim()).toBe("");
+    else await git(["merge", "--abort"], tree);
+    const self = await api("POST", `/api/v1/sessions/${runId}-root.2/sync`, { byAgent: true });
+    expect(self.json).toMatchObject({ synced: false, conflicts: ["s.txt"], note: expect.stringMatching(/resolve/) });
+    expect((await git(["diff", "--name-only", "--diff-filter=U"], tree)).trim()).toBe("s.txt");
+  });
+});
+
+describe("ship without a leaf", () => {
+  it("finishes the run without a skipped leaf, then opens a follow-up PR when it finishes", async () => {
+    await start({ pr: "auto" });
+    const runId = await startRun({ title: "root", prompt: "r", children: [
+      leaf("quick", { files: { "a.txt": "a" }, commit: "a" }),
+      leaf("late", { files: { "late.txt": "late" }, commit: "late", listen: true }),
+    ] });
+    await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
+    expect((await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root.2" })).status).toBe(204);
+    const shipped = await until(() => runOf(runId), (r) => r.pr !== null);
+    expect(shipped.run.nodes[0]!.status).toBe("done");
+    expect(shipped.run.nodes[2]).toMatchObject({ status: "skipped" });
+    await expect(onOrigin(`rivet/${runId}/root`, "late.txt")).rejects.toThrow();
+    // The late leaf finishes now.
+    await api("POST", `/api/v1/sessions/${runId}-root.2/send`, { message: "/exit" });
+    const after = await until(() => runOf(runId), (r) => /follow-up pull request/.test(r.run.nodes[2]!.summary ?? ""));
+    expect(after.run.nodes[2]!.summary).toMatch(/pull\/2/);
+    expect(gh.prs[1]).toMatchObject({ title: "Follow-up: late", head: { ref: `rivet/${runId}/root.2` } });
+    expect(await onOrigin(`rivet/${runId}/root.2`, "a.txt")).toBe("a");
+  });
+
+  it("only skips leaves that are not finished", async () => {
+    await start();
+    const runId = await startRun(twoParts());
+    await until(() => runOf(runId), (r) => r.run.nodes[0]!.status === "done");
+    expect((await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root.1" })).status).toBe(409);
+    expect((await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root" })).status).toBe(409);
+  });
+});
+
+describe("radar endpoint", () => {
+  it("reports siblings that would conflict while both still work", async () => {
+    await start();
+    const runId = await startRun({ title: "root", prompt: "r", children: [
+      leaf("one", { files: { "s.txt": "one" }, commit: "one", stayFor: 60_000 }),
+      leaf("two", { files: { "s.txt": "two" }, commit: "two", stayFor: 60_000 }),
+    ] });
+    const res = await until(async () => (await api("GET", `/api/v1/runs/${runId}/radar`)).json, (j) => j.conflicts.length > 0);
+    expect(res.conflicts).toEqual([{ a: "root.1", b: "root.2", files: ["s.txt"] }]);
+  });
+});

@@ -235,6 +235,10 @@ export function createScheduler(d: SchedulerDeps) {
     try { run = await load(runId); } catch { return; }
     const node = run.nodes.find((n) => n.id === nodeId);
     if (!node || node.kind !== "leaf") return;
+    if (node.status === "skipped") {
+      if (code === 0 || doneReported.has(sessionId)) await followUp(runId, nodeId);
+      return;
+    }
     if (code === 0 || doneReported.has(sessionId)) await leafFinished(runId, nodeId);
     else await leafFailed(runId, nodeId, `agent exited with code ${code}\n${lastOutput(sessionId)}`);
   }
@@ -596,7 +600,96 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onReport, resume, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs };
+  // Brings the parent's merged work into a running leaf. Its work is saved first. On a
+  // conflict an agent that can be told resolves it (or the agent asked for the sync
+  // itself); otherwise the merge is undone and the leaf carries on as it was.
+  async function sync(runId: string, nodeId: string, o: { byAgent?: boolean } = {}): Promise<{ synced: boolean; conflicts: string[]; note: string }> {
+    const run = await load(runId);
+    const leaf = nodeOf(run, nodeId);
+    if (leaf.kind !== "leaf") throw new SchedulerError(409, "only leaves sync");
+    if (leaf.status !== "running" || leaf.finishedAt) throw new SchedulerError(409, `${nodeId} is not working (${leaf.status})`);
+    if (!leaf.parentId) throw new SchedulerError(409, "a single-leaf run has no parent to sync with");
+    const parent = nodeOf(run, leaf.parentId);
+    if (await mergeInProgress(leaf.worktree)) throw new SchedulerError(409, "a merge is already in progress in this worktree");
+    await commitLeftovers(leaf.worktree, `rivet: save work of "${leaf.title}" before syncing`);
+    const merged = await mergeBranch(leaf.worktree, parent.branch, `Sync with "${parent.title}"`);
+    if (merged.ok) return { synced: true, conflicts: [], note: `merged ${parent.branch} into ${leaf.branch}` };
+    const sessionId = sessionIdOf(runId, nodeId);
+    if (o.byAgent) {
+      return { synced: false, conflicts: merged.conflicts, note: "resolve the conflicts, then commit the merge" };
+    }
+    const agent = d.agents(leaf.agent);
+    if (d.runtime.isAlive(sessionId) && agent.acceptsInput({ headless: (await d.write(() => d.store.getConfig(run.project)))["worker.mode"] !== "interactive" })) {
+      await d.runtime.write(sessionId, `Note from Rivet: I merged ${parent.branch} (your siblings' finished work) into your branch and it conflicts in: ${merged.conflicts.join(", ")}. Resolve those conflicts, commit the merge, then continue your part.`);
+      return { synced: false, conflicts: merged.conflicts, note: "the leaf's agent was asked to resolve them" };
+    }
+    await abortMerge(leaf.worktree);
+    return { synced: false, conflicts: merged.conflicts, note: "merge undone; the leaf continues on its own branch" };
+  }
+
+  // A parent whose remaining children are all done or skipped moves on.
+  async function advance(runId: string, parentId: string): Promise<void> {
+    const run = await load(runId);
+    const parent = nodeOf(run, parentId);
+    if (parent.status !== "waiting") return;
+    if (childrenOf(run, parentId).some((c) => c.status !== "done" && c.status !== "skipped")) return;
+    if (parent.parentId === null) {
+      await completeRoot(runId);
+    } else {
+      await transition(runId, parentId, "integrating");
+      await transition(runId, parentId, "done");
+      await d.write(() => d.store.updateNode(runId, parentId, { finishedAt: new Date().toISOString() }));
+      enqueueMerge(runId, parent.parentId, parentId);
+    }
+  }
+
+  // The user ships without this leaf. Its agent keeps working; when it finishes, its
+  // work becomes a follow-up pull request on top of what shipped.
+  async function skip(runId: string, nodeId: string): Promise<void> {
+    const run = await load(runId);
+    const leaf = nodeOf(run, nodeId);
+    if (leaf.kind !== "leaf") throw new SchedulerError(409, "only leaves can be skipped");
+    if (!["pending", "running", "failed", "escalated"].includes(leaf.status)) throw new SchedulerError(409, `${nodeId} is ${leaf.status}`);
+    const running = d.runtime.isAlive(sessionIdOf(runId, nodeId));
+    await transition(runId, nodeId, "skipped",
+      running ? "skipped by the user; still running, will become a follow-up" : "skipped by the user");
+    if (leaf.parentId) await advance(runId, leaf.parentId);
+    else await completeRoot(runId).catch(report);
+  }
+
+  async function followUp(runId: string, nodeId: string): Promise<void> {
+    const run = await load(runId);
+    const leaf = nodeOf(run, nodeId);
+    const root = run.nodes[0]!;
+    await commitLeftovers(leaf.worktree, `rivet: save work left uncommitted by "${leaf.title}"`);
+    // On top of what shipped, so the follow-up applies cleanly after it.
+    const shipped = await mergeBranch(leaf.worktree, root.branch, `Bring in the shipped work of "${run.task}"`).catch(() => ({ ok: false as const, conflicts: [] as string[] }));
+    if (!shipped.ok) {
+      await abortMerge(leaf.worktree).catch(report);
+      await d.write(() => d.store.updateNode(runId, nodeId, {
+        summary: `finished after it was skipped; merging the shipped work conflicts in ${shipped.conflicts.join(", ") || "?"}; its work is on ${leaf.branch}`,
+      }));
+      return;
+    }
+    const hasPr = (await d.write(() => d.store.getPr(runId))) !== null;
+    if (!d.github || !hasPr) {
+      await d.write(() => d.store.updateNode(runId, nodeId, { summary: `finished after it was skipped; its work is on ${leaf.branch}` }));
+      return;
+    }
+    try {
+      await git(["push", "-q", "origin", `HEAD:refs/heads/${leaf.branch}`], leaf.worktree);
+      const github = await d.github(run);
+      const pr = await github.createPr({
+        title: `Follow-up: ${leaf.title}`, head: leaf.branch, base: run.base,
+        body: `${leaf.title}\n\nThis part of "${run.task}" finished after the main pull request shipped without it.\n\n${leaf.prompt}`,
+      });
+      await d.write(() => d.store.updateNode(runId, nodeId, { summary: `follow-up pull request: ${pr.url}` }));
+    } catch (e) {
+      await d.write(() => d.store.updateNode(runId, nodeId, { summary: `finished after it was skipped; follow-up PR failed: ${(e as Error).message}` }));
+    }
+  }
+
+  return { launch, startRun, onReport, resume, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, sync, skip };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;
