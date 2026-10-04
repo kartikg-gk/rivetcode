@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { git } from "../git.js";
 import type { Agent } from "./agent.js";
 import { normalizePermission, type Permission } from "./command.js";
 import { rivetBinDir } from "../runtime/env.js";
@@ -73,6 +74,8 @@ export type CodexOptions = {
   prompt?: string;
   headless?: boolean;
   hookFlags: string[];
+  // Extra folders a sandboxed run may write (the repo's shared git folder, so it can commit).
+  writableDirs?: string[];
 };
 
 function common(o: CodexOptions): string[] {
@@ -84,7 +87,8 @@ function common(o: CodexOptions): string[] {
 
 export function codexStartCommand(o: CodexOptions): string[] {
   const args = [o.binary, ...(o.headless ? ["exec"] : []), ...BASE_ARGS,
-    ...codexPermissionArgs(o.permission ?? "default", !!o.headless), ...o.hookFlags, ...common(o)];
+    ...codexPermissionArgs(o.permission ?? "default", !!o.headless), ...o.hookFlags, ...common(o),
+    ...(o.writableDirs ?? []).flatMap((d) => ["--add-dir", d])];
   if (o.prompt) args.push("--", o.prompt);
   return args;
 }
@@ -96,6 +100,14 @@ export function codexResumeCommand(o: CodexOptions & { capturedId?: string }): s
   const args = [o.binary, "resume", ...BASE_ARGS, ...codexPermissionArgs(o.permission ?? "default", false), ...o.hookFlags, ...common(o), id];
   if (o.prompt) args.push("--", o.prompt);
   return args;
+}
+
+async function sharedGitDir(workspace: string): Promise<string[]> {
+  try {
+    return [resolve(workspace, (await git(["rev-parse", "--git-common-dir"], workspace)).trim())];
+  } catch {
+    return [];
+  }
 }
 
 function rivetExecutable(): string {
@@ -110,6 +122,8 @@ export function codexAgent(binary: string): Agent {
     acceptsInput: ({ headless }) => !headless,
     launchCommand: async (cfg) => codexStartCommand({
       binary, workspace: cfg.workspace, hookFlags: hookFlags(),
+      // A worktree's git data lives in the main repo's .git, outside the sandbox.
+      ...(cfg.headless ? { writableDirs: await sharedGitDir(cfg.workspace) } : {}),
       ...(cfg.permission ? { permission: cfg.permission } : {}),
       ...(cfg.model ? { model: cfg.model } : {}),
       ...(cfg.systemPrompt ? { systemPrompt: cfg.systemPrompt } : {}),

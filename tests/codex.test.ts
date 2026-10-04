@@ -87,3 +87,25 @@ describe("codex adapter", () => {
     expect(deriveActivity("codex", "session-start", {})).toBeNull();
   });
 });
+
+describe("headless codex in a worktree", () => {
+  it("may write the repo's shared git folder so it can commit", async () => {
+    const { makeRepo, makeDataDir, removeRepo } = await import("./helpers.js");
+    const { createWorktree } = await import("../src/worktree.js");
+    const { join } = await import("node:path");
+    const repo = await makeRepo();
+    const data = await makeDataDir();
+    try {
+      const path = join(data, "wt");
+      await createWorktree({ repo, path, branch: "b", from: "main" });
+      const argv = await getAgent("codex", { binary: "codex" }).launchCommand({ sessionId: "r1-root", workspace: path, headless: true });
+      const at = argv.indexOf("--add-dir");
+      expect(at).toBeGreaterThan(0);
+      const norm = (p: string) => p.split("\\").join("/").toLowerCase();
+      expect(norm(argv[at + 1]!)).toBe(norm(join(repo, ".git")));
+    } finally {
+      await removeRepo(repo);
+      await removeRepo(data);
+    }
+  });
+});
