@@ -1,0 +1,152 @@
+import { existsSync } from "node:fs";
+import { mkdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getAgent } from "../src/agents/agent.js";
+import { createRuntime, RuntimeError, type Runtime } from "../src/runtime/runtime.js";
+import { makeDataDir, removeRepo } from "./helpers.js";
+
+let data: string;
+let ws: string;
+let runtime: Runtime;
+
+beforeEach(async () => {
+  data = await makeDataDir();
+  ws = join(data, "work space");
+  await mkdir(ws);
+  runtime = createRuntime({ logDir: join(data, "logs"), stopGraceMs: 500 });
+});
+
+afterEach(async () => {
+  await runtime.stopAll();
+  await removeRepo(data);
+});
+
+async function fakeArgv(spec: object): Promise<string[]> {
+  return getAgent("fake").launchCommand({ sessionId: "r1-a", workspace: ws, prompt: JSON.stringify(spec) });
+}
+
+function exited(sessionId: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const off = runtime.onExit((id, _launch, code) => {
+      if (id === sessionId) { off(); resolve(code); }
+    });
+  });
+}
+
+async function until(check: () => boolean | Promise<boolean>, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!(await check())) {
+    if (Date.now() > end) throw new Error("timed out");
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+describe("start", () => {
+  it("runs the command in the workspace with the given env, no shell", async () => {
+    const done = exited("r1-a");
+    const launch = await runtime.start({
+      sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ dumpEnv: true, files: { "a b.txt": "x" } }),
+      env: { RIVET_SESSION_ID: "r1-a" },
+    });
+    expect(launch.launchId).toMatch(/^[0-9a-f]{16}$/);
+    expect(await done).toBe(0);
+    expect(JSON.parse(await readFile(join(ws, "env.json"), "utf8"))).toEqual({ RIVET_SESSION_ID: "r1-a" });
+    expect(existsSync(join(ws, "a b.txt"))).toBe(true);
+  });
+
+  it("refuses a second start while the session is live", async () => {
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ stayFor: 5000 }), env: {} });
+    await expect(runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({}), env: {} }))
+      .rejects.toThrow(/already running/);
+  });
+
+  it("refuses a missing workspace or a command that does not exist", async () => {
+    await expect(runtime.start({ sessionId: "r1-a", workspace: join(data, "nope"), argv: await fakeArgv({}), env: {} }))
+      .rejects.toThrow(RuntimeError);
+    await expect(runtime.start({ sessionId: "r1-b", workspace: ws, argv: ["rivet-no-such-binary"], env: {} }))
+      .rejects.toThrow(/could not start/);
+    expect(runtime.isAlive("r1-b")).toBe(false);
+  });
+
+  it("can start the same session again after it exited", async () => {
+    let done = exited("r1-a");
+    const first = await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({}), env: {} });
+    await done;
+    done = exited("r1-a");
+    const second = await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({}), env: {} });
+    await done;
+    expect(second.launchId).not.toBe(first.launchId);
+  });
+});
+
+describe("output", () => {
+  it("keeps the last lines after exit and appends them to the session log", async () => {
+    const done = exited("r1-a");
+    await runtime.start({
+      sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ files: { "1": "", "2": "", "3": "" }, exitCode: 2 }), env: {},
+    });
+    expect(await done).toBe(2);
+    expect(runtime.output("r1-a", 2)).toEqual({ alive: false, exitCode: 2, lines: ["wrote 2", "wrote 3"] });
+    const log = await readFile(join(data, "logs", "r1-a.log"), "utf8");
+    expect(log.split(/\r?\n/).filter(Boolean)).toEqual(["wrote 1", "wrote 2", "wrote 3"]);
+  });
+
+  it("caps the lines kept in memory", async () => {
+    const small = createRuntime({ logDir: join(data, "logs"), keepLines: 2 });
+    const done = new Promise<void>((r) => small.onExit(() => r()));
+    await small.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ files: { "1": "", "2": "", "3": "" } }), env: {} });
+    await done;
+    expect(small.output("r1-a", 100)!.lines).toEqual(["wrote 2", "wrote 3"]);
+  });
+
+  it("returns null for a session it never started, and after forget", async () => {
+    expect(runtime.output("r1-x", 10)).toBeNull();
+    const done = exited("r1-a");
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({}), env: {} });
+    await done;
+    runtime.forget("r1-a");
+    expect(runtime.output("r1-a", 10)).toBeNull();
+  });
+});
+
+describe("write", () => {
+  it("types a line into the agent's input", async () => {
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ listen: true }), env: {} });
+    await runtime.write("r1-a", "hello there");
+    await until(() => existsSync(join(ws, "inbox.txt")));
+    expect(await readFile(join(ws, "inbox.txt"), "utf8")).toBe("hello there\n");
+    const done = exited("r1-a");
+    await runtime.write("r1-a", "/exit");
+    await done;
+    await expect(runtime.write("r1-a", "late")).rejects.toThrow(/not running/);
+  });
+});
+
+describe("stop", () => {
+  it("ends a running agent and is safe to repeat", async () => {
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ stayFor: 60_000 }), env: {} });
+    await runtime.stop("r1-a");
+    expect(runtime.isAlive("r1-a")).toBe(false);
+    await runtime.stop("r1-a");
+    await runtime.stop("r1-never");
+  });
+
+  it("force-kills an agent that ignores the polite request", async () => {
+    const stubborn = [process.execPath, "-e", "process.on('SIGTERM', () => {}); console.log('up'); setInterval(() => {}, 1000)"];
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: stubborn, env: {} });
+    await until(() => (runtime.output("r1-a", 1)?.lines ?? []).includes("up"));
+    const started = Date.now();
+    await runtime.stop("r1-a");
+    expect(runtime.isAlive("r1-a")).toBe(false);
+    expect(Date.now() - started).toBeLessThan(4000);
+  });
+
+  it("stopAll ends every live agent", async () => {
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: await fakeArgv({ stayFor: 60_000 }), env: {} });
+    await runtime.start({ sessionId: "r1-b", workspace: ws, argv: await fakeArgv({ stayFor: 60_000 }), env: {} });
+    expect(runtime.liveSessions().sort()).toEqual(["r1-a", "r1-b"]);
+    await runtime.stopAll();
+    expect(runtime.liveSessions()).toEqual([]);
+  });
+});
