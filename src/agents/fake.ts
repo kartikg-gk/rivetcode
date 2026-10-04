@@ -9,6 +9,7 @@ export function fakeAgent(): Agent {
   return {
     name: "fake",
     promptVia: "argv",
+    acceptsInput: () => true,
     launchCommand: async (cfg) => [process.execPath, SCRIPT, "--", cfg.prompt ?? "{}"],
     restoreCommand: async () => null,
     installHooks: async () => {},

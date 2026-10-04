@@ -34,8 +34,10 @@ export function claudeAgent(binary: string): Agent {
   return {
     name: "claude",
     promptVia: "argv",
-    launchCommand: (cfg) => claudeStartCommand({ binary, ...cfg }),
-    restoreCommand: (cfg) => claudeResumeCommand({ binary, ...cfg }),
+    // Print mode reads stdin only at start, so a headless claude takes no messages.
+    acceptsInput: ({ headless }) => !headless,
+    launchCommand: ({ headless, ...cfg }) => claudeStartCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
+    restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
     installHooks: (workspace) => claudeHooks.install(workspace),
     uninstallHooks: (workspace) => claudeHooks.uninstall(workspace),
     hooksInstalled: (workspace) => claudeHooks.installed(workspace),

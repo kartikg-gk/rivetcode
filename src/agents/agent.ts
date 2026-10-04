@@ -14,6 +14,8 @@ export type AgentLaunch = {
   systemPromptFile?: string;
   allowedTools?: string[];
   disallowedTools?: string[];
+  // No terminal: the agent must run to completion on its own.
+  headless?: boolean;
 };
 
 // capturedId: the agent's own session id, as reported by its hooks.
@@ -23,6 +25,8 @@ export type AgentRestore = Omit<AgentLaunch, "nativeSessionId"> & { capturedId?:
 export type Agent = {
   name: AgentName;
   promptVia: PromptVia;
+  // Whether text typed into its stdin reaches it (how sent messages are delivered).
+  acceptsInput(o: { headless: boolean }): boolean;
   launchCommand(cfg: AgentLaunch): Promise<string[]>;
   restoreCommand(cfg: AgentRestore): Promise<string[] | null>;
   installHooks(workspace: string): Promise<void>;

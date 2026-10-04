@@ -148,3 +148,14 @@ describe("fake agent", () => {
     expect(await fake.hooksInstalled(path)).toBe(false);
   });
 });
+
+describe("headless launches", () => {
+  it("claude runs in print mode and then takes no typed input; the fake always listens", async () => {
+    const claude = getAgent("claude");
+    expect(await claude.launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: true, permission: "accept-edits", model: "haiku", allowedTools: ["Bash(rivet:*)"] }))
+      .toEqual(["claude", "--session-id", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77", "-p", "--model", "haiku", "--permission-mode", "acceptEdits", "--allowedTools", "Bash(rivet:*)", "--", "go"]);
+    expect(claude.acceptsInput({ headless: true })).toBe(false);
+    expect(claude.acceptsInput({ headless: false })).toBe(true);
+    expect(getAgent("fake").acceptsInput({ headless: true })).toBe(true);
+  });
+});
