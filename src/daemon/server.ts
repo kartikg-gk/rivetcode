@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude, findCodex } from "../agents/locate.js";
 import { claudePlanner } from "../planner/claude-runner.js";
+import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
 import { extractReplan, replanPrompt } from "../planner/planner.js";
 import { dataDir, assertId } from "../paths.js";
 import { git } from "../git.js";
@@ -17,7 +18,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -33,6 +34,10 @@ export type DaemonOptions = {
   checkTimeoutMs?: number;
   // Rewrites a twice-failed leaf's instructions; defaults to a read-only claude planner.
   replan?(run: Run, node: Node, why: string): Promise<string | null>;
+  // GitHub access for a run (tests pass a client for a mock API).
+  github?(run: Run): Promise<GitHub>;
+  // How often open pull requests are checked.
+  prWatchMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -168,8 +173,15 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const planner = claudePlanner({ binary, repo: node.worktree, ...(model ? { model } : {}) });
     return extractReplan(await planner(replanPrompt(run.task, node, why), { resume: false }));
   });
+  const github = opts.github ?? (async (run: Run): Promise<GitHub> => {
+    const remote = (await git(["remote", "get-url", "origin"], run.repo).catch(() => "")).trim();
+    const config = await write(() => store.getConfig(run.project));
+    const repo = config["github.repo"] ?? repoSlug(remote);
+    if (!repo) throw new Error(`origin is not a GitHub repository (${remote || "no origin"}); set github.repo`);
+    return githubClient({ repo, token: await githubToken(process.env, remote) });
+  });
   const scheduler = createScheduler({
-    data, runFile, store, write, runtime, agents, launches, replan,
+    data, runFile, store, write, runtime, agents, launches, replan, github,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
   });
@@ -385,7 +397,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 201, { runId: run.id });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -396,10 +408,15 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (action === undefined) {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         const live = Object.fromEntries(run.nodes.map((n) => [n.id, runtime.isAlive(sessionIdOf(run.id, n.id))]));
-        reply(res, 200, { run, live, now: new Date().toISOString() });
+        const pr = await write(() => store.getPr(run.id));
+        reply(res, 200, { run, live, pr, now: new Date().toISOString() });
         return;
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      if (action === "pr") {
+        reply(res, 200, await scheduler.publish(run.id));
+        return;
+      }
       if (action === "resume") {
         await scheduler.resume(run.id);
         reply(res, 202, { runId: run.id });
@@ -458,6 +475,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
+    scheduler.watchPrs(opts.prWatchMs ?? 30_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {
       void scheduler.recover(id).catch((e) => opts.onError?.(e));

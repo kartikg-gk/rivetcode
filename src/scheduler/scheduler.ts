@@ -8,7 +8,8 @@ import { normalizePermission } from "../agents/command.js";
 import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { Run, Store } from "../store.js";
-import { setStatus, type Node, type Status } from "../tree.js";
+import { claimsOverlap, reopen, setStatus, type Node, type Status } from "../tree.js";
+import { prStatus, type GitHub } from "../github/github.js";
 import { conflictPrompt, leafPrompt } from "./prompts.js";
 
 // Agents run without a terminal for now, so they need leave to edit files and to run
@@ -34,6 +35,8 @@ export type SchedulerDeps = {
   testTimeoutMs?: number;
   // Rewrites a leaf's instructions after it failed twice; null keeps them.
   replan?(run: Run, node: Node, why: string): Promise<string | null>;
+  // GitHub access for a run's repository; without it there are no pull requests.
+  github?(run: Run): Promise<GitHub>;
   // Called with every problem the scheduler could not handle itself (for logs and tests).
   onError?(error: unknown): void;
 };
@@ -254,6 +257,7 @@ export function createScheduler(d: SchedulerDeps) {
   // From now on exits are only recorded; nothing is retried or merged.
   async function shutdown(): Promise<void> {
     shuttingDown = true;
+    if (watcher) clearInterval(watcher);
     await d.runtime.stopAll();
     await idle();
   }
@@ -375,6 +379,155 @@ export function createScheduler(d: SchedulerDeps) {
       }
     }
     await transition(runId, root.id, "done");
+    // A run with a pull request pushes every new result; "pr=auto" opens one the first time.
+    const config = await d.write(() => d.store.getConfig(run.project));
+    const hasPr = (await d.write(() => d.store.getPr(runId))) !== null;
+    if (d.github && (hasPr || config.pr === "auto")) await publish(runId).catch(report);
+  }
+
+  async function filesChanged(run: Run, branch: string): Promise<string[]> {
+    const out = await git(["diff", "--name-only", `${run.base}...${branch}`], run.repo).catch(() => "");
+    return out.split(/\r?\n/).filter(Boolean);
+  }
+
+  async function prBody(run: Run): Promise<string> {
+    const lines = [
+      run.task,
+      "",
+      "Rivet split this task into parts, ran an agent on each in its own worktree, and merged",
+      "every part into this branch as soon as it was done (one merge commit per part).",
+      "",
+    ];
+    for (const leaf of run.nodes.filter((n) => n.kind === "leaf")) {
+      const files = await filesChanged(run, leaf.branch);
+      lines.push(`- **${leaf.title}** (\`${leaf.id}\`, branch \`${leaf.branch}\`)${leaf.summary ? `: ${leaf.summary.split(/\r?\n/)[0]}` : ""}`);
+      if (files.length) lines.push(`  files: ${files.map((f) => `\`${f}\``).join(", ")}`);
+    }
+    return lines.join("\n");
+  }
+
+  // Brings the latest base into the finished root, tests again if it moved, pushes the
+  // root branch and opens the pull request if there is none yet. Never merges the PR.
+  async function publish(runId: string): Promise<{ number: number; url: string }> {
+    if (!d.github) throw new SchedulerError(409, "GitHub is not available");
+    const run = await load(runId);
+    const root = run.nodes[0]!;
+    if (root.status !== "done") throw new SchedulerError(409, `run ${runId} is not done (root is ${root.status})`);
+    const before = await headOf(root.worktree);
+    try {
+      await git(["fetch", "-q", "origin", run.base], root.worktree);
+    } catch (e) {
+      throw new SchedulerError(409, `cannot fetch ${run.base} from origin: ${(e as Error).message}`);
+    }
+    const synced = await mergeBranch(root.worktree, `origin/${run.base}`, `Merge latest ${run.base}`);
+    if (!synced.ok) {
+      const base: Node = { ...root, id: run.base, title: `latest ${run.base}`, branch: `origin/${run.base}` };
+      const resolved = await resolveWithAgent(run, root, base, synced.conflicts);
+      if (!resolved.ok) {
+        await abortMerge(root.worktree).catch(report);
+        if ((await headOf(root.worktree)) !== before) await resetTo(root.worktree, before).catch(report);
+        const why = `merging the latest ${run.base} conflicts in ${synced.conflicts.join(", ")}: ${resolved.reason}`;
+        await d.write(() => d.store.updateNode(runId, root.id, { summary: why, prStatus: "needs_input" }));
+        throw new SchedulerError(409, why);
+      }
+    }
+    if ((await headOf(root.worktree)) !== before) {
+      const { test } = await d.write(() => d.store.getConfig(run.project));
+      if (test) {
+        const result = await runCommand(test, root.worktree, testTimeout);
+        if (!result.ok) {
+          await resetTo(root.worktree, before);
+          const why = `tests "${test}" fail after merging the latest ${run.base}:\n${result.output}`;
+          await d.write(() => d.store.updateNode(runId, root.id, { summary: why, prStatus: "needs_input" }));
+          throw new SchedulerError(409, why);
+        }
+      }
+    }
+    await git(["push", "-q", "origin", `HEAD:refs/heads/${root.branch}`], root.worktree);
+    const existing = await d.write(() => d.store.getPr(runId));
+    if (existing) return { number: existing.number, url: existing.url };
+    const github = await d.github(run);
+    const pr = await github.createPr({ title: run.task, head: root.branch, base: run.base, body: await prBody(run) });
+    await d.write(() => {
+      d.store.setPr(runId, pr);
+      d.store.updateNode(runId, root.id, { prStatus: "pr_open" });
+    });
+    return pr;
+  }
+
+  // Leaves whose claimed or changed files include one of the paths.
+  async function owners(run: Run, paths: string[]): Promise<Node[]> {
+    const found: Node[] = [];
+    for (const leaf of run.nodes.filter((n) => n.kind === "leaf")) {
+      const files = [...leaf.files, ...(await filesChanged(run, leaf.branch))];
+      if (paths.some((p) => files.some((f) => claimsOverlap(f, p)))) found.push(leaf);
+    }
+    return found;
+  }
+
+  // Sends a finished leaf back to work with feedback; its parents wait for it again.
+  async function reopenLeaf(runId: string, leafId: string, feedback: string): Promise<void> {
+    await d.write(() => {
+      let nodes = d.store.loadRun(runId).nodes;
+      const chain: string[] = [];
+      for (let n = nodes.find((x) => x.id === leafId); n; n = nodes.find((x) => x.id === n!.parentId)) chain.push(n.id);
+      for (const id of chain) {
+        if (nodes.find((x) => x.id === id)!.status === "done") nodes = reopen(nodes, id, id === leafId ? feedback : undefined);
+      }
+      for (const id of chain) {
+        const n = nodes.find((x) => x.id === id)!;
+        d.store.updateNode(runId, id, { status: n.status, attempts: n.attempts, finishedAt: null, ...(id === leafId ? { summary: feedback } : {}) });
+      }
+    });
+    const run = await load(runId);
+    const leaf = nodeOf(run, leafId);
+    await launch(run, leaf, leafPrompt(run, leaf, feedback));
+  }
+
+  // One look at the pull request: record where it stands and act once on new feedback.
+  async function checkPr(runId: string): Promise<string | null> {
+    if (!d.github) return null;
+    const pr = await d.write(() => d.store.getPr(runId));
+    if (!pr) return null;
+    const run = await load(runId);
+    const root = run.nodes[0]!;
+    if (root.prStatus === "merged" || root.prStatus === "terminated") return root.prStatus;
+    const github = await d.github(run);
+    const facts = await github.facts(pr.number);
+    const status = prStatus(facts);
+    await d.write(() => d.store.updateNode(runId, root.id, { prStatus: status }));
+    const key = `${status}:${facts.mergeability}:${facts.headSha}`;
+    // Work is already under way, or this exact state was handled before.
+    if (pr.handled === key || root.status !== "done") return status;
+    if (status === "ci_failed") {
+      const paths = await github.failedPaths(pr.number);
+      for (const leaf of await owners(run, paths)) {
+        await reopenLeaf(runId, leaf.id, `CI failed on the pull request in: ${paths.join(", ")}. Fix it.`);
+      }
+    } else if (status === "changes_requested") {
+      const comments = await github.reviewComments(pr.number);
+      for (const leaf of await owners(run, comments.map((c) => c.path))) {
+        const files = [...leaf.files, ...(await filesChanged(run, leaf.branch))];
+        const mine = comments.filter((c) => files.some((f) => claimsOverlap(f, c.path)));
+        const text = mine.map((c) => `${c.path}${c.line ? `:${c.line}` : ""}: ${c.body}`).join("\n");
+        await reopenLeaf(runId, leaf.id, `Review comments on the pull request:\n${text}\nAddress them.`);
+      }
+    } else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") {
+      await publish(runId).catch(report);
+    }
+    await d.write(() => d.store.setPr(runId, { ...pr, handled: key }));
+    return status;
+  }
+
+  let watcher: NodeJS.Timeout | undefined;
+  // Looks at every open pull request on a timer until shutdown.
+  function watchPrs(intervalMs: number): void {
+    watcher = setInterval(() => {
+      void (async () => {
+        for (const id of await d.write(() => d.store.listRuns())) await checkPr(id).catch(report);
+      })();
+    }, intervalMs);
+    watcher.unref();
   }
 
   // Puts escalated and failed nodes back to work after the user fixed what blocked them,
@@ -443,7 +596,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onReport, resume, recover, idle, stopSession, shutdown, deliver: deliverQueued };
+  return { launch, startRun, onReport, resume, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

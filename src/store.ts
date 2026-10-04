@@ -47,10 +47,12 @@ export type NodeUpdate = {
   finishedAt?: string | null;
   // A re-plan replaces a leaf's instructions.
   prompt?: string;
+  // Where the root's pull request stands.
+  prStatus?: Node["prStatus"] | null;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
-  status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt",
+  status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt", prStatus: "pr_status",
 };
 
 export class RunStoreError extends Error {
