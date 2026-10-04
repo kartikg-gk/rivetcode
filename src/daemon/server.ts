@@ -273,11 +273,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
       const payload = await body(req);
-      if (!ACTIVITY_STATES.includes(payload.state as ActivityState)) {
+      if (payload.state !== undefined && !ACTIVITY_STATES.includes(payload.state as ActivityState)) {
         throw new HttpError(400, "invalid activity state");
       }
+      const state = (payload.state as ActivityState | undefined) ?? null;
       const agentSessionId = optionalString(payload.agentSessionId, "agentSessionId");
-      const found = await write(() => store.setActivity(runId, nodeId, payload.state as ActivityState, agentSessionId));
+      if (state === null && agentSessionId === undefined) throw new HttpError(400, "state or agentSessionId is required");
+      // Hooks of an agent from an earlier launch may still fire; only the current launch counts.
+      const launchId = optionalString(payload.launchId, "launchId");
+      if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
+        reply(res, 204);
+        return;
+      }
+      const found = await write(() => store.setActivity(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
       reply(res, 204);
       return;
