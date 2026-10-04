@@ -162,3 +162,26 @@ describe("schema migrations", () => {
     expect(versions()).toEqual([1, 2]);
   });
 });
+
+describe("outbox and stale sessions", () => {
+  it("lists undelivered messages oldest first and marks them delivered", () => {
+    store.saveRun(sampleRun());
+    const first = store.queueMessage("r1", "root.1", "one")!;
+    const second = store.queueMessage("r1", "root.1", "two", "r1-root")!;
+    store.queueMessage("r1", "root", "for the parent");
+    expect(store.undeliveredMessages("r1", "root.1")).toEqual([
+      { id: first, message: "one" }, { id: second, message: "two" },
+    ]);
+    store.markDelivered(first);
+    expect(store.undeliveredMessages("r1", "root.1")).toEqual([{ id: second, message: "two" }]);
+  });
+
+  it("marks every session that still looks alive as exited", () => {
+    store.saveRun(sampleRun());
+    store.setActivity("r1", "root.1", "active");
+    store.setActivity("r1", "root", "idle");
+    expect(store.exitStaleSessions()).toBe(2);
+    expect(store.loadRun("r1").nodes.map((n) => n.activity)).toEqual(["exited", "exited"]);
+    expect(store.exitStaleSessions()).toBe(0);
+  });
+});

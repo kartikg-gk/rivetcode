@@ -1,8 +1,13 @@
+import { existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { join } from "node:path";
+import { getAgent, type Agent } from "../agents/agent.js";
 import { dataDir, assertId } from "../paths.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
-import { openStore } from "../store.js";
-import { ACTIVITY_STATES, type ActivityState } from "../tree.js";
+import { agentEnv, sessionIdOf } from "../runtime/env.js";
+import { createRuntime, newLaunchId } from "../runtime/runtime.js";
+import { openStore, RunStoreError } from "../store.js";
+import { ACTIVITY_STATES, type ActivityState, type Node } from "../tree.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
@@ -10,7 +15,14 @@ const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
 export type Daemon = { port: number; stop(): Promise<void> };
-export type DaemonOptions = { data?: string; runFile?: string; port?: number };
+export type DaemonOptions = {
+  data?: string;
+  runFile?: string;
+  port?: number;
+  // Which adapter runs a node's agent; tests swap in the fake agent.
+  agents?: (name: Node["agent"]) => Agent;
+  stopGraceMs?: number;
+};
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
@@ -38,6 +50,7 @@ async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
     req.once("error", reject);
   });
   if (size > BODY_LIMIT) throw new HttpError(413, "body exceeds 1 MiB");
+  if (size === 0) return {};
   let value: unknown;
   try { value = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
   catch { throw new HttpError(400, "invalid JSON"); }
@@ -101,8 +114,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   }
 
   const store = openStore(data);
-  try { await emptyTrash(data); }
-  catch (error) { store.close(); throw error; }
+  try {
+    store.exitStaleSessions();
+    await emptyTrash(data);
+  } catch (error) { store.close(); throw error; }
+
+  const agents = opts.agents ?? ((name: Node["agent"]) => {
+    if (name !== "claude") throw new HttpError(409, `agent "${name}" is not supported yet`);
+    return getAgent(name);
+  });
+  const runtime = createRuntime({ logDir: join(data, "logs"), ...(opts.stopGraceMs ? { stopGraceMs: opts.stopGraceMs } : {}) });
+  // The launch each session is on now; exits of older launches are ignored.
+  const launches = new Map<string, string>();
 
   let queue = Promise.resolve();
   function write<T>(work: () => T): Promise<T> {
@@ -120,6 +143,69 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     });
   });
 
+  runtime.onExit((sessionId, launchId) => {
+    if (launches.get(sessionId) !== launchId) return;
+    const { runId, nodeId } = session(sessionId);
+    void write(() => store.setActivity(runId, nodeId, "exited"));
+  });
+
+  // Types every queued message into a running session, oldest first. One delivery
+  // pass per session at a time, so two sends never type the same message twice.
+  const delivering = new Map<string, Promise<void>>();
+  function deliver(runId: string, nodeId: string): Promise<void> {
+    const sessionId = sessionIdOf(runId, nodeId);
+    const next = (delivering.get(sessionId) ?? Promise.resolve()).then(() => deliverNow(runId, nodeId));
+    const tail = next.catch(() => {});
+    delivering.set(sessionId, tail);
+    void tail.then(() => { if (delivering.get(sessionId) === tail) delivering.delete(sessionId); });
+    return next;
+  }
+
+  async function deliverNow(runId: string, nodeId: string): Promise<void> {
+    const sessionId = sessionIdOf(runId, nodeId);
+    const pending = await write(() => store.undeliveredMessages(runId, nodeId));
+    for (const m of pending) {
+      if (!runtime.isAlive(sessionId)) return;
+      try { await runtime.write(sessionId, m.message); }
+      catch { return; }
+      await write(() => store.markDelivered(m.id));
+    }
+  }
+
+  async function startSession(runId: string, nodeId: string, prompt?: string): Promise<string> {
+    let run;
+    try { run = store.loadRun(runId); }
+    catch (error) {
+      if (error instanceof RunStoreError) throw new HttpError(404, "unknown session");
+      throw error;
+    }
+    const node = run.nodes.find((n) => n.id === nodeId);
+    if (!node) throw new HttpError(404, "unknown session");
+    if (node.kind !== "leaf") throw new HttpError(409, "only leaves run agents");
+    const sessionId = sessionIdOf(runId, nodeId);
+    if (runtime.isAlive(sessionId)) throw new HttpError(409, "session is already running");
+    if (!existsSync(node.worktree)) throw new HttpError(409, `worktree is missing: ${node.worktree}`);
+
+    const agent = agents(node.agent);
+    const launchId = newLaunchId();
+    const argv = await agent.launchCommand({ sessionId, workspace: node.worktree, ...(prompt !== undefined ? { prompt } : {}) });
+    await agent.installHooks(node.worktree);
+    try {
+      await runtime.start({
+        sessionId, workspace: node.worktree, argv, launchId,
+        env: agentEnv({ runId, nodeId, project: run.project, dataDir: data, runFile, launchId }),
+      });
+    } catch (error) {
+      if (runtime.isAlive(sessionId)) throw new HttpError(409, "session is already running");
+      throw error;
+    }
+    // Set only once this launch really runs, so a refused duplicate start cannot hide its exit.
+    launches.set(sessionId, launchId);
+    await write(() => store.setActivity(runId, nodeId, "active"));
+    await deliver(runId, nodeId);
+    return launchId;
+  }
+
   let stopping: Promise<void> | undefined;
   const onSignal = () => { void stop(); };
   function stop(): Promise<void> {
@@ -127,6 +213,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     stopping = (async () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      await runtime.stopAll();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
       await waitForTrash();
@@ -152,6 +239,33 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       res.writeHead(202, { "content-type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ status: "shutting_down", pid: process.pid }), () => { void stop(); });
+      return;
+    }
+    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output)$/.exec(path);
+    if (control) {
+      const [, id, action] = control;
+      const { runId, nodeId } = session(id);
+      const sessionId = sessionIdOf(runId, nodeId);
+      if (action === "output") {
+        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+        const raw = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("lines");
+        const lines = raw === null ? 200 : Number(raw);
+        if (!Number.isInteger(lines) || lines < 1) throw new HttpError(400, "lines must be a positive integer");
+        const out = runtime.output(sessionId, Math.min(lines, 2000));
+        if (!out) throw new HttpError(404, "session has not been started");
+        reply(res, 200, out);
+        return;
+      }
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      if (action === "stop") {
+        if (!runtime.isAlive(sessionId)) throw new HttpError(404, "session is not running");
+        await runtime.stop(sessionId);
+        reply(res, 204);
+        return;
+      }
+      const payload = await body(req);
+      const prompt = optionalString(payload.prompt, "prompt");
+      reply(res, 202, { launchId: await startSession(runId, nodeId, prompt) });
       return;
     }
     const activity = /^\/api\/v1\/sessions\/([^/]+)\/activity$/.exec(path);
@@ -188,6 +302,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const from = optionalString(payload.from, "from");
       const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from));
       if (id === null) throw new HttpError(404, "unknown session");
+      if (runtime.isAlive(sessionIdOf(runId, nodeId))) await deliver(runId, nodeId);
       reply(res, 202, { id });
       return;
     }
@@ -207,6 +322,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     process.on("SIGTERM", onSignal);
     return { port: address.port, stop };
   } catch (error) {
+    await runtime.stopAll();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
     await waitForTrash();
     store.close();

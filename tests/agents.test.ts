@@ -112,6 +112,36 @@ describe("fake agent", () => {
     expect((await git(["status", "--porcelain"], path)).trim()).toBe("?? b.txt");
   });
 
+  it("reports each action on stdout", async () => {
+    const result = await run({ files: { "a.txt": "a\n" }, commit: "add a" });
+    expect(result.stdout.split(/\r?\n/).filter(Boolean)).toEqual(["wrote a.txt", "committed"]);
+  });
+
+  it("writes its RIVET_* environment to env.json when asked", async () => {
+    const [cmd, ...args] = await fake.launchCommand({ sessionId: "r1-root", workspace: path, prompt: JSON.stringify({ dumpEnv: true }) });
+    const result = spawnSync(cmd!, args, {
+      cwd: path, encoding: "utf8", env: { ...process.env, RIVET_SESSION_ID: "r1-root", OTHER: "x" },
+    });
+    expect(result.status).toBe(0);
+    const env = JSON.parse(await readFile(join(path, "env.json"), "utf8"));
+    expect(env.RIVET_SESSION_ID).toBe("r1-root");
+    expect(env.OTHER).toBeUndefined();
+  });
+
+  it("listens on stdin until /exit when asked", async () => {
+    const [cmd, ...args] = await fake.launchCommand({ sessionId: "r1-root", workspace: path, prompt: JSON.stringify({ listen: true, exitCode: 4 }) });
+    const result = spawnSync(cmd!, args, { cwd: path, encoding: "utf8", input: "hello\nsecond line\n/exit\nignored\n" });
+    expect(result.status).toBe(4);
+    expect(await readFile(join(path, "inbox.txt"), "utf8")).toBe("hello\nsecond line\n");
+    expect(result.stdout).toContain("got hello");
+  });
+
+  it("stays alive for stayFor ms", async () => {
+    const started = Date.now();
+    await run({ stayFor: 300 });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+  });
+
   it("cannot be resumed and has no hooks", async () => {
     expect(await fake.restoreCommand({ sessionId: "r1-root", workspace: path })).toBeNull();
     await fake.installHooks(path);
