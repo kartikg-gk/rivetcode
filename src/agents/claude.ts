@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type { Agent } from "./agent.js";
 import { claudeResumeCommand, claudeStartCommand } from "./command.js";
 import { hooksManager, type HookSpec } from "./hooks.js";
+import { claudeConfigPath, ensureClaudeTrust } from "./trust.js";
 
 const PREFIX = "rivet hooks claude-code ";
 
@@ -30,8 +31,12 @@ const claudeHooks = hooksManager({
   managed: CLAUDE_HOOKS,
 });
 
-export function claudeAgent(binary: string): Agent {
+export function claudeAgent(binary: string, configPath = claudeConfigPath()): Agent {
   return {
+    // Only the interactive app asks about folder trust; print mode does not.
+    prepare: async ({ workspace, headless }) => {
+      if (!headless) await ensureClaudeTrust(configPath, workspace);
+    },
     name: "claude",
     promptVia: "argv",
     // Print mode reads stdin only at start, so a headless claude takes no messages.

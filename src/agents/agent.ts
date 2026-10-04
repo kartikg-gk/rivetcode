@@ -33,14 +33,16 @@ export type Agent = {
   installHooks(workspace: string): Promise<void>;
   uninstallHooks(workspace: string): Promise<void>;
   hooksInstalled(workspace: string): Promise<boolean>;
+  // Runs just before launch (e.g. marking the worktree trusted for an interactive agent).
+  prepare?(o: { workspace: string; headless: boolean }): Promise<void>;
 };
 
 export type AgentName = "claude" | "codex" | "fake";
 
-export function getAgent(name: AgentName, opts: { binary?: string } = {}): Agent {
+export function getAgent(name: AgentName, opts: { binary?: string; claudeConfig?: string } = {}): Agent {
   switch (name) {
     case "claude":
-      return claudeAgent(opts.binary ?? "claude");
+      return claudeAgent(opts.binary ?? "claude", opts.claudeConfig);
     case "codex":
       return codexAgent(opts.binary ?? "codex");
     case "fake":
