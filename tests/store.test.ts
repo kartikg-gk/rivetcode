@@ -141,25 +141,25 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1, 2, 3]);
+    expect(versions()).toEqual([1, 2, 3, 4]);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3]);
+    expect(versions()).toEqual([1, 2, 3, 4]);
   });
 
   it("applies migrations 2 and 3 once to a version 1 database", () => {
     store.saveRun(sampleRun());
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("DROP TABLE pull_requests; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     expect(versions()).toEqual([1]);
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3]);
+    expect(versions()).toEqual([1, 2, 3, 4]);
     expect(store.loadRun("r1").nodes).toHaveLength(2);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3]);
+    expect(versions()).toEqual([1, 2, 3, 4]);
   });
 });
 
@@ -193,7 +193,7 @@ describe("migration 3 and project config", () => {
     store.saveRun(run);
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DELETE FROM schema_migrations WHERE version = 3; DROP TABLE project_config;");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 3; DROP TABLE project_config; DROP TABLE pull_requests;");
     db.exec("CREATE TABLE n2 AS SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes; DROP TABLE nodes; ALTER TABLE n2 RENAME TO nodes;");
     db.close();
     store = openStore(data);
@@ -242,5 +242,16 @@ describe("updateNode", () => {
     store.saveRun(sampleRun());
     expect(() => store.updateNode("r1", "root.9", { status: "done" })).toThrow(/no node root\.9/);
     expect(() => store.updateNode("r1", "root.1", { status: "bogus" as never })).toThrow();
+  });
+});
+
+describe("pull requests", () => {
+  it("remembers a run's pull request and what was already handled", () => {
+    store.saveRun(sampleRun());
+    expect(store.getPr("r1")).toBeNull();
+    store.setPr("r1", { number: 7, url: "https://github.com/o/r/pull/7" });
+    expect(store.getPr("r1")).toEqual({ number: 7, url: "https://github.com/o/r/pull/7" });
+    store.setPr("r1", { number: 7, url: "https://github.com/o/r/pull/7", handled: "ci:abc" });
+    expect(store.getPr("r1")!.handled).toBe("ci:abc");
   });
 });

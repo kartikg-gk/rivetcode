@@ -187,3 +187,16 @@ export function setStatus(nodes: Node[], id: string, to: Status, summary?: strin
   };
   return nodes.map((x, j) => (j === i ? next : x));
 }
+
+// Feedback on the pull request (failed CI, review comments) sends finished work back:
+// a done leaf runs again, a done parent waits for it again. Only done nodes reopen.
+export function reopen(nodes: Node[], id: string, summary?: string): Node[] {
+  const i = nodes.findIndex((n) => n.id === id);
+  if (i < 0) throw new Error(`unknown node ${id}`);
+  const n = nodes[i]!;
+  if (n.status !== "done") throw new Error(`${id} is ${n.status}; only done nodes reopen`);
+  const next: Node = n.kind === "leaf"
+    ? { ...n, status: "running", attempts: n.attempts + 1, ...(summary !== undefined ? { summary } : {}) }
+    : { ...n, status: "waiting", ...(summary !== undefined ? { summary } : {}) };
+  return nodes.map((x, j) => (j === i ? next : x));
+}

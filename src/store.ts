@@ -32,8 +32,13 @@ export type Store = {
   // Per-project settings such as the check and test commands.
   getConfig(project: string): Record<string, string>;
   setConfig(project: string, key: string, value: string | null): void;
+  // A run's pull request; "handled" remembers which feedback was already acted on.
+  getPr(runId: string): PullRequest | null;
+  setPr(runId: string, pr: PullRequest): void;
   close(): void;
 };
+
+export type PullRequest = { number: number; url: string; handled?: string };
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -158,6 +163,16 @@ CREATE TABLE project_config (
   key TEXT NOT NULL,
   value TEXT NOT NULL,
   PRIMARY KEY (project, key)
+);
+` });
+
+// The pull request a run's root opened, and the last feedback Rivet already acted on.
+MIGRATIONS.push({ version: 4, sql: `
+CREATE TABLE pull_requests (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  number INTEGER NOT NULL,
+  url TEXT NOT NULL,
+  handled TEXT
 );
 ` });
 
@@ -345,6 +360,19 @@ export function openStore(data: string): Store {
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+    },
+
+    getPr(runId) {
+      const row = db.prepare("SELECT number, url, handled FROM pull_requests WHERE run_id = ?").get(runId) as
+        { number: number; url: string; handled: string | null } | undefined;
+      if (!row) return null;
+      return { number: Number(row.number), url: row.url, ...(row.handled !== null ? { handled: row.handled } : {}) };
+    },
+
+    setPr(runId, pr) {
+      db.prepare(`INSERT INTO pull_requests (run_id, number, url, handled) VALUES (?, ?, ?, ?)
+        ON CONFLICT (run_id) DO UPDATE SET number = excluded.number, url = excluded.url, handled = excluded.handled`)
+        .run(runId, pr.number, pr.url, pr.handled ?? null);
     },
 
     getConfig(project) {
