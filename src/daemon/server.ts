@@ -14,7 +14,8 @@ const BODY_LIMIT = 1024 * 1024;
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
-export type Daemon = { port: number; stop(): Promise<void> };
+// stopped resolves once the daemon has fully shut down (by stop(), a signal or /shutdown).
+export type Daemon = { port: number; stop(): Promise<void>; stopped: Promise<void> };
 export type DaemonOptions = {
   data?: string;
   runFile?: string;
@@ -207,6 +208,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   }
 
   let stopping: Promise<void> | undefined;
+  let markStopped!: () => void;
+  const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
   const onSignal = () => { void stop(); };
   function stop(): Promise<void> {
     if (stopping) return stopping;
@@ -219,6 +222,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       await waitForTrash();
       store.close();
       await releaseRunFile(runFile, process.pid);
+      markStopped();
     })();
     return stopping;
   }
@@ -328,7 +332,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     process.on("SIGINT", onSignal);
     process.on("SIGTERM", onSignal);
-    return { port: address.port, stop };
+    return { port: address.port, stop, stopped };
   } catch (error) {
     await runtime.stopAll();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
