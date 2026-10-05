@@ -3,3 +3,4 @@ plans/
 .rivet/
 node_modules/
 learning.md
+dist/

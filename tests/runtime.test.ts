@@ -3,6 +3,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getAgent } from "../src/agents/agent.js";
+import { agentEnv, rivetBinDir } from "../src/runtime/env.js";
 import { createRuntime, RuntimeError, type Runtime } from "../src/runtime/runtime.js";
 import { makeDataDir, removeRepo } from "./helpers.js";
 
@@ -53,6 +54,17 @@ describe("start", () => {
     expect(await done).toBe(0);
     expect(JSON.parse(await readFile(join(ws, "env.json"), "utf8"))).toEqual({ RIVET_SESSION_ID: "r1-a" });
     expect(existsSync(join(ws, "a b.txt"))).toBe(true);
+  });
+
+  it("gives the agent a PATH that starts with Rivet's bin folder", async () => {
+    const done = exited("r1-a");
+    const env = agentEnv({ runId: "r1", nodeId: "a", project: "p", dataDir: data, runFile: "f", launchId: "x" });
+    await runtime.start({
+      sessionId: "r1-a", workspace: ws, env,
+      argv: [process.execPath, "-e", "const k = Object.keys(process.env).filter((n) => n.toUpperCase() === 'PATH'); console.log(k.length, process.env[k[0]].split(require('path').delimiter)[0])"],
+    });
+    await done;
+    expect(runtime.output("r1-a", 1)!.lines).toEqual([`1 ${rivetBinDir()}`]);
   });
 
   it("refuses a second start while the session is live", async () => {

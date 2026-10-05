@@ -19,7 +19,8 @@ export type Store = {
   saveRun(run: Run): void;
   loadRun(runId: string): Run;
   listRuns(project?: string): string[];
-  setActivity(runId: string, nodeId: string, state: ActivityState, agentSessionId?: string): boolean;
+  // state null keeps the current activity (a hook that only reports the agent's own session id).
+  setActivity(runId: string, nodeId: string, state: ActivityState | null, agentSessionId?: string): boolean;
   createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
   queueMessage(runId: string, nodeId: string, message: string, from?: string): number | null;
   undeliveredMessages(runId: string, nodeId: string): { id: number; message: string }[];
@@ -151,7 +152,7 @@ export function openStore(data: string): Store {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
-  const updateActivity = db.prepare(`UPDATE nodes SET activity = ?, agent_session_id = COALESCE(?, agent_session_id)
+  const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity), agent_session_id = COALESCE(?, agent_session_id)
     WHERE run_id = ? AND id = ?`);
   const sessionExists = db.prepare("SELECT 1 FROM nodes WHERE run_id = ? AND id = ?");
   const insertReport = db.prepare(`INSERT INTO reports (run_id, node_id, kind, message, created_at)
