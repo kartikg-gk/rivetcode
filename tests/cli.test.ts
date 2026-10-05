@@ -1,0 +1,198 @@
+import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { deriveActivity } from "../src/cli/activity.js";
+import { runCli, type CliIo } from "../src/cli/commands.js";
+import { startDaemon, type Daemon } from "../src/daemon/server.js";
+import { openStore } from "../src/store.js";
+import { buildTree } from "../src/tree.js";
+import { makeDataDir, removeRepo } from "./helpers.js";
+
+describe("deriveActivity (Claude Code)", () => {
+  it.each([
+    ["user-prompt-submit", {}, "active"],
+    ["pre-tool-use", {}, "active"],
+    ["post-tool-use", {}, "active"],
+    ["post-tool-use-failure", {}, "active"],
+    ["permission-request", {}, "blocked"],
+    ["stop", {}, "idle"],
+    ["notification", { notification_type: "idle_prompt" }, "idle"],
+    ["notification", { notification_type: "agent_completed" }, "idle"],
+    ["notification", { notification_type: "agent_needs_input" }, "waiting_input"],
+    ["notification", { notification_type: "permission_prompt" }, "blocked"],
+    ["notification", { notification_type: "other" }, null],
+    ["session-end", { reason: "logout" }, "exited"],
+    ["session-end", {}, "exited"],
+    ["session-end", { reason: "clear" }, null],
+    ["session-end", { reason: "resume" }, null],
+    ["session-start", {}, null],
+    ["subagent-stop", {}, null],
+  ])("%s %j -> %s", (event, payload, state) => {
+    expect(deriveActivity("claude-code", event, payload)).toBe(state);
+  });
+
+  it("knows no states for an unknown agent", () => {
+    expect(deriveActivity("other", "stop", {})).toBeNull();
+  });
+});
+
+let data: string;
+let runFile: string;
+let daemon: Daemon | undefined;
+let out: string[];
+let err: string[];
+
+beforeEach(async () => {
+  data = await makeDataDir();
+  runFile = join(data, "running.json");
+  out = [];
+  err = [];
+  const store = openStore(data);
+  store.saveRun({
+    id: "r1", project: "proj", repo: join(data, "repo"), base: "main", task: "t", createdAt: new Date().toISOString(),
+    nodes: buildTree({
+      runId: "r1", project: "proj", dataDir: data, defaultAgent: "claude",
+      plan: { title: "root", prompt: "root", children: [{ title: "leaf", prompt: "leaf" }] },
+    }),
+  });
+  store.close();
+});
+
+afterEach(async () => {
+  await daemon?.stop();
+  daemon = undefined;
+  await removeRepo(data);
+});
+
+function io(env: Record<string, string>, stdin = ""): CliIo {
+  return {
+    env: { RIVET_DATA_DIR: data, RIVET_RUN_FILE: runFile, ...env },
+    readStdin: async () => stdin,
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+  };
+}
+
+function query(sql: string): Record<string, unknown>[] {
+  const db = new DatabaseSync(join(data, "rivet.db"));
+  try { return db.prepare(sql).all() as Record<string, unknown>[]; }
+  finally { db.close(); }
+}
+
+async function up(): Promise<void> {
+  daemon = await startDaemon({ data, runFile, port: 0 });
+}
+
+describe("rivet hooks", () => {
+  it("posts the derived state and the agent's own session id", async () => {
+    await up();
+    const code = await runCli(["hooks", "claude-code", "permission-request"],
+      io({ RIVET_SESSION_ID: "r1-root.1" }, JSON.stringify({ session_id: "conv-9" })));
+    expect(code).toBe(0);
+    expect(query("SELECT activity, agent_session_id FROM nodes WHERE id = 'root.1'")).toEqual([
+      { activity: "blocked", agent_session_id: "conv-9" },
+    ]);
+  });
+
+  it("does nothing outside a Rivet session", async () => {
+    let read = false;
+    const code = await runCli(["hooks", "claude-code", "stop"], {
+      ...io({}), env: { RIVET_DATA_DIR: data, RIVET_RUN_FILE: runFile }, readStdin: async () => { read = true; return ""; },
+    });
+    expect(code).toBe(0);
+    expect(read).toBe(false);
+  });
+
+  it("exits 0 and logs when the daemon is down", async () => {
+    const code = await runCli(["hooks", "claude-code", "stop"], io({ RIVET_SESSION_ID: "r1-root.1" }, "{}"));
+    expect(code).toBe(0);
+    const log = await readFile(join(data, "hooks.log"), "utf8");
+    expect(log).toMatch(/claude-code stop r1-root\.1 .*not running/);
+  });
+
+  it("tolerates a payload that is not JSON", async () => {
+    await up();
+    expect(await runCli(["hooks", "claude-code", "stop"], io({ RIVET_SESSION_ID: "r1-root.1" }, "garbage"))).toBe(0);
+    expect(query("SELECT activity FROM nodes WHERE id = 'root.1'")).toEqual([{ activity: "idle" }]);
+  });
+
+  it("keeps the hook log under 1 MiB", async () => {
+    await writeFile(join(data, "hooks.log"), "x".repeat(1024 * 1024 + 10));
+    await runCli(["hooks", "claude-code", "stop"], io({ RIVET_SESSION_ID: "r1-root.1" }, "{}"));
+    const log = await readFile(join(data, "hooks.log"), "utf8");
+    expect(log.length).toBeLessThan(1024);
+  });
+
+  it("is a usage error without agent and event", async () => {
+    expect(await runCli(["hooks", "claude-code"], io({ RIVET_SESSION_ID: "r1-root.1" }))).toBe(2);
+  });
+});
+
+describe("rivet report", () => {
+  it("records a structured report for the current session", async () => {
+    await up();
+    expect(await runCli(["report", "--done", "--note", "login works"], io({ RIVET_SESSION_ID: "r1-root.1" }))).toBe(0);
+    expect(query("SELECT node_id, kind, message FROM reports")).toEqual([
+      { node_id: "root.1", kind: "done", message: "login works" },
+    ]);
+  });
+
+  it.each([
+    [["report", "--note", "x"]],
+    [["report", "--done"]],
+    [["report", "--done", "--stuck", "--note", "x"]],
+    [["report", "--done", "--note", "y".repeat(1001)]],
+    [["report", "free text"]],
+  ])("rejects %j as a usage error", async (argv) => {
+    expect(await runCli(argv, io({ RIVET_SESSION_ID: "r1-root.1" }))).toBe(2);
+  });
+
+  it("needs RIVET_SESSION_ID", async () => {
+    expect(await runCli(["report", "--stuck", "--note", "x"], io({}))).toBe(2);
+    expect(err.join("\n")).toMatch(/RIVET_SESSION_ID/);
+  });
+
+  it("fails clearly when the daemon is down", async () => {
+    expect(await runCli(["report", "--stuck", "--note", "x"], io({ RIVET_SESSION_ID: "r1-root.1" }))).toBe(1);
+    expect(err.join("\n")).toMatch(/daemon is not running/);
+  });
+});
+
+describe("rivet send", () => {
+  it("queues a message from the current session", async () => {
+    await up();
+    expect(await runCli(["send", "--session", "r1-root.1", "--message", "rebase please"], io({ RIVET_SESSION_ID: "r1-root" }))).toBe(0);
+    expect(query("SELECT node_id, from_session, message FROM outbox")).toEqual([
+      { node_id: "root.1", from_session: "r1-root", message: "rebase please" },
+    ]);
+  });
+
+  it("requires --session and --message", async () => {
+    expect(await runCli(["send", "--message", "x"], io({}))).toBe(2);
+    expect(await runCli(["send", "--session", "r1-root.1"], io({}))).toBe(2);
+  });
+
+  it("reports a daemon error", async () => {
+    await up();
+    expect(await runCli(["send", "--session", "r1-nope", "--message", "x"], io({}))).toBe(1);
+    expect(err.join("\n")).toMatch(/unknown session/);
+  });
+});
+
+describe("rivet (top level)", () => {
+  it("prints usage for no or unknown commands", async () => {
+    expect(await runCli([], io({}))).toBe(2);
+    expect(await runCli(["fly"], io({}))).toBe(2);
+    expect(err.join("\n")).toMatch(/usage: rivet/);
+  });
+
+  it("daemon status reports a running daemon and its absence", async () => {
+    expect(await runCli(["daemon", "status"], io({}))).toBe(1);
+    await up();
+    expect(await runCli(["daemon", "status"], io({}))).toBe(0);
+    expect(out.join("\n")).toMatch(/running \(pid \d+, port \d+\)/);
+    expect(existsSync(runFile)).toBe(true);
+  });
+});

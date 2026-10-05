@@ -14,7 +14,8 @@ const BODY_LIMIT = 1024 * 1024;
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
-export type Daemon = { port: number; stop(): Promise<void> };
+// stopped resolves once the daemon has fully shut down (by stop(), a signal or /shutdown).
+export type Daemon = { port: number; stop(): Promise<void>; stopped: Promise<void> };
 export type DaemonOptions = {
   data?: string;
   runFile?: string;
@@ -207,6 +208,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   }
 
   let stopping: Promise<void> | undefined;
+  let markStopped!: () => void;
+  const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
   const onSignal = () => { void stop(); };
   function stop(): Promise<void> {
     if (stopping) return stopping;
@@ -219,6 +222,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       await waitForTrash();
       store.close();
       await releaseRunFile(runFile, process.pid);
+      markStopped();
     })();
     return stopping;
   }
@@ -273,11 +277,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
       const payload = await body(req);
-      if (!ACTIVITY_STATES.includes(payload.state as ActivityState)) {
+      if (payload.state !== undefined && !ACTIVITY_STATES.includes(payload.state as ActivityState)) {
         throw new HttpError(400, "invalid activity state");
       }
+      const state = (payload.state as ActivityState | undefined) ?? null;
       const agentSessionId = optionalString(payload.agentSessionId, "agentSessionId");
-      const found = await write(() => store.setActivity(runId, nodeId, payload.state as ActivityState, agentSessionId));
+      if (state === null && agentSessionId === undefined) throw new HttpError(400, "state or agentSessionId is required");
+      // Hooks of an agent from an earlier launch may still fire; only the current launch counts.
+      const launchId = optionalString(payload.launchId, "launchId");
+      if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
+        reply(res, 204);
+        return;
+      }
+      const found = await write(() => store.setActivity(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
       reply(res, 204);
       return;
@@ -320,7 +332,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     process.on("SIGINT", onSignal);
     process.on("SIGTERM", onSignal);
-    return { port: address.port, stop };
+    return { port: address.port, stop, stopped };
   } catch (error) {
     await runtime.stopAll();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));

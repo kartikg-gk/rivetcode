@@ -210,3 +210,21 @@ describe("concurrent requests", () => {
     expect(lines.sort()).toEqual(["a", "b", "queued"]);
   });
 });
+
+describe("hook activity from agents", () => {
+  it("saves an agent session id without a state, and ignores events from an older launch", async () => {
+    await start();
+    const first = await (await startLeaf({ stayFor: 60_000 })).json() as { launchId: string };
+    expect((await post("/api/v1/sessions/r1-root.1/activity", { agentSessionId: "conv-1", launchId: first.launchId })).status).toBe(204);
+    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "idle", launchId: "0000000000000000" })).status).toBe(204);
+    expect(activity()).toBe("active");
+    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "idle", launchId: first.launchId })).status).toBe(204);
+    expect(activity()).toBe("idle");
+    expect((await post("/api/v1/sessions/r1-root.1/activity", {})).status).toBe(400);
+    await daemon!.stop();
+    daemon = undefined;
+    const store = openStore(data);
+    try { expect(store.loadRun("r1").nodes[1]!.agentSessionId).toBe("conv-1"); }
+    finally { store.close(); }
+  });
+});
