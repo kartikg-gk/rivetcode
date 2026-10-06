@@ -10,6 +10,7 @@ async function readStdin(): Promise<string> {
 
 process.exitCode = await runCli(process.argv.slice(2), {
   env: process.env,
+  cwd: process.cwd(),
   readStdin,
   out: (line) => process.stdout.write(line + "\n"),
   err: (line) => process.stderr.write(line + "\n"),

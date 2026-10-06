@@ -172,3 +172,15 @@ describe("stop", () => {
     expect(runtime.liveSessions()).toEqual([]);
   });
 });
+
+describe("stop reaches child processes", () => {
+  it("ends processes the agent started", async () => {
+    const pidFile = join(ws, "grandchild.pid");
+    const script = `const { spawn } = require('child_process'); const c = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); setInterval(() => {}, 1000)`;
+    await runtime.start({ sessionId: "r1-a", workspace: ws, argv: [process.execPath, "-e", script], env: {} });
+    await until(() => existsSync(pidFile));
+    const grandchild = Number(await readFile(pidFile, "utf8"));
+    await runtime.stop("r1-a");
+    await until(() => { try { process.kill(grandchild, 0); return false; } catch { return true; } });
+  });
+});

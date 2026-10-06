@@ -5,7 +5,8 @@
 //   "dumpEnv"?: true,                      write the RIVET_* environment to env.json
 //   "listen"?: true,                       append stdin lines to inbox.txt until "/exit"
 //   "stayFor"?: <ms>,                      otherwise keep running this long
-//   "exitCode"?: number
+//   "exitCode"?: number,
+//   "failUntilAttempt"?: n                 exit 1 at once while RIVET_ATTEMPT < n
 // }
 // Prints one line per action so tests can read its output.
 import { execFileSync } from "node:child_process";
@@ -17,6 +18,11 @@ const at = process.argv.indexOf("--");
 const spec = JSON.parse(at >= 0 ? process.argv[at + 1] ?? "{}" : "{}");
 const exit = () => process.exit(spec.exitCode ?? 0);
 
+if (spec.failUntilAttempt && Number(process.env.RIVET_ATTEMPT ?? 0) < spec.failUntilAttempt) {
+  console.log(`failing on purpose (attempt ${process.env.RIVET_ATTEMPT})`);
+  process.exit(1);
+}
+
 for (const [path, content] of Object.entries(spec.files ?? {})) {
   const full = join(process.cwd(), path);
   mkdirSync(dirname(full), { recursive: true });
@@ -26,8 +32,12 @@ for (const [path, content] of Object.entries(spec.files ?? {})) {
 
 if (spec.commit) {
   execFileSync("git", ["add", "-A"], { stdio: "ignore" });
-  execFileSync("git", ["commit", "-q", "-m", spec.commit], { stdio: "ignore" });
-  console.log("committed");
+  // A retry may have nothing new to commit; that is not an error.
+  const staged = execFileSync("git", ["diff", "--cached", "--name-only"], { encoding: "utf8" }).trim();
+  if (staged) {
+    execFileSync("git", ["commit", "-q", "-m", spec.commit], { stdio: "ignore" });
+    console.log("committed");
+  }
 }
 
 if (spec.dumpEnv) {

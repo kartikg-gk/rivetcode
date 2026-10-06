@@ -1,21 +1,24 @@
-import { existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { dataDir, assertId } from "../paths.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
-import { agentEnv, sessionIdOf } from "../runtime/env.js";
-import { createRuntime, newLaunchId } from "../runtime/runtime.js";
+import { sessionIdOf } from "../runtime/env.js";
+import { createRuntime } from "../runtime/runtime.js";
+import { cleanRun, prepareRun, RunInputError } from "../scheduler/runs.js";
+import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError } from "../store.js";
 import { ACTIVITY_STATES, type ActivityState, type Node } from "../tree.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
+// Per-project settings: the check after every merge, the full test at the root, the default agent.
+const CONFIG_KEYS = ["check", "test", "worker.agent"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
 // stopped resolves once the daemon has fully shut down (by stop(), a signal or /shutdown).
-export type Daemon = { port: number; stop(): Promise<void>; stopped: Promise<void> };
+export type Daemon = { port: number; stop(): Promise<void>; stopped: Promise<void>; idle(): Promise<void> };
 export type DaemonOptions = {
   data?: string;
   runFile?: string;
@@ -23,6 +26,9 @@ export type DaemonOptions = {
   // Which adapter runs a node's agent; tests swap in the fake agent.
   agents?: (name: Node["agent"]) => Agent;
   stopGraceMs?: number;
+  checkTimeoutMs?: number;
+  // Problems the scheduler handled by escalating or could not handle; for logs and tests.
+  onError?(error: unknown): void;
 };
 
 class HttpError extends Error {
@@ -121,11 +127,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   } catch (error) { store.close(); throw error; }
 
   const agents = opts.agents ?? ((name: Node["agent"]) => {
-    if (name !== "claude") throw new HttpError(409, `agent "${name}" is not supported yet`);
+    if (name === "codex") throw new HttpError(409, `agent "${name}" is not supported yet`);
     return getAgent(name);
   });
   const runtime = createRuntime({ logDir: join(data, "logs"), ...(opts.stopGraceMs ? { stopGraceMs: opts.stopGraceMs } : {}) });
-  // The launch each session is on now; exits of older launches are ignored.
+  // The launch each session is on now; hooks and exits of older launches are ignored.
   const launches = new Map<string, string>();
 
   let queue = Promise.resolve();
@@ -135,47 +141,25 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return result;
   }
 
+  const scheduler = createScheduler({
+    data, runFile, store, write, runtime, agents, launches,
+    ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
+    onError: (error) => { opts.onError?.(error); },
+  });
+
   const server = createServer((req, res) => {
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) return;
-      const status = error instanceof HttpError ? error.status : 500;
+      const status = error instanceof HttpError || error instanceof SchedulerError ? error.status : 500;
       const message = error instanceof Error ? error.message : "internal error";
       reply(res, status, { error: message });
     });
   });
 
-  runtime.onExit((sessionId, launchId) => {
-    if (launches.get(sessionId) !== launchId) return;
-    const { runId, nodeId } = session(sessionId);
-    void write(() => store.setActivity(runId, nodeId, "exited"));
-  });
-
-  // Types every queued message into a running session, oldest first. One delivery
-  // pass per session at a time, so two sends never type the same message twice.
-  const delivering = new Map<string, Promise<void>>();
-  function deliver(runId: string, nodeId: string): Promise<void> {
-    const sessionId = sessionIdOf(runId, nodeId);
-    const next = (delivering.get(sessionId) ?? Promise.resolve()).then(() => deliverNow(runId, nodeId));
-    const tail = next.catch(() => {});
-    delivering.set(sessionId, tail);
-    void tail.then(() => { if (delivering.get(sessionId) === tail) delivering.delete(sessionId); });
-    return next;
-  }
-
-  async function deliverNow(runId: string, nodeId: string): Promise<void> {
-    const sessionId = sessionIdOf(runId, nodeId);
-    const pending = await write(() => store.undeliveredMessages(runId, nodeId));
-    for (const m of pending) {
-      if (!runtime.isAlive(sessionId)) return;
-      try { await runtime.write(sessionId, m.message); }
-      catch { return; }
-      await write(() => store.markDelivered(m.id));
-    }
-  }
-
+  // Starts a leaf's agent by hand with the given prompt; the tree status is not touched.
   async function startSession(runId: string, nodeId: string, prompt?: string): Promise<string> {
     let run;
-    try { run = store.loadRun(runId); }
+    try { run = await write(() => store.loadRun(runId)); }
     catch (error) {
       if (error instanceof RunStoreError) throw new HttpError(404, "unknown session");
       throw error;
@@ -183,28 +167,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const node = run.nodes.find((n) => n.id === nodeId);
     if (!node) throw new HttpError(404, "unknown session");
     if (node.kind !== "leaf") throw new HttpError(409, "only leaves run agents");
-    const sessionId = sessionIdOf(runId, nodeId);
-    if (runtime.isAlive(sessionId)) throw new HttpError(409, "session is already running");
-    if (!existsSync(node.worktree)) throw new HttpError(409, `worktree is missing: ${node.worktree}`);
-
-    const agent = agents(node.agent);
-    const launchId = newLaunchId();
-    const argv = await agent.launchCommand({ sessionId, workspace: node.worktree, ...(prompt !== undefined ? { prompt } : {}) });
-    await agent.installHooks(node.worktree);
-    try {
-      await runtime.start({
-        sessionId, workspace: node.worktree, argv, launchId,
-        env: agentEnv({ runId, nodeId, project: run.project, dataDir: data, runFile, launchId }),
-      });
-    } catch (error) {
-      if (runtime.isAlive(sessionId)) throw new HttpError(409, "session is already running");
-      throw error;
-    }
-    // Set only once this launch really runs, so a refused duplicate start cannot hide its exit.
-    launches.set(sessionId, launchId);
-    await write(() => store.setActivity(runId, nodeId, "active"));
-    await deliver(runId, nodeId);
-    return launchId;
+    return scheduler.launch(run, node, prompt);
   }
 
   let stopping: Promise<void> | undefined;
@@ -216,7 +179,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     stopping = (async () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
-      await runtime.stopAll();
+      await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
       await waitForTrash();
@@ -263,7 +226,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       if (action === "stop") {
         if (!runtime.isAlive(sessionId)) throw new HttpError(404, "session is not running");
-        await runtime.stop(sessionId);
+        await scheduler.stopSession(sessionId);
         reply(res, 204);
         return;
       }
@@ -302,6 +265,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const message = optionalString(payload.message, "message");
       const id = await write(() => store.createReport(runId, nodeId, payload.kind as ReportKind, message));
       if (id === null) throw new HttpError(404, "unknown session");
+      void scheduler.onReport(runId, nodeId, payload.kind as string).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
       return;
     }
@@ -314,8 +278,84 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const from = optionalString(payload.from, "from");
       const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from));
       if (id === null) throw new HttpError(404, "unknown session");
-      if (runtime.isAlive(sessionIdOf(runId, nodeId))) await deliver(runId, nodeId);
+      if (runtime.isAlive(sessionIdOf(runId, nodeId))) await scheduler.deliver(runId, nodeId);
       reply(res, 202, { id });
+      return;
+    }
+    if (path === "/api/v1/runs") {
+      if (req.method === "GET") {
+        const runs = await write(() => store.listRuns().map((id) => {
+          const r = store.loadRun(id);
+          return { id: r.id, project: r.project, task: r.task, createdAt: r.createdAt, status: r.nodes[0]!.status };
+        }));
+        reply(res, 200, { runs });
+        return;
+      }
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      if (typeof payload.repo !== "string" || typeof payload.task !== "string") {
+        throw new HttpError(400, "repo and task must be strings");
+      }
+      if (!payload.plan || typeof payload.plan !== "object") throw new HttpError(400, "plan must be an object");
+      const base = optionalString(payload.base, "base");
+      const agent = optionalString(payload.agent, "agent");
+      let run;
+      try {
+        run = await prepareRun({
+          data, repo: payload.repo, task: payload.task, plan: payload.plan as never,
+          ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
+          defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
+        });
+      } catch (error) {
+        if (error instanceof RunInputError) throw new HttpError(400, error.message);
+        throw error;
+      }
+      await write(() => store.saveRun(run));
+      void scheduler.startRun(run.id).catch((e) => opts.onError?.(e));
+      reply(res, 201, { runId: run.id });
+      return;
+    }
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean))?$/.exec(path);
+    if (runRoute) {
+      const [, runId, action] = runRoute;
+      let run;
+      try {
+        assertId("run", runId!);
+        run = await write(() => store.loadRun(runId!));
+      } catch { throw new HttpError(404, "unknown run"); }
+      if (action === undefined) {
+        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+        const live = Object.fromEntries(run.nodes.map((n) => [n.id, runtime.isAlive(sessionIdOf(run.id, n.id))]));
+        reply(res, 200, { run, live, now: new Date().toISOString() });
+        return;
+      }
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      if (action === "resume") {
+        await scheduler.resume(run.id);
+        reply(res, 202, { runId: run.id });
+        return;
+      }
+      for (const n of run.nodes) await scheduler.stopSession(sessionIdOf(run.id, n.id));
+      reply(res, 200, await cleanRun(data, run));
+      return;
+    }
+    const config = /^\/api\/v1\/projects\/([^/]+)\/config$/.exec(path);
+    if (config) {
+      const project = decodeURIComponent(config[1]!);
+      if (req.method === "GET") {
+        reply(res, 200, await write(() => store.getConfig(project)));
+        return;
+      }
+      if (req.method !== "PUT") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      if (!CONFIG_KEYS.includes(payload.key as string)) {
+        throw new HttpError(400, `key must be one of ${CONFIG_KEYS.join(", ")}`);
+      }
+      if (payload.value !== null && typeof payload.value !== "string") throw new HttpError(400, "value must be a string or null");
+      try {
+        await write(() => store.setConfig(project, payload.key as string, payload.value as string | null));
+      } catch (error) { throw new HttpError(400, (error as Error).message); }
+      reply(res, 204);
       return;
     }
     throw new HttpError(404, "unknown route");
@@ -330,9 +370,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
+    // Pick up runs that were in flight when the previous daemon stopped.
+    for (const id of await write(() => store.listRuns())) {
+      void scheduler.recover(id).catch((e) => opts.onError?.(e));
+    }
     process.on("SIGINT", onSignal);
     process.on("SIGTERM", onSignal);
-    return { port: address.port, stop, stopped };
+    return { port: address.port, stop, stopped, idle: () => scheduler.idle() };
   } catch (error) {
     await runtime.stopAll();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
