@@ -117,11 +117,11 @@ describe("daemon ownership and lifecycle", () => {
   it("upgrades a version 1 database on startup", async () => {
     seed();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DROP TABLE reports; DROP TABLE outbox; ALTER TABLE nodes DROP COLUMN agent_session_id; DELETE FROM schema_migrations WHERE version = 2");
+    db.exec("DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     await start();
     expect(rows("SELECT version FROM schema_migrations ORDER BY version")).toEqual([
-      { version: 1 }, { version: 2 },
+      { version: 1 }, { version: 2 }, { version: 3 },
     ]);
     expect(rows("SELECT id FROM nodes WHERE run_id = 'r1'")).toHaveLength(2);
   });

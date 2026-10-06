@@ -27,7 +27,23 @@ export type Store = {
   markDelivered(id: number): void;
   // After a daemon restart no agent is running; returns how many nodes were changed.
   exitStaleSessions(): number;
+  // Changes some fields of one node in place; null clears an optional field.
+  updateNode(runId: string, nodeId: string, fields: NodeUpdate): void;
+  // Per-project settings such as the check and test commands.
+  getConfig(project: string): Record<string, string>;
+  setConfig(project: string, key: string, value: string | null): void;
   close(): void;
+};
+
+export type NodeUpdate = {
+  status?: Node["status"];
+  attempts?: number;
+  summary?: string | null;
+  finishedAt?: string | null;
+};
+
+const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
+  status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at",
 };
 
 export class RunStoreError extends Error {
@@ -102,6 +118,47 @@ CREATE TABLE outbox (
 );
 ` });
 
+// SQLite cannot change a CHECK constraint in place, so the nodes table is rebuilt:
+// adds the "waiting" status and the "fake" agent, plus when a node last showed
+// activity and when a leaf finished (a finished leaf waits for its parent to merge it).
+MIGRATIONS.push({ version: 3, sql: `
+CREATE TABLE nodes_v3 (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  parent_id TEXT,
+  depth INTEGER NOT NULL CHECK (depth >= 0),
+  kind TEXT NOT NULL CHECK (kind IN (${oneOf(KINDS)})),
+  title TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  files TEXT NOT NULL,
+  agent TEXT NOT NULL CHECK (agent IN (${oneOf(AGENTS)})),
+  branch TEXT NOT NULL,
+  worktree TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (${oneOf(STATUSES)})),
+  attempts INTEGER NOT NULL CHECK (attempts >= 0),
+  summary TEXT,
+  activity TEXT CHECK (activity IS NULL OR activity IN (${oneOf(ACTIVITY_STATES)})),
+  pr_status TEXT CHECK (pr_status IS NULL OR pr_status IN (${oneOf(PR_STATUSES)})),
+  agent_session_id TEXT,
+  activity_at TEXT,
+  finished_at TEXT,
+  PRIMARY KEY (run_id, id)
+);
+INSERT INTO nodes_v3 (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch,
+  worktree, status, attempts, summary, activity, pr_status, agent_session_id)
+SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch,
+  worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes;
+DROP TABLE nodes;
+ALTER TABLE nodes_v3 RENAME TO nodes;
+CREATE TABLE project_config (
+  project TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (project, key)
+);
+` });
+
 function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
@@ -129,6 +186,7 @@ type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
   summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
+  activity_at: string | null; finished_at: string | null;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -148,12 +206,18 @@ export function openStore(data: string): Store {
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
-      branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
-  const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity), agent_session_id = COALESCE(?, agent_session_id)
+  const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
+    activity_at = CASE WHEN ? IS NULL THEN activity_at ELSE ? END,
+    agent_session_id = COALESCE(?, agent_session_id)
     WHERE run_id = ? AND id = ?`);
+  const selectConfig = db.prepare("SELECT key, value FROM project_config WHERE project = ? ORDER BY key");
+  const upsertConfig = db.prepare(`INSERT INTO project_config (project, key, value) VALUES (?, ?, ?)
+    ON CONFLICT (project, key) DO UPDATE SET value = excluded.value`);
+  const deleteConfig = db.prepare("DELETE FROM project_config WHERE project = ? AND key = ?");
   const sessionExists = db.prepare("SELECT 1 FROM nodes WHERE run_id = ? AND id = ?");
   const insertReport = db.prepare(`INSERT INTO reports (run_id, node_id, kind, message, created_at)
     VALUES (?, ?, ?, ?, ?)`);
@@ -199,6 +263,7 @@ export function openStore(data: string): Store {
             run.id, n.id, position, n.parentId, n.depth, n.kind, n.title, n.prompt,
             JSON.stringify(n.files), n.agent, n.branch, n.worktree, n.status, n.attempts,
             n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
+            n.activityAt ?? null, n.finishedAt ?? null,
           );
         });
         db.exec("COMMIT");
@@ -228,6 +293,8 @@ export function openStore(data: string): Store {
         ...(n.activity !== null ? { activity: n.activity as Node["activity"] } : {}),
         ...(n.agent_session_id !== null ? { agentSessionId: n.agent_session_id } : {}),
         ...(n.pr_status !== null ? { prStatus: n.pr_status as Node["prStatus"] } : {}),
+        ...(n.activity_at !== null ? { activityAt: n.activity_at } : {}),
+        ...(n.finished_at !== null ? { finishedAt: n.finished_at } : {}),
       }));
       return {
         id: r.id, project: r.project, repo: r.repo, base: r.base, task: r.task,
@@ -243,7 +310,8 @@ export function openStore(data: string): Store {
     },
 
     setActivity(runId, nodeId, state, agentSessionId) {
-      return updateActivity.run(state, agentSessionId ?? null, runId, nodeId).changes > 0;
+      const now = state === null ? null : new Date().toISOString();
+      return updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
     },
 
     createReport(runId, nodeId, kind, message) {
@@ -267,6 +335,24 @@ export function openStore(data: string): Store {
 
     exitStaleSessions() {
       return Number(updateStale.run().changes);
+    },
+
+    updateNode(runId, nodeId, fields) {
+      const keys = (Object.keys(fields) as (keyof NodeUpdate)[]).filter((k) => fields[k] !== undefined);
+      if (keys.length === 0) return;
+      const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
+      const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
+      if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+    },
+
+    getConfig(project) {
+      return Object.fromEntries((selectConfig.all(project) as { key: string; value: string }[]).map((r) => [r.key, r.value]));
+    },
+
+    setConfig(project, key, value) {
+      assertProjectId(project);
+      if (value === null) deleteConfig.run(project, key);
+      else upsertConfig.run(project, key, value);
     },
 
     close() {

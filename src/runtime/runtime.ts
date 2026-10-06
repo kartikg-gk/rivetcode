@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, statSync, type WriteStream } from "node:fs";
 import { join } from "node:path";
+import { signalTree } from "../proc.js";
 
 export class RuntimeError extends Error {
   constructor(message: string) {
@@ -109,6 +110,8 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
       env: mergeEnv(process.env, opts.env),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      // Own process group on POSIX, so stop() reaches the tools the agent started too.
+      detached: process.platform !== "win32",
     });
     try {
       await new Promise<void>((resolve, reject) => {
@@ -149,8 +152,9 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
     const p = procs.get(sessionId);
     if (!p) return;
     if (p.alive) {
-      p.child.kill();
-      const timer = setTimeout(() => { if (p.alive) p.child.kill("SIGKILL"); }, grace);
+      const pid = p.child.pid!;
+      signalTree(pid, "SIGTERM");
+      const timer = setTimeout(() => { if (p.alive) signalTree(pid, "SIGKILL"); }, grace);
       await p.closed;
       clearTimeout(timer);
     }

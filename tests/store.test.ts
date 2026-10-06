@@ -141,25 +141,25 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1, 2]);
+    expect(versions()).toEqual([1, 2, 3]);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2]);
+    expect(versions()).toEqual([1, 2, 3]);
   });
 
-  it("applies migration 2 once to a version 1 database", () => {
+  it("applies migrations 2 and 3 once to a version 1 database", () => {
     store.saveRun(sampleRun());
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DROP TABLE reports; DROP TABLE outbox; ALTER TABLE nodes DROP COLUMN agent_session_id; DELETE FROM schema_migrations WHERE version = 2");
+    db.exec("DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     expect(versions()).toEqual([1]);
     store = openStore(data);
-    expect(versions()).toEqual([1, 2]);
+    expect(versions()).toEqual([1, 2, 3]);
     expect(store.loadRun("r1").nodes).toHaveLength(2);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2]);
+    expect(versions()).toEqual([1, 2, 3]);
   });
 });
 
@@ -183,5 +183,64 @@ describe("outbox and stale sessions", () => {
     expect(store.exitStaleSessions()).toBe(2);
     expect(store.loadRun("r1").nodes.map((n) => n.activity)).toEqual(["exited", "exited"]);
     expect(store.exitStaleSessions()).toBe(0);
+  });
+});
+
+describe("migration 3 and project config", () => {
+  it("keeps every node and its fields through the table rebuild", () => {
+    const run = sampleRun();
+    run.nodes[1] = { ...run.nodes[1]!, status: "running", attempts: 1, summary: "s", agentSessionId: "c1" };
+    store.saveRun(run);
+    store.close();
+    const db = new DatabaseSync(join(data, "rivet.db"));
+    db.exec("DELETE FROM schema_migrations WHERE version = 3; DROP TABLE project_config;");
+    db.exec("CREATE TABLE n2 AS SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes; DROP TABLE nodes; ALTER TABLE n2 RENAME TO nodes;");
+    db.close();
+    store = openStore(data);
+    expect(store.loadRun("r1")).toEqual(run);
+  });
+
+  it("stores waiting parents, fake agents, activity and finish times", () => {
+    const run = sampleRun();
+    run.nodes[0] = { ...run.nodes[0]!, status: "waiting" };
+    run.nodes[1] = { ...run.nodes[1]!, agent: "fake", finishedAt: "2026-10-04T10:00:00.000Z" };
+    store.saveRun(run);
+    store.setActivity("r1", "root.1", "idle");
+    const loaded = store.loadRun("r1");
+    expect(loaded.nodes[0]!.status).toBe("waiting");
+    expect(loaded.nodes[1]).toMatchObject({ agent: "fake", finishedAt: "2026-10-04T10:00:00.000Z", activity: "idle" });
+    expect(Date.parse(loaded.nodes[1]!.activityAt!)).toBeGreaterThan(Date.now() - 5000);
+  });
+
+  it("sets, reads and clears project settings", () => {
+    store.setConfig("proj", "check", "npm run typecheck");
+    store.setConfig("proj", "test", "npm test");
+    store.setConfig("other", "check", "make");
+    expect(store.getConfig("proj")).toEqual({ check: "npm run typecheck", test: "npm test" });
+    store.setConfig("proj", "test", null);
+    expect(store.getConfig("proj")).toEqual({ check: "npm run typecheck" });
+  });
+});
+
+describe("updateNode", () => {
+  it("changes only the given fields and leaves activity alone", () => {
+    store.saveRun(sampleRun());
+    store.setActivity("r1", "root.1", "blocked", "conv");
+    store.updateNode("r1", "root.1", { status: "running", attempts: 1, finishedAt: "2026-10-04T00:00:00.000Z" });
+    store.updateNode("r1", "root.1", { summary: "half way" });
+    expect(store.loadRun("r1").nodes[1]).toMatchObject({
+      status: "running", attempts: 1, summary: "half way", activity: "blocked", agentSessionId: "conv",
+      finishedAt: "2026-10-04T00:00:00.000Z",
+    });
+    store.updateNode("r1", "root.1", { finishedAt: null, summary: null });
+    const n = store.loadRun("r1").nodes[1]!;
+    expect(n.finishedAt).toBeUndefined();
+    expect(n.summary).toBeUndefined();
+  });
+
+  it("rejects unknown nodes and invalid statuses", () => {
+    store.saveRun(sampleRun());
+    expect(() => store.updateNode("r1", "root.9", { status: "done" })).toThrow(/no node root\.9/);
+    expect(() => store.updateNode("r1", "root.1", { status: "bogus" as never })).toThrow();
   });
 });

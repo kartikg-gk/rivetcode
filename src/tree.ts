@@ -1,10 +1,12 @@
 import { posix } from "node:path";
 import { branchName, worktreePath } from "./paths.js";
 
-export const AGENTS = ["claude", "codex"] as const;
+// "fake" runs a scripted stand-in instead of a model, for end-to-end tests.
+export const AGENTS = ["claude", "codex", "fake"] as const;
 export const KINDS = ["leaf", "parent"] as const;
 export const STATUSES = [
-  "pending", "running", "integrating", "done", "failed", "escalated", "skipped",
+  // waiting: a parent between merges, with children still running.
+  "pending", "running", "waiting", "integrating", "done", "failed", "escalated", "skipped",
 ] as const;
 
 // What a leaf's agent session is doing right now.
@@ -47,6 +49,10 @@ export type Node = {
   activity?: ActivityState;
   agentSessionId?: string;
   prStatus?: PrStatus;
+  // When the agent last reported activity (ISO); the status view shows idle time from it.
+  activityAt?: string;
+  // When a leaf's work finished; it then waits for its parent to merge it.
+  finishedAt?: string;
 };
 
 // Every level adds a parent that waits on its children, so the tree stays shallow.
@@ -157,10 +163,11 @@ const TRANSITIONS: Record<Node["kind"], Partial<Record<Status, Status[]>>> = {
     escalated: ["running", "skipped"],
   },
   parent: {
-    pending: ["integrating"],
-    integrating: ["done", "failed", "escalated"],
-    failed: ["integrating", "escalated"],
-    escalated: ["integrating"],
+    pending: ["waiting", "integrating"],
+    waiting: ["integrating", "failed", "escalated"],
+    integrating: ["waiting", "done", "failed", "escalated"],
+    failed: ["integrating", "waiting", "escalated"],
+    escalated: ["integrating", "waiting"],
   },
 };
 

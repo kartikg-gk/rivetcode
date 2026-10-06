@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildTree, PR_STATUSES, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
+import { AGENTS, buildTree, PR_STATUSES, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
 
 const leaf = (title: string, files: string[] = []): PlanNode => ({ title, prompt: `do ${title}`, files });
 const data = join("C:", "data x");
@@ -127,6 +127,22 @@ describe("setStatus", () => {
     expect(() => setStatus(nodes, "root.2", "running")).toThrow(/skipped/);
   });
 
+  it("a parent waits between merges", () => {
+    let nodes = setStatus(fresh(), "root", "waiting");
+    nodes = setStatus(nodes, "root", "integrating");
+    nodes = setStatus(nodes, "root", "waiting");
+    nodes = setStatus(nodes, "root", "integrating");
+    nodes = setStatus(nodes, "root", "done");
+    expect(nodes[0]).toMatchObject({ status: "done", attempts: 2 });
+    expect(() => setStatus(fresh(), "root.1", "waiting")).toThrow(/leaf.*pending.*waiting/);
+  });
+
+  it("an escalated parent can wait again once the user has fixed things", () => {
+    let nodes = setStatus(setStatus(fresh(), "root", "integrating"), "root", "escalated");
+    nodes = setStatus(nodes, "root", "waiting");
+    expect(nodes[0]!.status).toBe("waiting");
+  });
+
   it("rejects an unknown node", () => {
     expect(() => setStatus(fresh(), "root.9", "running")).toThrow(/unknown node root\.9/);
   });
@@ -164,5 +180,11 @@ describe("state lists", () => {
       "approved", "changes_requested", "ci_failed", "draft", "exited", "idle", "mergeable",
       "merged", "needs_input", "no_signal", "pr_open", "review_pending", "terminated", "working",
     ]);
+  });
+});
+
+describe("agents", () => {
+  it("includes the fake agent for end-to-end runs", () => {
+    expect([...AGENTS]).toEqual(["claude", "codex", "fake"]);
   });
 });
