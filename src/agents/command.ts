@@ -19,6 +19,8 @@ export type ClaudeOptions = {
   systemPromptFile?: string;
   extraArgs?: string[];
   prompt?: string;
+  // Print mode: answer the prompt and exit, no terminal needed.
+  print?: boolean;
 };
 
 export type ClaudeStart = ClaudeOptions & { sessionId?: string; nativeSessionId?: string };
@@ -97,6 +99,7 @@ async function readableFile(file: string): Promise<void> {
 async function claudeCommand(o: ClaudeOptions, conversation: string[]): Promise<string[]> {
   if (!o.binary.trim()) throw new Error("claude-code: binary is required");
   const args = [o.binary, ...conversation];
+  if (o.print) args.push("-p");
   const flag = (name: string, value?: string) => {
     if (value?.trim()) args.push(name, value.trim());
   };

@@ -4,11 +4,17 @@ import type { Agent } from "../agents/agent.js";
 import {
   abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, mergeInProgress, resetTo, runCommand,
 } from "../merge.js";
+import { normalizePermission } from "../agents/command.js";
 import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { Run, Store } from "../store.js";
 import { setStatus, type Node, type Status } from "../tree.js";
 import { conflictPrompt, leafPrompt } from "./prompts.js";
+
+// Agents run without a terminal for now, so they need leave to edit files and to run
+// rivet and git on their own; a project can widen or narrow this.
+export const DEFAULT_PERMISSION = "accept-edits";
+export const DEFAULT_ALLOWED_TOOLS = "Bash(rivet:*),Bash(git:*)";
 
 // A leaf gets this many launches before Rivet stops retrying and asks the user.
 export const MAX_ATTEMPTS = 2;
@@ -80,7 +86,16 @@ export function createScheduler(d: SchedulerDeps) {
     if (!existsSync(node.worktree)) throw new SchedulerError(409, `worktree is missing: ${node.worktree}`);
     const agent = d.agents(node.agent);
     const launchId = newLaunchId();
-    const argv = await agent.launchCommand({ sessionId, workspace: node.worktree, ...(prompt !== undefined ? { prompt } : {}) });
+    const config = await d.write(() => d.store.getConfig(run.project));
+    const model = config["worker.model"]?.trim();
+    const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    const argv = await agent.launchCommand({
+      sessionId, workspace: node.worktree, headless: true,
+      permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
+      ...(model ? { model } : {}),
+      ...(allowedTools.length ? { allowedTools } : {}),
+      ...(prompt !== undefined ? { prompt } : {}),
+    });
     await agent.installHooks(node.worktree);
     // Recorded before the process exists, so even an instant exit is attributed to it.
     const previous = d.launches.get(sessionId);
@@ -88,6 +103,7 @@ export function createScheduler(d: SchedulerDeps) {
     try {
       await d.runtime.start({
         sessionId, workspace: node.worktree, argv, launchId,
+        stdin: agent.acceptsInput({ headless: true }) ? "pipe" : "ignore",
         env: {
           ...agentEnv({ runId: run.id, nodeId: node.id, project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
           RIVET_ATTEMPT: String(node.attempts),

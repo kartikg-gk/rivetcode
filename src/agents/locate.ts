@@ -1,0 +1,69 @@
+import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
+
+export type LocateEnv = {
+  platform: NodeJS.Platform;
+  env: Record<string, string | undefined>;
+  home: string;
+};
+
+const current = (): LocateEnv => ({ platform: process.platform, env: process.env, home: homedir() });
+
+function pathDirs(o: LocateEnv): string[] {
+  const key = Object.keys(o.env).find((k) => k.toUpperCase() === "PATH");
+  const raw = key ? o.env[key] ?? "" : "";
+  return raw.split(o.platform === "win32" ? ";" : ":").filter(Boolean);
+}
+
+// Where claude can be, most specific first: the PATH, then the native installer's
+// and npm's usual folders.
+export function claudeCandidates(o: LocateEnv = current()): string[] {
+  const win = o.platform === "win32";
+  const names = win ? ["claude.exe", "claude.cmd", "claude"] : ["claude"];
+  const fromPath = pathDirs(o).flatMap((d) => names.map((n) => join(d, n)));
+  if (win) {
+    const appData = o.env.APPDATA ?? join(o.home, "AppData", "Roaming");
+    return [
+      ...fromPath,
+      join(o.home, ".local", "bin", "claude.exe"),
+      join(appData, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+      join(appData, "npm", "claude.exe"),
+      join(appData, "npm", "claude.cmd"),
+    ];
+  }
+  return [
+    ...fromPath,
+    join(o.home, ".local", "bin", "claude"),
+    join(o.home, ".claude", "local", "claude"),
+    join(o.home, ".npm-global", "bin", "claude"),
+    "/usr/local/bin/claude",
+    "/opt/homebrew/bin/claude",
+  ];
+}
+
+const isFile = (p: string) => existsSync(p) && statSync(p).isFile();
+
+// Child processes cannot run an npm .cmd shim directly; use the executable it wraps.
+function unwrapShim(path: string): string {
+  if (basename(path).toLowerCase() !== "claude.cmd") return path;
+  const dir = dirname(path);
+  for (const real of [
+    join(dir, "claude.exe"),
+    join(dir, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+  ]) {
+    if (isFile(real)) return real;
+  }
+  return path;
+}
+
+export function findClaude(o: LocateEnv = current()): string {
+  const explicit = o.env.RIVET_CLAUDE_BIN?.trim();
+  if (explicit) {
+    if (!isFile(explicit)) throw new Error(`RIVET_CLAUDE_BIN points at nothing: ${explicit}`);
+    return explicit;
+  }
+  const found = claudeCandidates(o).find(isFile);
+  if (!found) throw new Error("claude was not found on PATH or in its usual install folders (set RIVET_CLAUDE_BIN)");
+  return unwrapShim(found);
+}

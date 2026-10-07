@@ -19,6 +19,8 @@ export type StartOptions = {
   env: Record<string, string>;
   // Given when the caller already told the agent its launch id; otherwise one is made.
   launchId?: string;
+  // "ignore" for agents that take no typed input (they see end-of-input at once).
+  stdin?: "pipe" | "ignore";
 };
 
 export type Launch = { sessionId: string; launchId: string };
@@ -108,7 +110,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
     const child = spawn(argv[0], argv.slice(1), {
       cwd: workspace,
       env: mergeEnv(process.env, opts.env),
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: [opts.stdin ?? "pipe", "pipe", "pipe"],
       windowsHide: true,
       // Own process group on POSIX, so stop() reaches the tools the agent started too.
       detached: process.platform !== "win32",
@@ -172,7 +174,8 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
     },
     async write(sessionId, text) {
       const p = procs.get(sessionId);
-      if (!p?.alive || !p.child.stdin) throw new RuntimeError(`session ${sessionId} is not running`);
+      if (!p?.alive) throw new RuntimeError(`session ${sessionId} is not running`);
+      if (!p.child.stdin) throw new RuntimeError(`session ${sessionId} does not take input`);
       await new Promise<void>((resolve, reject) => {
         p.child.stdin!.write(text + "\n", (e) => (e ? reject(new RuntimeError(`write to ${sessionId}: ${e.message}`)) : resolve()));
       });
