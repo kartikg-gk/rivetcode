@@ -184,3 +184,16 @@ describe("stop reaches child processes", () => {
     await until(() => { try { process.kill(grandchild, 0); return false; } catch { return true; } });
   });
 });
+
+describe("closed stdin", () => {
+  it("gives the agent no input and refuses writes", async () => {
+    const done = exited("r1-a");
+    await runtime.start({
+      sessionId: "r1-a", workspace: ws, env: {}, stdin: "ignore",
+      argv: [process.execPath, "-e", "process.stdin.on('data', () => {}); process.stdin.on('end', () => console.log('eof')); setTimeout(() => {}, 300)"],
+    });
+    await expect(runtime.write("r1-a", "hello")).rejects.toThrow(/does not take input/);
+    await done;
+    expect(runtime.output("r1-a", 5)!.lines).toContain("eof");
+  });
+});

@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
+import { findClaude } from "../agents/locate.js";
 import { dataDir, assertId } from "../paths.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
@@ -13,7 +14,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -126,8 +127,14 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     await emptyTrash(data);
   } catch (error) { store.close(); throw error; }
 
+  let claudeBinary: string | undefined;
   const agents = opts.agents ?? ((name: Node["agent"]) => {
     if (name === "codex") throw new HttpError(409, `agent "${name}" is not supported yet`);
+    if (name === "claude") {
+      try { claudeBinary ??= findClaude(); }
+      catch (e) { throw new HttpError(409, (e as Error).message); }
+      return getAgent("claude", { binary: claudeBinary });
+    }
     return getAgent(name);
   });
   const runtime = createRuntime({ logDir: join(data, "logs"), ...(opts.stopGraceMs ? { stopGraceMs: opts.stopGraceMs } : {}) });

@@ -130,3 +130,12 @@ describe("resume", () => {
     expect(await claudeResumeCommand({ binary: "claude", sessionId: "" })).toBeNull();
   });
 });
+
+describe("headless (print) mode", () => {
+  it("adds -p after the session so the agent runs without a terminal", async () => {
+    expect(await claudeStartCommand({ binary: "claude", sessionId: "r1-root.1", print: true, prompt: "go" }))
+      .toEqual(["claude", "--session-id", DERIVED, "-p", "--", "go"]);
+    expect(await claudeResumeCommand({ binary: "claude", sessionId: "r1-root.1", print: true }))
+      .toEqual(["claude", "--resume", DERIVED, "-p"]);
+  });
+});
