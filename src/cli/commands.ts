@@ -25,6 +25,7 @@ const USAGE = `usage: rivet <command>
   clean <run>                           remove a run's worktrees (branches stay)
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
+  bench <spec.json>                     compare ways of splitting one task (e.g. single, flat, tree)
   daemon start|stop|status              run or control the background daemon
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
@@ -279,6 +280,27 @@ async function project(args: string[], io: CliIo): Promise<number> {
   throw new UsageError("project needs get, set <key> <value> or unset <key>");
 }
 
+async function bench(args: string[], io: CliIo): Promise<number> {
+  const [specFile] = args;
+  if (!specFile) throw new UsageError("bench needs a spec file");
+  const { runBench, formatResult } = await import("../bench/bench.js");
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { dirname, join } = await import("node:path");
+  const full = resolve(io.cwd, specFile);
+  const spec = JSON.parse(await readFile(full, "utf8"));
+  spec.repo = resolve(dirname(full), spec.repo);
+  const workDir = await mkdtemp(join(tmpdir(), "rivet bench "));
+  io.out(`benchmark "${spec.name}" in ${workDir}`);
+  const result = await runBench(spec, { workDir, log: io.out });
+  const out = join(dirname(full), `${spec.name.replace(/[^\w.-]+/g, "-")}-results-${Date.now()}.json`);
+  await writeFile(out, `${JSON.stringify(result, null, 2)}\n`);
+  for (const r of result.results) io.out(formatResult(r));
+  io.out(result.verdict);
+  io.out(`results: ${out}`);
+  return 0;
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
@@ -293,6 +315,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "resume": return await runAction("resume", args, io);
       case "clean": return await runAction("clean", args, io);
       case "project": return await project(args, io);
+      case "bench": return await bench(args, io);
       default: throw new UsageError(command ? `unknown command "${command}"` : "no command given");
     }
   } catch (e) {
