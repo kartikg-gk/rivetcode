@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type { Agent } from "./agent.js";
 import { claudeResumeCommand, claudeStartCommand } from "./command.js";
 import { hooksManager, type HookSpec } from "./hooks.js";
+import { claudeConfigPath, ensureClaudeTrust } from "./trust.js";
 
 const PREFIX = "rivet hooks claude-code ";
 
@@ -30,13 +31,20 @@ const claudeHooks = hooksManager({
   managed: CLAUDE_HOOKS,
 });
 
-export function claudeAgent(binary: string): Agent {
+export function claudeAgent(binary: string, configPath = claudeConfigPath()): Agent {
   return {
+    // Only the interactive app asks about folder trust; print mode does not.
+    prepare: async ({ workspace, headless }) => {
+      if (!headless) await ensureClaudeTrust(configPath, workspace);
+    },
     name: "claude",
     promptVia: "argv",
     // Print mode reads stdin only at start, so a headless claude takes no messages.
     acceptsInput: ({ headless }) => !headless,
-    launchCommand: ({ headless, ...cfg }) => claudeStartCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
+    // An agent Rivet starts in a terminal must not stop at a browser question or drive the user's browser.
+    launchCommand: ({ headless, ...cfg }) => claudeStartCommand({
+      binary, ...cfg, ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+    }),
     restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
     installHooks: (workspace) => claudeHooks.install(workspace),
     uninstallHooks: (workspace) => claudeHooks.uninstall(workspace),

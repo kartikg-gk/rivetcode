@@ -21,6 +21,8 @@ export type ClaudeOptions = {
   prompt?: string;
   // Print mode: answer the prompt and exit, no terminal needed.
   print?: boolean;
+  // Keep the browser integration off (and its first-run question out of the way).
+  noChrome?: boolean;
 };
 
 export type ClaudeStart = ClaudeOptions & { sessionId?: string; nativeSessionId?: string };
@@ -100,6 +102,7 @@ async function claudeCommand(o: ClaudeOptions, conversation: string[]): Promise<
   if (!o.binary.trim()) throw new Error("claude-code: binary is required");
   const args = [o.binary, ...conversation];
   if (o.print) args.push("-p");
+  if (o.noChrome) args.push("--no-chrome");
   const flag = (name: string, value?: string) => {
     if (value?.trim()) args.push(name, value.trim());
   };

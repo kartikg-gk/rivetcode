@@ -1,0 +1,36 @@
+// How to show several sessions side by side, each pane running "rivet attach <session>".
+export type PanesPlan =
+  | { kind: "wt"; file: string; args: string[] }
+  | { kind: "tmux"; steps: string[][] }
+  | { kind: "print"; lines: string[] };
+
+const shellQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+export function panesPlan(o: {
+  platform: NodeJS.Platform;
+  rivet: string;
+  runId: string;
+  sessions: { id: string; title: string }[];
+  have(tool: "wt" | "tmux"): boolean;
+}): PanesPlan {
+  const { sessions } = o;
+  if (o.platform === "win32" && o.have("wt")) {
+    // One Windows Terminal window: the first session in a tab, the rest split beside it.
+    const args = ["-w", "new"];
+    sessions.forEach((s, i) => {
+      if (i > 0) args.push(";", "split-pane", i % 2 === 1 ? "-V" : "-H");
+      else args.push("new-tab");
+      args.push("--title", s.title, o.rivet, "attach", s.id);
+    });
+    return { kind: "wt", file: "wt", args };
+  }
+  if (o.platform !== "win32" && o.have("tmux")) {
+    const name = `rivet-${o.runId}`;
+    const attach = (id: string) => `${shellQuote(o.rivet)} attach ${shellQuote(id)}`;
+    const steps: string[][] = [["new-session", "-d", "-s", name, "-n", "agents", attach(sessions[0]!.id)]];
+    for (const s of sessions.slice(1)) steps.push(["split-window", "-t", name, attach(s.id)], ["select-layout", "-t", name, "tiled"]);
+    steps.push(["attach-session", "-t", name]);
+    return { kind: "tmux", steps };
+  }
+  return { kind: "print", lines: sessions.map((s) => `${o.rivet} attach ${s.id}    # ${s.title}`) };
+}

@@ -91,21 +91,26 @@ export function createScheduler(d: SchedulerDeps) {
     const config = await d.write(() => d.store.getConfig(run.project));
     const model = config["worker.model"]?.trim();
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    // interactive: the agent's own app in a terminal you can attach to; headless: it runs to the end on its own.
+    const headless = config["worker.mode"] !== "interactive";
     const argv = await agent.launchCommand({
-      sessionId, workspace: node.worktree, headless: true,
+      sessionId, workspace: node.worktree, headless,
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
       ...(model ? { model } : {}),
       ...(allowedTools.length ? { allowedTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
     });
     await agent.installHooks(node.worktree);
+    await agent.prepare?.({ workspace: node.worktree, headless });
     // Recorded before the process exists, so even an instant exit is attributed to it.
     const previous = d.launches.get(sessionId);
     d.launches.set(sessionId, launchId);
     try {
       await d.runtime.start({
         sessionId, workspace: node.worktree, argv, launchId,
-        stdin: agent.acceptsInput({ headless: true }) ? "pipe" : "ignore",
+        ...(headless
+          ? { stdin: agent.acceptsInput({ headless: true }) ? "pipe" as const : "ignore" as const }
+          : { terminal: { cols: 120, rows: 40 } }),
         env: {
           ...agentEnv({ runId: run.id, nodeId: node.id, project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
           RIVET_ATTEMPT: String(node.attempts),

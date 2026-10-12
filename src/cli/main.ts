@@ -18,7 +18,8 @@ process.exitCode = await runCli(process.argv.slice(2), {
   env: process.env,
   cwd: process.cwd(),
   readStdin,
-  ...(process.stdin.isTTY ? { ask } : {}),
+  ...(process.stdin.isTTY ? { ask, tty: { input: process.stdin, output: process.stdout } } : {}),
+  raw: (chunk) => process.stdout.write(chunk),
   out: (line) => process.stdout.write(line + "\n"),
   err: (line) => process.stderr.write(line + "\n"),
 });

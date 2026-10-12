@@ -18,5 +18,8 @@
   },
   "bin": {
     "rivet": "dist/cli/main.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
   }
 }

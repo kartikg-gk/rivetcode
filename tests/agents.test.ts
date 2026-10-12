@@ -159,3 +159,11 @@ describe("headless launches", () => {
     expect(getAgent("fake").acceptsInput({ headless: true })).toBe(true);
   });
 });
+
+describe("interactive claude", () => {
+  it("keeps the browser integration off", async () => {
+    const argv = await getAgent("claude").launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: false });
+    expect(argv).toContain("--no-chrome");
+    expect(argv).not.toContain("-p");
+  });
+});
