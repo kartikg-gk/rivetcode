@@ -1,20 +1,23 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
-import { findClaude } from "../agents/locate.js";
+import { findClaude, findCodex } from "../agents/locate.js";
+import { claudePlanner } from "../planner/claude-runner.js";
+import { extractReplan, replanPrompt } from "../planner/planner.js";
 import { dataDir, assertId } from "../paths.js";
+import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { cleanRun, prepareRun, RunInputError } from "../scheduler/runs.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
-import { openStore, RunStoreError } from "../store.js";
+import { openStore, RunStoreError, type Run } from "../store.js";
 import { ACTIVITY_STATES, type ActivityState, type Node } from "../tree.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -28,6 +31,8 @@ export type DaemonOptions = {
   agents?: (name: Node["agent"]) => Agent;
   stopGraceMs?: number;
   checkTimeoutMs?: number;
+  // Rewrites a twice-failed leaf's instructions; defaults to a read-only claude planner.
+  replan?(run: Run, node: Node, why: string): Promise<string | null>;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -128,8 +133,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   } catch (error) { store.close(); throw error; }
 
   let claudeBinary: string | undefined;
+  let codexBinary: string | undefined;
   const agents = opts.agents ?? ((name: Node["agent"]) => {
-    if (name === "codex") throw new HttpError(409, `agent "${name}" is not supported yet`);
+    if (name === "codex") {
+      try { codexBinary ??= findCodex(); }
+      catch (e) { throw new HttpError(409, (e as Error).message); }
+      return getAgent("codex", { binary: codexBinary });
+    }
     if (name === "claude") {
       try { claudeBinary ??= findClaude(); }
       catch (e) { throw new HttpError(409, (e as Error).message); }
@@ -148,8 +158,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return result;
   }
 
+  const replan = opts.replan ?? (async (run: Run, node: Node, why: string): Promise<string | null> => {
+    // A scripted test agent has nothing to re-plan.
+    if (node.agent === "fake") return null;
+    let binary: string;
+    try { binary = claudeBinary ??= findClaude(); } catch { return null; }
+    const config = await write(() => store.getConfig(run.project));
+    const model = config["planner.model"] ?? config["worker.model"];
+    const planner = claudePlanner({ binary, repo: node.worktree, ...(model ? { model } : {}) });
+    return extractReplan(await planner(replanPrompt(run.task, node, why), { resume: false }));
+  });
   const scheduler = createScheduler({
-    data, runFile, store, write, runtime, agents, launches,
+    data, runFile, store, write, runtime, agents, launches, replan,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
   });
@@ -215,11 +235,54 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       res.end(JSON.stringify({ status: "shutting_down", pid: process.pid }), () => { void stop(); });
       return;
     }
-    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output)$/.exec(path);
+    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output|attach|input|resize)$/.exec(path);
     if (control) {
       const [, id, action] = control;
       const { runId, nodeId } = session(id);
       const sessionId = sessionIdOf(runId, nodeId);
+      if (action === "attach") {
+        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+        // Streams the terminal: recent output first, then everything new, until exit.
+        let ended = false;
+        let watch: { replay: string; detach(): void } | null = null;
+        const finish = () => {
+          if (ended) return;
+          ended = true;
+          watch?.detach();
+          offExit();
+          res.end();
+        };
+        const offExit = runtime.onExit((s) => { if (s === sessionId) finish(); });
+        watch = runtime.attach(sessionId, (chunk) => { if (!ended) res.write(chunk); });
+        if (!watch) { offExit(); throw new HttpError(404, "session has not been started"); }
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        res.write(watch.replay);
+        req.on("close", finish);
+        if (!runtime.isAlive(sessionId)) finish();
+        return;
+      }
+      if (action === "input" || action === "resize") {
+        if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+        if (!runtime.isAlive(sessionId)) throw new HttpError(404, "session is not running");
+        const payload = await body(req);
+        try {
+          if (action === "input") {
+            if (typeof payload.data !== "string") throw new HttpError(400, "data must be a string");
+            runtime.input(sessionId, payload.data);
+          } else {
+            const { cols, rows } = payload;
+            if (!Number.isInteger(cols) || !Number.isInteger(rows) || (cols as number) < 1 || (rows as number) < 1) {
+              throw new HttpError(400, "cols and rows must be positive integers");
+            }
+            runtime.resize(sessionId, cols as number, rows as number);
+          }
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(409, (error as Error).message);
+        }
+        reply(res, 204);
+        return;
+      }
       if (action === "output") {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         const raw = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("lines");
@@ -344,6 +407,24 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       for (const n of run.nodes) await scheduler.stopSession(sessionIdOf(run.id, n.id));
       reply(res, 200, await cleanRun(data, run));
+      return;
+    }
+    const active = /^\/api\/v1\/projects\/([^/]+)\/active-files$/.exec(path);
+    if (active) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const project = decodeURIComponent(active[1]!);
+      const runs = await write(() => store.listRuns(project).map((id) => store.loadRun(id)));
+      const files: { file: string; runId: string; nodeId: string }[] = [];
+      for (const r of runs) {
+        const root = r.nodes[0]!;
+        if (["done", "failed", "skipped"].includes(root.status) || r.nodes.every((n) => n.status === "pending")) continue;
+        for (const n of r.nodes.filter((x) => x.kind === "leaf" && x.status !== "skipped")) {
+          const changed = await git(["diff", "--name-only", `${r.base}...${n.branch}`], r.repo)
+            .then((out) => out.split(/\r?\n/).filter(Boolean), () => [] as string[]);
+          for (const file of new Set([...n.files, ...changed])) files.push({ file, runId: r.id, nodeId: n.id });
+        }
+      }
+      reply(res, 200, { files });
       return;
     }
     const config = /^\/api\/v1\/projects\/([^/]+)\/config$/.exec(path);

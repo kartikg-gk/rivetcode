@@ -17,7 +17,8 @@ export async function makeRepo(): Promise<string> {
 }
 
 export async function removeRepo(dir: string): Promise<void> {
-  await rm(dir, { recursive: true, force: true });
+  // Windows can hold a folder for a moment after the process inside it exits.
+  await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }
 
 export async function makeDataDir(): Promise<string> {

@@ -42,8 +42,9 @@ function resolver(content: string | null): Agent {
   };
 }
 
-async function start(parentAgent?: Agent): Promise<void> {
+async function start(parentAgent?: Agent, replan?: (prompt: string) => string | null): Promise<void> {
   daemon = await startDaemon({
+    ...(replan ? { replan: async (_run, node) => replan(node.prompt) } : {}),
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
     agents: () => getAgent("fake"),
     ...(parentAgent ? { agents: (name) => (name === "claude" ? parentAgent : getAgent("fake")) } : {}),
@@ -237,6 +238,32 @@ describe("failures", () => {
   });
 });
 
+describe("re-plan", () => {
+  it("re-plans a leaf that failed twice and gives it one more try", async () => {
+    const seen: string[] = [];
+    await start(undefined, (prompt) => { seen.push(prompt); return JSON.stringify({ files: { "fixed.txt": "ok" }, commit: "fixed" }); });
+    const runId = await runPlan({ title: "root", prompt: "r", children: [leaf("bad", { exitCode: 3 })] });
+    const run = await settled(runId);
+    expect(statuses(run)).toEqual({ root: "done", "root.1": "done" });
+    expect(run.nodes[1]!.attempts).toBe(3);
+    expect(seen).toEqual([JSON.stringify({ exitCode: 3 })]);
+    expect(await show(`rivet/${runId}/root`, "fixed.txt")).toBe("ok");
+  });
+
+  it("escalates after the re-planned try fails too", async () => {
+    await start(undefined, () => JSON.stringify({ exitCode: 4 }));
+    const runId = await runPlan({ title: "root", prompt: "r", children: [leaf("bad", { exitCode: 3 })] });
+    const run = await settled(runId);
+    expect(run.nodes[1]).toMatchObject({ status: "escalated", attempts: 3 });
+  });
+
+  it("escalates at once when the planner has nothing better", async () => {
+    await start(undefined, () => null);
+    const runId = await runPlan({ title: "root", prompt: "r", children: [leaf("bad", { exitCode: 3 })] });
+    expect((await settled(runId)).nodes[1]).toMatchObject({ status: "escalated", attempts: 2 });
+  });
+});
+
 describe("conflicts", () => {
   const conflicting = (): PlanNode => ({
     title: "root", prompt: "r", agent: "claude", children: [
@@ -319,3 +346,20 @@ describe("clean", () => {
 function projectOf(dir: string): string {
   return dir.split(/[\\/]/).pop()!.toLowerCase().trim().replace(/ /g, "-");
 }
+
+describe("active files", () => {
+  it("lists files claimed or changed by runs still in flight", async () => {
+    await start();
+    const runId = await runPlan({ title: "root", prompt: "r", children: [
+      { ...leaf("busy", { files: { "src/changed.ts": "x" }, commit: "c", stayFor: 60_000 }), files: ["src/claimed.ts"] },
+    ] });
+    const tree = (await getRun(runId)).nodes[1]!.worktree;
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !(await git(["log", "--oneline", "-1"], tree)).includes(" c")) await new Promise((r) => setTimeout(r, 50));
+    const res = await api("GET", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/active-files`);
+    expect(res.json.files).toEqual(expect.arrayContaining([
+      { file: "src/claimed.ts", runId, nodeId: "root.1" },
+      { file: "src/changed.ts", runId, nodeId: "root.1" },
+    ]));
+  });
+});

@@ -67,3 +67,38 @@ export function findClaude(o: LocateEnv = current()): string {
   if (!found) throw new Error("claude was not found on PATH or in its usual install folders (set RIVET_CLAUDE_BIN)");
   return unwrapShim(found);
 }
+
+// Codex: install folders first, then the PATH (skipping Windows Store aliases).
+export function codexCandidates(o: LocateEnv = current()): string[] {
+  const win = o.platform === "win32";
+  const fromPath = pathDirs(o)
+    .filter((d) => !(win && /[\\/]WindowsApps$/i.test(d)))
+    .flatMap((d) => (win ? ["codex.cmd", "codex", "codex.exe"] : ["codex"]).map((n) => join(d, n)));
+  if (win) {
+    const appData = o.env.APPDATA ?? join(o.home, "AppData", "Roaming");
+    const npmDir = join(appData, "npm");
+    return [
+      join(npmDir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
+      join(npmDir, "node_modules", "@openai", "codex", "bin", "codex.exe"),
+      join(npmDir, "codex.exe"),
+      join(npmDir, "codex.cmd"),
+      join(o.home, ".cargo", "bin", "codex.exe"),
+      ...fromPath,
+    ];
+  }
+  return [join(o.home, ".cargo", "bin", "codex"), join(o.home, ".local", "bin", "codex"), "/usr/local/bin/codex", "/opt/homebrew/bin/codex", ...fromPath];
+}
+
+export function findCodex(o: LocateEnv = current()): string {
+  const explicit = o.env.RIVET_CODEX_BIN?.trim();
+  if (explicit) {
+    if (!isFile(explicit)) throw new Error(`RIVET_CODEX_BIN points at nothing: ${explicit}`);
+    return explicit;
+  }
+  const found = codexCandidates(o).find(isFile);
+  if (!found) throw new Error("codex was not found on PATH or in its usual install folders (set RIVET_CODEX_BIN)");
+  if (basename(found).toLowerCase() !== "codex.cmd") return found;
+  const dir = dirname(found);
+  const real = [join(dir, "codex.exe"), join(dir, "node_modules", "@openai", "codex", "bin", "codex.exe")].find(isFile);
+  return real ?? found;
+}

@@ -82,7 +82,7 @@ function isValidFile(f: unknown): f is string {
 }
 
 // Every claim covers its whole subtree: "src" and "src/a.ts" overlap.
-function claimsOverlap(a: string, b: string): boolean {
+export function claimsOverlap(a: string, b: string): boolean {
   const [x, y] = process.platform === "win32" ? [a.toLowerCase(), b.toLowerCase()] : [a, b];
   return x === y || y.startsWith(`${x}/`) || x.startsWith(`${y}/`);
 }

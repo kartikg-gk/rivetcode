@@ -30,8 +30,14 @@ function claudeCode(event: string, payload: Payload): ActivityState | null {
   }
 }
 
+// Codex hooks: a prompt starts work, a permission prompt waits on the user, stop is idle.
+function codex(event: string): ActivityState | null {
+  return ({ "user-prompt-submit": "active", "permission-request": "waiting_input", stop: "idle" } as Record<string, ActivityState>)[event] ?? null;
+}
+
 const BY_AGENT: Record<string, (event: string, payload: Payload) => ActivityState | null> = {
   "claude-code": claudeCode,
+  codex,
 };
 
 export function deriveActivity(agent: string, event: string, payload: Payload): ActivityState | null {
@@ -40,6 +46,6 @@ export function deriveActivity(agent: string, event: string, payload: Payload): 
 
 // The agent's own conversation id, so the session can be resumed later.
 export function agentSessionIdOf(payload: Payload): string | undefined {
-  const id = payload.session_id;
+  const id = payload.session_id ?? payload.sessionId;
   return typeof id === "string" && id.trim() ? id.trim() : undefined;
 }

@@ -32,6 +32,8 @@ export type SchedulerDeps = {
   launches: Map<string, string>;
   checkTimeoutMs?: number;
   testTimeoutMs?: number;
+  // Rewrites a leaf's instructions after it failed twice; null keeps them.
+  replan?(run: Run, node: Node, why: string): Promise<string | null>;
   // Called with every problem the scheduler could not handle itself (for logs and tests).
   onError?(error: unknown): void;
 };
@@ -89,21 +91,26 @@ export function createScheduler(d: SchedulerDeps) {
     const config = await d.write(() => d.store.getConfig(run.project));
     const model = config["worker.model"]?.trim();
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    // interactive: the agent's own app in a terminal you can attach to; headless: it runs to the end on its own.
+    const headless = config["worker.mode"] !== "interactive";
     const argv = await agent.launchCommand({
-      sessionId, workspace: node.worktree, headless: true,
+      sessionId, workspace: node.worktree, headless,
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
       ...(model ? { model } : {}),
       ...(allowedTools.length ? { allowedTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
     });
     await agent.installHooks(node.worktree);
+    await agent.prepare?.({ workspace: node.worktree, headless });
     // Recorded before the process exists, so even an instant exit is attributed to it.
     const previous = d.launches.get(sessionId);
     d.launches.set(sessionId, launchId);
     try {
       await d.runtime.start({
         sessionId, workspace: node.worktree, argv, launchId,
-        stdin: agent.acceptsInput({ headless: true }) ? "pipe" : "ignore",
+        ...(headless
+          ? { stdin: agent.acceptsInput({ headless: true }) ? "pipe" as const : "ignore" as const }
+          : { terminal: { cols: 120, rows: 40 } }),
         env: {
           ...agentEnv({ runId: run.id, nodeId: node.id, project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
           RIVET_ATTEMPT: String(node.attempts),
@@ -179,6 +186,8 @@ export function createScheduler(d: SchedulerDeps) {
     enqueueMerge(runId, node.parentId, nodeId);
   }
 
+  // The failure ladder: retry once, then (with a planner) re-plan the leaf and retry
+  // once more, then hand it to the user.
   async function leafFailed(runId: string, nodeId: string, why: string): Promise<void> {
     const run = await load(runId);
     const node = nodeOf(run, nodeId);
@@ -186,9 +195,19 @@ export function createScheduler(d: SchedulerDeps) {
     if (node.attempts < MAX_ATTEMPTS) {
       await transition(runId, nodeId, "failed", why);
       await runLeaf(runId, nodeId, why);
-    } else {
-      await transition(runId, nodeId, "escalated", `gave up after ${node.attempts} attempts: ${why}`);
+      return;
     }
+    if (node.attempts === MAX_ATTEMPTS && d.replan) {
+      let prompt: string | null = null;
+      try { prompt = await d.replan(run, node, why); } catch (e) { report(e); }
+      if (prompt) {
+        await transition(runId, nodeId, "failed", why);
+        await d.write(() => d.store.updateNode(runId, nodeId, { prompt }));
+        await runLeaf(runId, nodeId, why);
+        return;
+      }
+    }
+    await transition(runId, nodeId, "escalated", `gave up after ${node.attempts} attempts: ${why}`);
   }
 
   function lastOutput(sessionId: string): string {
@@ -307,7 +326,7 @@ export function createScheduler(d: SchedulerDeps) {
         await transition(runId, parentId, "waiting");
         const why = `check "${check}" failed after merging "${child.title}":\n${result.output}`;
         if (child.kind === "leaf") {
-          await leafFailedAfterMerge(runId, childId, why);
+          await leafFailed(runId, childId, why);
         } else {
           await transition(runId, parentId, "escalated", why);
         }
@@ -329,18 +348,6 @@ export function createScheduler(d: SchedulerDeps) {
       await transition(runId, parentId, "done");
       await d.write(() => d.store.updateNode(runId, parentId, { finishedAt: new Date().toISOString() }));
       enqueueMerge(runId, parent.parentId, parentId);
-    }
-  }
-
-  // A merged leaf broke the check: it gets the check output and one more go.
-  async function leafFailedAfterMerge(runId: string, childId: string, why: string): Promise<void> {
-    const run = await load(runId);
-    const child = nodeOf(run, childId);
-    if (child.attempts < MAX_ATTEMPTS) {
-      await transition(runId, childId, "failed", why);
-      await runLeaf(runId, childId, why);
-    } else {
-      await transition(runId, childId, "escalated", `gave up after ${child.attempts} attempts: ${why}`);
     }
   }
 
