@@ -35,6 +35,9 @@ export type Store = {
   // A run's pull request; "handled" remembers which feedback was already acted on.
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
+  // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
+  getTerminateOnPrMerge(runId: string): boolean;
+  setTerminateOnPrMerge(runId: string, terminate: boolean): void;
   close(): void;
 };
 
@@ -176,6 +179,11 @@ CREATE TABLE pull_requests (
   url TEXT NOT NULL,
   handled TEXT
 );
+` });
+
+// Per-run merge policy; off unless the user turns it on for that run.
+MIGRATIONS.push({ version: 5, sql: `
+ALTER TABLE runs ADD COLUMN terminate_on_pr_merge INTEGER NOT NULL DEFAULT 0 CHECK (terminate_on_pr_merge IN (0, 1));
 ` });
 
 function migrate(db: DatabaseSync): void {
@@ -375,6 +383,16 @@ export function openStore(data: string): Store {
       db.prepare(`INSERT INTO pull_requests (run_id, number, url, handled) VALUES (?, ?, ?, ?)
         ON CONFLICT (run_id) DO UPDATE SET number = excluded.number, url = excluded.url, handled = excluded.handled`)
         .run(runId, pr.number, pr.url, pr.handled ?? null);
+    },
+
+    getTerminateOnPrMerge(runId) {
+      const row = db.prepare("SELECT terminate_on_pr_merge AS t FROM runs WHERE id = ?").get(runId) as { t: number } | undefined;
+      return Number(row?.t ?? 0) === 1;
+    },
+
+    setTerminateOnPrMerge(runId, terminate) {
+      const changed = db.prepare("UPDATE runs SET terminate_on_pr_merge = ? WHERE id = ?").run(terminate ? 1 : 0, runId).changes;
+      if (Number(changed) === 0) throw new RunStoreError(`unknown run ${runId}`);
     },
 
     getConfig(project) {
