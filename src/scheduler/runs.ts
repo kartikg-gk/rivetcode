@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { cp, mkdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { git } from "../git.js";
+import { runCommand } from "../merge.js";
 import { assertProjectId, defaultProjectId } from "../paths.js";
 import { newRunId, type Run } from "../store.js";
 import { buildTree, TreeError, AGENTS, type Agent, type PlanNode } from "../tree.js";
@@ -25,6 +26,8 @@ export type NewRun = {
   defaultAgentFor?(project: string): string | undefined;
   // Untracked files to copy from the repo into every worktree (e.g. .env).
   copyFor?(project: string): string[];
+  // Shell commands run in every new worktree, in order (e.g. "npm ci").
+  setupFor?(project: string): string[];
 };
 
 async function repoRoot(dir: string): Promise<string> {
@@ -68,6 +71,9 @@ export async function prepareRun(o: NewRun): Promise<Run> {
       await copyListed(repo, n.worktree, o.copyFor?.(project) ?? []);
       made.push({ path: n.worktree, branch: n.branch });
     }
+    // Every worktree is provisioned (e.g. dependencies installed) before any agent starts.
+    const steps = o.setupFor?.(project) ?? [];
+    if (steps.length > 0) await Promise.all(nodes.map((n) => runSetup(repo, n.worktree, n.id, steps)));
   } catch (e) {
     for (const m of made.reverse()) {
       await removeWorktree(o.data, repo, m.path).catch(() => {});
@@ -96,6 +102,30 @@ async function copyListed(repo: string, worktree: string, files: string[]): Prom
     }
     await mkdir(dirname(join(worktree, rel)), { recursive: true });
     await cp(from, join(worktree, rel), { recursive: true });
+  }
+}
+
+export class SetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SetupError";
+  }
+}
+
+const SETUP_STEP_TIMEOUT_MS = 10 * 60_000;
+const SETUP_OUTPUT_TAIL = 8 * 1024;
+
+// Each step through the shell in the worktree, ten minutes at most; the first failure
+// stops the run before any agent starts, showing the end of its output.
+async function runSetup(repo: string, worktree: string, nodeId: string, steps: string[]): Promise<void> {
+  for (const [i, step] of steps.entries()) {
+    const result = await runCommand(step, worktree, SETUP_STEP_TIMEOUT_MS, {
+      RIVET_SOURCE_TREE_PATH: repo,
+      RIVET_WORKTREE_PATH: worktree,
+    });
+    if (!result.ok) {
+      throw new SetupError(`setup step ${i + 1} ("${step}") failed in ${nodeId}:\n${result.output.trim().slice(-SETUP_OUTPUT_TAIL)}`);
+    }
   }
 }
 

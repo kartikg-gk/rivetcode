@@ -14,7 +14,24 @@ async function ask(question: string): Promise<string> {
   try { return await rl.question(question); } finally { rl.close(); }
 }
 
+// A detached "rivet daemon start" that outlives this command; its output goes to
+// <data>/daemon.log.
+async function startDaemon(): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const { mkdirSync, openSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { dataDirFrom } = await import("./client.js");
+  const data = dataDirFrom(process.env);
+  mkdirSync(data, { recursive: true });
+  const log = openSync(join(data, "daemon.log"), "a");
+  const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", process.argv[1]!, "daemon", "start"], {
+    detached: true, stdio: ["ignore", log, log], windowsHide: true, env: process.env,
+  });
+  child.unref();
+}
+
 process.exitCode = await runCli(process.argv.slice(2), {
+  startDaemon,
   env: process.env,
   cwd: process.cwd(),
   readStdin,

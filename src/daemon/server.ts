@@ -11,7 +11,7 @@ import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } fr
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
-import { cleanRun, prepareRun, RunInputError } from "../scheduler/runs.js";
+import { cleanRun, prepareRun, RunInputError, SetupError } from "../scheduler/runs.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { ACTIVITY_STATES, type ActivityState, type Node } from "../tree.js";
@@ -19,7 +19,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy", "setup"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -396,9 +396,12 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
           defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
           copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
+          // One command per line, run in order in every new worktree.
+          setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
         });
       } catch (error) {
         if (error instanceof RunInputError) throw new HttpError(400, error.message);
+        if (error instanceof SetupError) throw new HttpError(409, error.message);
         throw error;
       }
       await write(() => store.saveRun(run));

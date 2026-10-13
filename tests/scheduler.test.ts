@@ -388,3 +388,36 @@ describe("copy list", () => {
     expect(res.json.error).toMatch(/only takes files git ignores/);
   });
 });
+
+describe("worktree setup", () => {
+  const setCfg = (key: string, value: string) =>
+    api("PUT", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/config`, { key, value });
+
+  it("runs each setup step in every new worktree before agents start", async () => {
+    await start();
+    await setCfg("setup", [
+      `node -e "require('fs').writeFileSync('step1.txt', process.env.RIVET_WORKTREE_PATH)"`,
+      `node -e "require('fs').writeFileSync('step2.txt', require('fs').existsSync('step1.txt') + ' ' + process.env.RIVET_SOURCE_TREE_PATH)"`,
+    ].join("\n"));
+    await writeFile(join(repo, ".gitignore"), "step*.txt\n");
+    await git(["add", ".gitignore"], repo);
+    await git(["commit", "-q", "-m", "ignore steps"], repo);
+    const runId = await runPlan({ title: "root", prompt: "r", children: [leaf("a", { files: { "a.txt": "a" }, commit: "a" })] });
+    const run = await settled(runId);
+    for (const n of run.nodes) {
+      expect(await readFile(join(n.worktree, "step1.txt"), "utf8")).toBe(n.worktree);
+      expect(await readFile(join(n.worktree, "step2.txt"), "utf8")).toBe(`true ${repo}`);
+    }
+    expect(run.nodes[0]!.status).toBe("done");
+  });
+
+  it("refuses the run when a step fails, showing its output, and leaves nothing behind", async () => {
+    await start();
+    await setCfg("setup", `node -e "console.error('install broke'); process.exit(2)"`);
+    const res = await api("POST", "/api/v1/runs", { repo, task: "t", plan: leaf("a", {}) });
+    expect(res.status).toBe(409);
+    expect(res.json.error).toMatch(/setup step 1 .* failed in root:\s+install broke/);
+    expect((await git(["branch", "--list", "rivet/*"], repo)).trim()).toBe("");
+    expect(await listWorktrees(repo)).toHaveLength(1);
+  });
+});

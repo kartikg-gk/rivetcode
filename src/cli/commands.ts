@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { readRunFile } from "../runfile.js";
 import { makePlan, planFiles, renderPlan, type PlannerRunner } from "../planner/planner.js";
 import { claimsOverlap, type PlanNode } from "../tree.js";
+import type { Probes } from "./doctor.js";
 import { agentSessionIdOf, deriveActivity } from "./activity.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
 
@@ -21,6 +22,10 @@ export type CliIo = {
   planner?(repo: string): PlannerRunner;
   // The real terminal, for attach (raw keys in, resize events).
   tty?: { input: NodeJS.ReadStream; output: NodeJS.WriteStream };
+  // Replaces what doctor checks on this machine (tests).
+  doctorProbes?: Probes;
+  // Starts the daemon in the background (absent in tests that do not want it).
+  startDaemon?(): Promise<void>;
   // Writes output exactly as received (a session's screen), without a newline.
   raw?(chunk: string): void;
   out(line: string): void;
@@ -43,6 +48,7 @@ const USAGE = `usage: rivet <command>
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
   panes <run>                           show every running agent of a run side by side
   daemon start|stop|status              run or control the background daemon
+  doctor                                check what Rivet needs on this machine
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
                                         report this session's state (inside an agent)
@@ -52,6 +58,8 @@ class UsageError extends Error {}
 
 const HOOK_TIMEOUT_MS = 5_000;
 const COMMAND_TIMEOUT_MS = 120_000;
+// Starting a run creates every worktree and runs the project's setup (installs can be slow).
+const RUN_TIMEOUT_MS = 60 * 60_000;
 const HOOK_LOG_LIMIT = 1024 * 1024;
 const NOTE_LIMIT = 1000;
 
@@ -281,7 +289,7 @@ async function run(args: string[], io: CliIo): Promise<number> {
     repo, task, plan,
     ...(typeof base === "string" ? { base } : {}),
     ...(typeof agent === "string" ? { agent } : {}),
-  }, COMMAND_TIMEOUT_MS) as { runId: string };
+  }, RUN_TIMEOUT_MS) as { runId: string };
   io.out(`run ${result.runId} started; follow it with: rivet status ${result.runId}`);
   return 0;
 }
@@ -487,15 +495,60 @@ async function panes(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
+// Commands you type yourself start the daemon when it is down. Commands agents run
+// (hooks, report, send, sync) never do: their daemon is the one that started them.
+const AUTOSTART = new Set(["run", "plan", "status", "resume", "clean", "project", "pr", "skip", "attach", "panes"]);
+const AUTOSTART_WAIT_MS = 15_000;
+
+async function daemonUp(io: CliIo): Promise<boolean> {
+  try {
+    await callDaemon(io.env, "GET", "/healthz", undefined, 2_000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureDaemon(io: CliIo): Promise<void> {
+  if (!io.startDaemon || io.env.RIVET_NO_AUTOSTART === "1" || (await daemonUp(io))) return;
+  io.err("rivet: starting the daemon in the background");
+  await io.startDaemon();
+  const end = Date.now() + AUTOSTART_WAIT_MS;
+  while (!(await daemonUp(io))) {
+    if (Date.now() > end) throw new Error(`the daemon did not come up within ${AUTOSTART_WAIT_MS / 1000} s; see ${join(dataDirFrom(io.env), "daemon.log")}`);
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
+
+async function doctorCommand(io: CliIo): Promise<number> {
+  const { doctor, realProbes } = await import("./doctor.js");
+  let probes = io.doctorProbes;
+  if (!probes) {
+    const { findClaude, findCodex } = await import("../agents/locate.js");
+    const { loadPty } = await import("../runtime/runtime.js");
+    const { githubToken } = await import("../github/github.js");
+    const remote = (await git(["remote", "get-url", "origin"], io.cwd).catch(() => "")).trim();
+    probes = realProbes({
+      findClaude: () => findClaude(), findCodex: () => findCodex(), loadPty: () => loadPty() !== null,
+      daemonUp: () => daemonUp(io), githubToken: () => githubToken(io.env, remote),
+    });
+  }
+  const checks = await doctor(dataDirFrom(io.env), probes);
+  for (const c of checks) io.out(`${(c.level === "fail" ? "FAIL" : c.level).padEnd(5)} ${c.name.padEnd(10)} ${c.message}`);
+  return checks.some((c) => c.level === "fail") ? 1 : 0;
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
   try {
+    if (AUTOSTART.has(command ?? "")) await ensureDaemon(io);
     switch (command) {
       case "hooks": return await hooks(args, io);
       case "report": return await report(args, io);
       case "send": return await send(args, io);
       case "daemon": return await daemon(args, io);
+      case "doctor": return await doctorCommand(io);
       case "run": return await run(args, io);
       case "plan": return await planCommand(args, io);
       case "attach": return await attach(args, io);
