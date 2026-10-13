@@ -262,6 +262,30 @@ describe("ship without a leaf", () => {
     expect(await onOrigin(`rivet/${runId}/root.2`, "a.txt")).toBe("a");
   });
 
+  it("does not end a merged run while a skipped leaf still works toward its follow-up", async () => {
+    await start({ pr: "auto" });
+    const runId = await startRun({ title: "root", prompt: "r", children: [
+      leaf("quick", { files: { "a.txt": "a" }, commit: "a" }),
+      leaf("late", { files: { "late.txt": "late" }, commit: "late", listen: true }),
+    ] });
+    await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
+    await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root.2" });
+    await until(() => runOf(runId), (r) => r.pr !== null);
+    await api("PATCH", `/api/v1/runs/${runId}/merge-policy`, { terminateOnPrMerge: true });
+    gh.prs[0]!.merged = true;
+    gh.prs[0]!.state = "closed";
+    await until(() => runOf(runId), (r) => r.run.nodes[0]!.prStatus === "merged");
+    await new Promise((r) => setTimeout(r, 600));
+    const waiting = await runOf(runId);
+    expect(waiting.run.nodes[0]!.prStatus).toBe("merged");
+    expect((waiting as any).live["root.2"]).toBe(true);
+    // Once the late leaf finishes, its follow-up opens and only then does the run end.
+    await api("POST", `/api/v1/sessions/${runId}-root.2/send`, { message: "/exit" });
+    const after = await until(() => runOf(runId), (r) => r.pr?.handled === "terminated");
+    expect(after.run.nodes[2]!.summary).toMatch(/follow-up pull request/);
+    expect(gh.prs[1]).toMatchObject({ title: "Follow-up: late" });
+  });
+
   it("only skips leaves that are not finished", async () => {
     await start();
     const runId = await startRun(twoParts());
