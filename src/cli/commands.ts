@@ -42,6 +42,7 @@ const USAGE = `usage: rivet <command>
   skip <run> <node>                     ship without a leaf (it keeps running for a follow-up)
   sync [<session>]                      bring the parent's merged work into a running leaf
   clean <run>                           remove a run's worktrees (branches stay)
+  merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
   bench <spec.json>                     compare ways of splitting one task (e.g. single, flat, tree)
@@ -497,7 +498,7 @@ async function panes(args: string[], io: CliIo): Promise<number> {
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send, sync) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["run", "plan", "status", "resume", "clean", "project", "pr", "skip", "attach", "panes"]);
+const AUTOSTART = new Set(["run", "plan", "status", "resume", "clean", "merge-policy", "project", "pr", "skip", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -580,6 +581,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return 0;
       }
       case "clean": return await runAction("clean", args, io);
+      case "merge-policy": {
+        const [runId, policy] = args;
+        if (!runId || (policy !== "terminate" && policy !== "keep")) throw new UsageError("merge-policy needs <run> terminate|keep");
+        await callDaemon(io.env, "PATCH", `/api/v1/runs/${encodeURIComponent(runId)}/merge-policy`, { terminateOnPrMerge: policy === "terminate" }, COMMAND_TIMEOUT_MS);
+        io.out(policy === "terminate" ? `run ${runId} ends once its pull request merges` : `run ${runId} stays after its pull request merges`);
+        return 0;
+      }
       case "project": return await project(args, io);
       case "bench": return await bench(args, io);
       default: throw new UsageError(command ? `unknown command "${command}"` : "no command given");

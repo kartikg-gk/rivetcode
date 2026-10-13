@@ -162,43 +162,49 @@ describe("watching the pull request", () => {
     await new Promise((r) => setTimeout(r, 500));
     const { run } = await runOf(runId);
     expect(run.nodes[0]!.prStatus).toBe("merged");
-    // Cleaning after a merge is off unless the project asks for it.
+    // A run stays after its merge unless it asked to end.
     expect(run.nodes.every((n) => existsSync(n.worktree))).toBe(true);
   });
 });
 
-describe("cleaning after the merge", () => {
+describe("ending the run after the merge", () => {
   const merge = () => { gh.prs[0]!.merged = true; gh.prs[0]!.state = "closed"; };
+  const policy = (runId: string, terminateOnPrMerge: unknown) => api("PATCH", `/api/v1/runs/${runId}/merge-policy`, { terminateOnPrMerge });
 
-  it("removes the run's worktrees once its pull request is merged, and keeps the branches", async () => {
-    await start({ pr: "auto", "clean.onMerge": "true" });
+  it("terminates a run that asked for it: worktrees go, branches stay", async () => {
+    await start({ pr: "auto" });
     const runId = await startRun(twoParts());
     const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
-    expect(run.nodes.every((n) => existsSync(n.worktree))).toBe(true);
+    expect((await runOf(runId) as any).terminateOnPrMerge).toBe(false);
+    expect((await policy(runId, true)).status).toBe(200);
+    expect((await runOf(runId) as any).terminateOnPrMerge).toBe(true);
     merge();
-    await until(() => runOf(runId), (r) => r.pr?.handled === "cleaned");
+    const after = await until(() => runOf(runId), (r) => r.pr?.handled === "terminated");
+    expect(after.run.nodes[0]!.prStatus).toBe("terminated");
     expect(run.nodes.some((n) => existsSync(n.worktree))).toBe(false);
     for (const n of run.nodes) expect((await git(["branch", "--list", n.branch], repo)).trim()).not.toBe("");
   });
 
-  it("never forces out a worktree with uncommitted work: it is kept and named", async () => {
-    await start({ pr: "auto", "clean.onMerge": "true" });
+  it("never forces out a worktree with uncommitted work: it is kept and named, the run still ends", async () => {
+    await start({ pr: "auto" });
     const runId = await startRun(twoParts());
     const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
+    await policy(runId, true);
     const dirty = run.nodes[2]!;
     await writeFile(join(dirty.worktree, "notes.txt"), "not committed");
     merge();
-    const { pr } = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("cleaned"));
-    expect(pr!.handled).toBe(`cleaned; kept ${dirty.id}`);
+    const after = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("terminated"));
+    expect(after.pr!.handled).toBe(`terminated; kept ${dirty.id}`);
+    expect(after.run.nodes[0]!.prStatus).toBe("terminated");
     expect(existsSync(join(dirty.worktree, "notes.txt"))).toBe(true);
     expect(existsSync(run.nodes[1]!.worktree)).toBe(false);
   });
 
   it("takes only true or false", async () => {
-    await start();
-    const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
-    const res = await api("PUT", `/api/v1/projects/${encodeURIComponent(project)}/config`, { key: "clean.onMerge", value: "yes" });
-    expect(res.status).toBe(400);
+    await start({ pr: "auto" });
+    const runId = await startRun(twoParts());
+    expect((await policy(runId, "yes")).status).toBe(400);
+    expect((await policy("r999", true)).status).toBe(404);
   });
 });
 

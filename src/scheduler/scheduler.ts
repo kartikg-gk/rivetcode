@@ -38,8 +38,6 @@ export type SchedulerDeps = {
   replan?(run: Run, node: Node, why: string): Promise<string | null>;
   // GitHub access for a run's repository; without it there are no pull requests.
   github?(run: Run): Promise<GitHub>;
-  // Whether a run's worktrees go away once its pull request is merged (off unless set).
-  cleanOnMerge?(run: Run): Promise<boolean>;
   // Called with every problem the scheduler could not handle itself (for logs and tests).
   onError?(error: unknown): void;
 };
@@ -499,7 +497,7 @@ export function createScheduler(d: SchedulerDeps) {
     const run = await load(runId);
     const root = run.nodes[0]!;
     if (root.prStatus === "merged") {
-      await cleanAfterMerge(run, pr);
+      await terminateAfterMerge(run, pr);
       return "merged";
     }
     if (root.prStatus === "terminated") return root.prStatus;
@@ -508,7 +506,7 @@ export function createScheduler(d: SchedulerDeps) {
     const status = prStatus(facts);
     await d.write(() => d.store.updateNode(runId, root.id, { prStatus: status }));
     if (status === "merged") {
-      await cleanAfterMerge(await load(runId), pr);
+      await terminateAfterMerge(await load(runId), pr);
       return status;
     }
     const key = `${status}:${facts.mergeability}:${facts.headSha}`;
@@ -534,14 +532,17 @@ export function createScheduler(d: SchedulerDeps) {
     return status;
   }
 
-  // Once the pull request is merged and no agent is at work, the run's worktrees go
-  // (only when the project asks for it). Branches stay, and a worktree with uncommitted
-  // work is never forced: it is kept and listed. Tried once per run.
-  async function cleanAfterMerge(run: Run, pr: PullRequest): Promise<void> {
-    if (pr.handled?.startsWith("cleaned") || !(await d.cleanOnMerge?.(run))) return;
+  // A run whose user asked for it ends once its pull request is merged: after its agents
+  // have gone quiet, they are stopped, the run is marked terminated and its worktrees go.
+  // Branches stay, and a worktree with uncommitted work is never forced: it is kept and
+  // named, and the run is terminated all the same.
+  async function terminateAfterMerge(run: Run, pr: PullRequest): Promise<void> {
+    if (!(await d.write(() => d.store.getTerminateOnPrMerge(run.id)))) return;
     if (run.nodes.some((n) => n.status === "running" || n.status === "integrating")) return;
+    for (const n of run.nodes) await stopSession(sessionIdOf(run.id, n.id));
+    await d.write(() => d.store.updateNode(run.id, run.nodes[0]!.id, { prStatus: "terminated" }));
     const { kept } = await cleanRun(d.data, run);
-    await d.write(() => d.store.setPr(run.id, { ...pr, handled: kept.length ? `cleaned; kept ${kept.join(", ")}` : "cleaned" }));
+    await d.write(() => d.store.setPr(run.id, { ...pr, handled: kept.length ? `terminated; kept ${kept.join(", ")}` : "terminated" }));
     if (kept.length) report(new Error(`run ${run.id}: kept worktrees with uncommitted work: ${kept.join(", ")}`));
   }
 

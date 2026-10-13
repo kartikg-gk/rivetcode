@@ -19,7 +19,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy", "setup", "clean.onMerge"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy", "setup"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -183,7 +183,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   });
   const scheduler = createScheduler({
     data, runFile, store, write, runtime, agents, launches, replan, github,
-    cleanOnMerge: async (run) => (await write(() => store.getConfig(run.project)))["clean.onMerge"] === "true",
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
   });
@@ -410,7 +409,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 201, { runId: run.id });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|skip|radar))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|skip|radar|merge-policy))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -422,12 +421,21 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         const live = Object.fromEntries(run.nodes.map((n) => [n.id, runtime.isAlive(sessionIdOf(run.id, n.id))]));
         const pr = await write(() => store.getPr(run.id));
-        reply(res, 200, { run, live, pr, now: new Date().toISOString() });
+        const terminateOnPrMerge = await write(() => store.getTerminateOnPrMerge(run.id));
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, now: new Date().toISOString() });
         return;
       }
       if (action === "radar") {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         reply(res, 200, { conflicts: await radar(run) });
+        return;
+      }
+      if (action === "merge-policy") {
+        if (req.method !== "PATCH") throw new HttpError(405, "method not allowed");
+        const payload = await body(req);
+        if (typeof payload.terminateOnPrMerge !== "boolean") throw new HttpError(400, "terminateOnPrMerge must be true or false");
+        await write(() => store.setTerminateOnPrMerge(run.id, payload.terminateOnPrMerge as boolean));
+        reply(res, 200, { runId: run.id, terminateOnPrMerge: payload.terminateOnPrMerge });
         return;
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
@@ -482,9 +490,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         throw new HttpError(400, `key must be one of ${CONFIG_KEYS.join(", ")}`);
       }
       if (payload.value !== null && typeof payload.value !== "string") throw new HttpError(400, "value must be a string or null");
-      if (payload.key === "clean.onMerge" && payload.value !== null && payload.value !== "true" && payload.value !== "false") {
-        throw new HttpError(400, "clean.onMerge must be true or false");
-      }
       try {
         await write(() => store.setConfig(project, payload.key as string, payload.value as string | null));
       } catch (error) { throw new HttpError(400, (error as Error).message); }
