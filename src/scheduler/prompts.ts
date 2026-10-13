@@ -25,6 +25,12 @@ export function leafPrompt(run: Run, node: Node, retry?: string): string {
   return lines.join("\n");
 }
 
+// The project's check runs after every merge and a failure sends the work back, so a
+// leaf runs it itself before saying it is done.
+export function checkNote(check: string): string {
+  return `\nBefore you report done, run the project's check and make it pass: ${check}\nRivet runs it again after merging your work; if it fails, the part comes back to you.`;
+}
+
 // What a parent's agent is told when merging a child conflicts. It may only resolve.
 export function conflictPrompt(run: Run, parent: Node, child: Node, conflicts: string[]): string {
   if (parent.agent === "fake") return parent.prompt;

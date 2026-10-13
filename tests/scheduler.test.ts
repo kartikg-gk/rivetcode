@@ -207,6 +207,8 @@ describe("failures", () => {
     const run = await settled(runId);
     expect(statuses(run)).toEqual({ root: "done", "root.1": "done" });
     expect(run.nodes[1]!.attempts).toBe(2);
+    // The first attempt's failure is not left on a finished leaf.
+    expect(run.nodes[1]!.summary ?? null).toBeNull();
   });
 
   it("undoes a merge that breaks the check and retries the leaf", async () => {
@@ -419,5 +421,28 @@ describe("worktree setup", () => {
     expect(res.json.error).toMatch(/setup step 1 .* failed in root:\s+install broke/);
     expect((await git(["branch", "--list", "rivet/*"], repo)).trim()).toBe("");
     expect(await listWorktrees(repo)).toHaveLength(1);
+  });
+});
+
+describe("what a leaf may run", () => {
+  it("lets a leaf run the check and test commands, and tells it to run the check before done", async () => {
+    const seen: { allowedTools?: string[]; prompt?: string }[] = [];
+    const fake = getAgent("fake");
+    const recording: Agent = {
+      ...fake,
+      launchCommand: async (cfg) => {
+        seen.push({ ...(cfg.allowedTools ? { allowedTools: cfg.allowedTools } : {}), ...(cfg.prompt !== undefined ? { prompt: cfg.prompt } : {}) });
+        return fake.launchCommand({ ...cfg, prompt: JSON.stringify({ files: { "a.txt": "a" }, commit: "a" }) });
+      },
+    };
+    await start(recording);
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/config`, { key: "check", value: "node --version" });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/config`, { key: "test", value: "git --version" });
+    const runId = await runPlan({ title: "root", prompt: "r", children: [{ title: "a", prompt: "write a.txt", agent: "claude" }] });
+    await settled(runId);
+    expect(seen[0]!.allowedTools).toEqual([
+      "Bash(rivet:*)", "Bash(git:*)", "Bash(node --version)", "Bash(node --version:*)", "Bash(git --version)", "Bash(git --version:*)",
+    ]);
+    expect(seen[0]!.prompt).toMatch(/Before you report done, run the project's check and make it pass: node --version/);
   });
 });

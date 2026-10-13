@@ -1,7 +1,10 @@
+import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Agent } from "./agent.js";
-import { claudeResumeCommand, claudeStartCommand } from "./command.js";
+import { claudeResumeCommand, claudeSessionId, claudeStartCommand } from "./command.js";
 import { hooksManager, type HookSpec } from "./hooks.js";
 import { claudeConfigPath, ensureClaudeTrust } from "./trust.js";
 
@@ -47,7 +50,19 @@ const claudeHooks = hooksManager({
   managed: CLAUDE_HOOKS,
 });
 
-export function claudeAgent(binary: string, configPath = claudeConfigPath()): Agent {
+// Where Claude keeps its conversations: one folder per working directory under projects/.
+export function claudeProjectsDir(): string {
+  return join(process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude"), "projects");
+}
+
+// Whether Claude already has a conversation with this id, in any folder.
+function conversationExists(projectsDir: string, id: string): boolean {
+  let folders: string[];
+  try { folders = readdirSync(projectsDir); } catch { return false; }
+  return folders.some((f) => existsSync(join(projectsDir, f, `${id}.jsonl`)));
+}
+
+export function claudeAgent(binary: string, configPath = claudeConfigPath(), projectsDir = claudeProjectsDir()): Agent {
   return {
     // Only the interactive app asks about folder trust; print mode does not.
     prepare: async ({ workspace, headless }) => {
@@ -58,9 +73,16 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath()): Ag
     // Print mode reads stdin only at start, so a headless claude takes no messages.
     acceptsInput: ({ headless }) => !headless,
     // An agent Rivet starts in a terminal must not stop at a browser question or drive the user's browser.
-    launchCommand: ({ headless, ...cfg }) => claudeStartCommand({
-      binary, ...cfg, ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
-    }),
+    // A fresh launch is a new conversation. The id derived from Rivet's session is used
+    // once: a relaunch of the same session (a retry) would reuse it, and Claude refuses an
+    // id it already has, so a new one is taken. Hooks report whichever id Claude runs with.
+    launchCommand: ({ headless, ...cfg }) => {
+      const taken = !cfg.nativeSessionId && !!cfg.sessionId && conversationExists(projectsDir, claudeSessionId(cfg.sessionId));
+      return claudeStartCommand({
+        binary, ...cfg, ...(taken ? { nativeSessionId: randomUUID() } : {}),
+        ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+      });
+    },
     restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
     installHooks: (workspace) => claudeHooks.install(workspace),
     uninstallHooks: (workspace) => claudeHooks.uninstall(workspace),
