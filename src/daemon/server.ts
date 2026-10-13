@@ -369,8 +369,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const from = optionalString(payload.from, "from");
       const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from));
       if (id === null) throw new HttpError(404, "unknown session");
-      if (runtime.isAlive(sessionIdOf(runId, nodeId))) await scheduler.deliver(runId, nodeId);
-      reply(res, 202, { id });
+      const target = sessionIdOf(runId, nodeId);
+      // Typed in now, handed over when a headless agent ends its turn, or at the next launch.
+      const delivery = runtime.takesInput(target) ? "now" : runtime.isAlive(target) ? "turn-end" : "next-launch";
+      if (delivery === "now") await scheduler.deliver(runId, nodeId);
+      reply(res, 202, { id, delivery });
       return;
     }
     if (path === "/api/v1/runs") {

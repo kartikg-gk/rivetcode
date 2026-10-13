@@ -154,9 +154,11 @@ async function send(args: string[], io: CliIo): Promise<number> {
   if (typeof session !== "string" || !session) throw new UsageError("send needs --session <id>");
   if (typeof message !== "string" || !message) throw new UsageError("send needs --message <text>");
   const from = io.env.RIVET_SESSION_ID?.trim();
-  await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/send`,
-    { message, ...(from ? { from } : {}) }, COMMAND_TIMEOUT_MS);
-  io.out(`sent to ${session}`);
+  const { delivery } = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/send`,
+    { message, ...(from ? { from } : {}) }, COMMAND_TIMEOUT_MS) as { delivery?: string };
+  io.out(delivery === "turn-end" ? `queued for ${session}: it runs headless and gets the message when its turn ends`
+    : delivery === "next-launch" ? `queued for ${session}: it is not running and gets the message when it starts again`
+    : `sent to ${session}`);
   return 0;
 }
 

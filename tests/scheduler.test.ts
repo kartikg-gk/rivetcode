@@ -446,3 +446,35 @@ describe("what a leaf may run", () => {
     expect(seen[0]!.prompt).toMatch(/Before you report done, run the project's check and make it pass: node --version/);
   });
 });
+
+describe("messages to a headless agent", () => {
+  // Takes no input while it works; a resume writes the prompt it was given and commits it.
+  function headless(): Agent {
+    const fake = getAgent("fake");
+    const script = fileURLToPath(new URL("../src/agents/fake-agent.mjs", import.meta.url));
+    return {
+      ...fake,
+      acceptsInput: () => false,
+      // Rivet wraps a claude leaf's prompt; the script is its JSON line.
+      launchCommand: async (cfg) => [process.execPath, script, "--", (cfg.prompt ?? "").split(/\r?\n/).find((l) => l.startsWith("{")) ?? "{}"],
+      restoreCommand: async (cfg) => [process.execPath, script, "--", JSON.stringify({ files: { "resumed.txt": cfg.prompt ?? "" }, commit: "act on messages" })],
+    };
+  }
+
+  it("hands queued messages over when its turn ends, before its work is taken; sibling notes are skipped", async () => {
+    await start(headless());
+    const spec = (files: object, stayFor?: number) => JSON.stringify({ files, commit: "work", ...(stayFor ? { stayFor } : {}) });
+    const runId = await runPlan({ title: "root", prompt: "r", children: [
+      { title: "quick", prompt: spec({ "q.txt": "q" }), agent: "claude" },
+      { title: "slow", prompt: spec({ "s.txt": "s" }, 2500), agent: "claude" },
+    ] });
+    const sent = await api("POST", `/api/v1/sessions/${runId}-root.2/send`, { message: "also handle empty input" });
+    expect(sent.json.delivery).toBe("turn-end");
+    const run = await settled(runId);
+    expect(run.nodes.map((n) => n.status)).toEqual(["done", "done", "done"]);
+    const resumed = await readFile(join(run.nodes[0]!.worktree, "resumed.txt"), "utf8");
+    expect(resumed).toMatch(/Messages arrived while you worked on your part:\r?\n- also handle empty input/);
+    // The quick sibling finished first, but a headless leaf is not resumed just for that note.
+    expect(resumed).not.toMatch(/Note from Rivet/);
+  });
+});

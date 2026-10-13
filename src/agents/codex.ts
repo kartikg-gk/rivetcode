@@ -93,7 +93,10 @@ export function codexStartCommand(o: CodexOptions): string[] {
 export function codexResumeCommand(o: CodexOptions & { capturedId?: string }): string[] | null {
   const id = o.capturedId?.trim();
   if (!id) return null;
-  const args = [o.binary, "resume", ...BASE_ARGS, ...codexPermissionArgs(o.permission ?? "default", false), ...o.hookFlags, ...common(o), id];
+  // Headless resume (codex exec resume) takes no --sandbox flag; the same mode goes in as config.
+  const permission = codexPermissionArgs(o.permission ?? "default", !!o.headless)
+    .flatMap((a, i, all) => (a === "--sandbox" ? ["-c", `sandbox_mode=${basicString(all[i + 1]!)}`] : all[i - 1] === "--sandbox" ? [] : [a]));
+  const args = [o.binary, ...(o.headless ? ["exec", "resume"] : ["resume"]), ...BASE_ARGS, ...permission, ...o.hookFlags, ...common(o), id];
   if (o.prompt) args.push("--", o.prompt);
   return args;
 }
@@ -123,6 +126,7 @@ export function codexAgent(binary: string): Agent {
       ...(cfg.permission ? { permission: cfg.permission } : {}),
       ...(cfg.model ? { model: cfg.model } : {}),
       ...(cfg.prompt ? { prompt: cfg.prompt } : {}),
+      ...(cfg.headless ? { headless: true } : {}),
     }),
     installHooks: async () => {},
     uninstallHooks: async () => {},
