@@ -93,9 +93,12 @@ export type CommandResult = { ok: boolean; output: string };
 const OUTPUT_LIMIT = 20_000;
 
 // Runs a user-configured check or test command through the shell, in the given worktree.
-export function runCommand(command: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
+export function runCommand(command: string, cwd: string, timeoutMs: number, env?: Record<string, string>): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
+    const child = spawn(command, {
+      cwd, shell: true, windowsHide: true, detached: process.platform !== "win32",
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
     let output = "";
     let timedOut = false;
     const collect = (chunk: Buffer) => {

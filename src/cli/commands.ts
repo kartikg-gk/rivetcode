@@ -52,6 +52,8 @@ class UsageError extends Error {}
 
 const HOOK_TIMEOUT_MS = 5_000;
 const COMMAND_TIMEOUT_MS = 120_000;
+// Starting a run creates every worktree and runs the project's setup (installs can be slow).
+const RUN_TIMEOUT_MS = 60 * 60_000;
 const HOOK_LOG_LIMIT = 1024 * 1024;
 const NOTE_LIMIT = 1000;
 
@@ -281,7 +283,7 @@ async function run(args: string[], io: CliIo): Promise<number> {
     repo, task, plan,
     ...(typeof base === "string" ? { base } : {}),
     ...(typeof agent === "string" ? { agent } : {}),
-  }, COMMAND_TIMEOUT_MS) as { runId: string };
+  }, RUN_TIMEOUT_MS) as { runId: string };
   io.out(`run ${result.runId} started; follow it with: rivet status ${result.runId}`);
   return 0;
 }
