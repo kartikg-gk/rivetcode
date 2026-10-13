@@ -63,6 +63,8 @@ export function createScheduler(d: SchedulerDeps) {
   // Sessions stopped on purpose (by the user or a shutdown): their exit is not a failure.
   const stoppedOnPurpose = new Set<string>();
   let shuttingDown = false;
+  // Skipped leaves whose finished work is being turned into a follow-up pull request.
+  const followingUp = new Set<string>();
   const report = (e: unknown) => d.onError?.(e);
 
   const load = (runId: string) => d.write(() => d.store.loadRun(runId));
@@ -237,7 +239,10 @@ export function createScheduler(d: SchedulerDeps) {
     const node = run.nodes.find((n) => n.id === nodeId);
     if (!node || node.kind !== "leaf") return;
     if (node.status === "skipped") {
-      if (code === 0 || doneReported.has(sessionId)) await followUp(runId, nodeId);
+      if (code === 0 || doneReported.has(sessionId)) {
+        followingUp.add(sessionId);
+        try { await followUp(runId, nodeId); } finally { followingUp.delete(sessionId); }
+      }
       return;
     }
     if (code === 0 || doneReported.has(sessionId)) await leafFinished(runId, nodeId);
@@ -539,6 +544,8 @@ export function createScheduler(d: SchedulerDeps) {
   async function terminateAfterMerge(run: Run, pr: PullRequest): Promise<void> {
     if (!(await d.write(() => d.store.getTerminateOnPrMerge(run.id)))) return;
     if (run.nodes.some((n) => n.status === "running" || n.status === "integrating")) return;
+    // A skipped leaf can still be working (or opening its follow-up): its work must not be lost.
+    if (run.nodes.some((n) => d.runtime.isAlive(sessionIdOf(run.id, n.id)) || followingUp.has(sessionIdOf(run.id, n.id)))) return;
     for (const n of run.nodes) await stopSession(sessionIdOf(run.id, n.id));
     await d.write(() => d.store.updateNode(run.id, run.nodes[0]!.id, { prStatus: "terminated" }));
     const { kept } = await cleanRun(d.data, run);
