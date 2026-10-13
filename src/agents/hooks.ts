@@ -90,12 +90,15 @@ export async function ensureWorkspaceGitignore(dir: string, ...names: string[]):
 export function hooksManager(o: {
   label: string;
   prefix: string;
+  // Recognises Rivet's entries in other forms too (older or other install paths).
+  isOurs?: (command: string) => boolean;
   timeout: number;
   path: (workspace: string) => string;
   managed: HookSpec[];
 }): HooksManager {
   const events = [...new Set(o.managed.map((h) => h.event))];
-  const ours = (entry: Entry) => typeof entry.command === "string" && entry.command.startsWith(o.prefix);
+  const ours = (entry: Entry) => typeof entry.command === "string" &&
+    (entry.command.startsWith(o.prefix) || (o.isOurs?.(entry.command) ?? false));
 
   async function guarded<T>(op: string, workspace: string, fn: (file: string) => Promise<T>): Promise<T> {
     if (workspace.trim() === "") throw new Error(`${o.label}.${op}: workspace is required`);

@@ -1,10 +1,25 @@
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Agent } from "./agent.js";
 import { claudeResumeCommand, claudeStartCommand } from "./command.js";
 import { hooksManager, type HookSpec } from "./hooks.js";
 import { claudeConfigPath, ensureClaudeTrust } from "./trust.js";
 
-const PREFIX = "rivet hooks claude-code ";
+// Hooks run node on Rivet's CLI directly: Claude waits on PreToolUse and PostToolUse for
+// every tool call, and going through the rivet.cmd shim adds a cmd.exe start each time.
+function rivetLauncher(): string {
+  const quote = (p: string) => `"${p.replace(/\\/g, "/")}"`;
+  const main = fileURLToPath(new URL("../cli/main.js", import.meta.url));
+  return `${quote(process.execPath)} --disable-warning=ExperimentalWarning ${quote(main)}`;
+}
+
+const PREFIX = `${rivetLauncher()} hooks claude-code `;
+
+// Ours whichever way they were written: by this install, by another install path, or in
+// the older "rivet hooks claude-code <event>" form, so re-installs replace them.
+export function isRivetClaudeHook(command: string): boolean {
+  return / hooks claude-code [a-z-]+$/.test(command) && (command.startsWith("rivet ") || command.includes("/cli/main.js\""));
+}
 
 // SessionStart also fires on resume, /clear, compaction and fork, not only on startup.
 const SESSION_START_MATCHER = "startup|resume|clear|compact|fork";
@@ -26,6 +41,7 @@ export const CLAUDE_HOOKS: HookSpec[] = [
 const claudeHooks = hooksManager({
   label: "claude-code",
   prefix: PREFIX,
+  isOurs: isRivetClaudeHook,
   timeout: 30,
   path: (workspace) => join(workspace, ".claude", "settings.local.json"),
   managed: CLAUDE_HOOKS,
