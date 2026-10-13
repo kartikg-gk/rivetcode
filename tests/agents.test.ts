@@ -1,10 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getAgent } from "../src/agents/agent.js";
-import { CLAUDE_HOOKS } from "../src/agents/claude.js";
+import { CLAUDE_HOOKS, claudeAgent } from "../src/agents/claude.js";
 import { git } from "../src/git.js";
 import { worktreePath } from "../src/paths.js";
 import { createWorktree, removeWorktree, waitForTrash } from "../src/worktree.js";
@@ -27,6 +27,19 @@ describe("claude adapter", () => {
     expect(await claude.launchCommand({ sessionId: "r1-root.1", workspace: ws, prompt: "fix it" })).toEqual([
       "claude", "--session-id", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77", "--", "fix it",
     ]);
+  });
+
+  it("takes a new conversation id when the derived one is already used (a retry)", async () => {
+    const projects = join(ws, "projects");
+    const agent = claudeAgent("claude", join(ws, ".claude.json"), projects);
+    const derived = "cce53ecb-99f4-55ff-a3cb-693ccbf24d77";
+    expect((await agent.launchCommand({ sessionId: "r1-root.1", workspace: ws }))[2]).toBe(derived);
+    await mkdir(join(projects, "some-folder"), { recursive: true });
+    await writeFile(join(projects, "some-folder", `${derived}.jsonl`), "{}\n");
+    const again = await agent.launchCommand({ sessionId: "r1-root.1", workspace: ws });
+    expect(again[1]).toBe("--session-id");
+    expect(again[2]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(again[2]).not.toBe(derived);
   });
 
   it("uses a configured binary", async () => {
