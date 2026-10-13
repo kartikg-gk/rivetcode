@@ -66,12 +66,18 @@ async function create(o: { repo: string; path: string; branch: string; from: str
     throw new WorktreeError(`branch already exists: ${o.branch}`);
   }
   await mkdir(dirname(path), { recursive: true });
-  // Drops records of worktree directories deleted by hand, which would block this path.
-  await prune(o.repo);
   // Branch first, checkout second: if checkout fails we know the branch is ours to delete.
   await git(["branch", o.branch, o.from], o.repo);
   try {
-    await git(["worktree", "add", path, o.branch], o.repo);
+    try {
+      await git(["worktree", "add", path, o.branch], o.repo);
+    } catch (e) {
+      // A record left by a worktree deleted by hand blocks its path. Pruning only
+      // then keeps the usual create to one git call instead of two.
+      if (!(e instanceof GitError) || !/already registered|missing but/i.test(e.stderr)) throw e;
+      await prune(o.repo);
+      await git(["worktree", "add", path, o.branch], o.repo);
+    }
   } catch (e) {
     await prune(o.repo).catch(() => {});
     await git(["branch", "-D", o.branch], o.repo).catch(() => {});
