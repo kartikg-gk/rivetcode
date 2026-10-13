@@ -8,6 +8,7 @@ const SCRIPT = fileURLToPath(new URL("./fake-agent.mjs", import.meta.url));
 export function fakeAgent(): Agent {
   return {
     name: "fake",
+    signals: false,
     promptVia: "argv",
     acceptsInput: () => true,
     launchCommand: async (cfg) => [process.execPath, SCRIPT, "--", cfg.prompt ?? "{}"],

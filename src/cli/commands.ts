@@ -301,18 +301,45 @@ function ago(iso: string | undefined, now: number): string {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-// One line per node: what it is, where it stands, and how long its agent has been quiet.
-function renderRun(run: Run, live: Record<string, boolean>, now: number): string[] {
+// How long a leaf has worked: from its first start to when it finished (or now).
+function elapsedMs(n: Run["nodes"][number], now: number): number | null {
+  if (!n.startedAt) return null;
+  return (n.finishedAt ? Date.parse(n.finishedAt) : now) - Date.parse(n.startedAt);
+}
+
+function duration(ms: number): string {
+  return ago(new Date(0).toISOString(), ms);
+}
+
+// A running leaf against its finished siblings (the median of their times). Display only.
+function versusSiblings(run: Run, n: Run["nodes"][number], now: number): string {
+  if (n.finishedAt || n.status !== "running") return "";
+  const mine = elapsedMs(n, now);
+  const done = run.nodes
+    .filter((s) => s.id !== n.id && s.kind === "leaf" && s.parentId === n.parentId && s.finishedAt)
+    .map((s) => elapsedMs(s, now))
+    .filter((ms): ms is number => ms !== null && ms > 0)
+    .sort((a, b) => a - b);
+  if (mine === null || done.length === 0) return "";
+  const median = done[Math.floor(done.length / 2)]!;
+  return `, ${(mine / median).toFixed(1)}x finished siblings`;
+}
+
+// One line per node: what it is, where it stands, how long its agent has been quiet, and
+// how long it has worked compared with its siblings.
+export function renderRun(run: Run, live: Record<string, boolean>, now: number, silent: string[] = []): string[] {
   const lines = [`run ${run.id} (root: ${run.nodes[0]!.status}) ${run.task}`];
   for (const n of run.nodes) {
     const name = `${"  ".repeat(n.depth)}${n.id} ${n.title}`;
     const parts = [name.padEnd(34), n.status.padEnd(11)];
     if (n.kind === "leaf" && n.activity) {
       const quiet = n.activity !== "active" && n.activity !== "exited" ? ` for ${ago(n.activityAt, now)}` : "";
-      parts.push(`${n.activity}${quiet}`.padEnd(20));
+      parts.push((silent.includes(n.id) ? `no signal for ${ago(n.activityAt, now)}` : `${n.activity}${quiet}`).padEnd(20));
     } else {
       parts.push("".padEnd(20));
     }
+    const worked = n.kind === "leaf" ? elapsedMs(n, now) : null;
+    if (worked !== null) parts.push(`[${n.finishedAt ? "took" : "working"} ${duration(worked)}${versusSiblings(run, n, now)}]`);
     if (live[n.id]) parts.push("[agent running]");
     if (n.finishedAt && n.status === "running") parts.push("[finished, waiting to merge]");
     if (n.summary) parts.push(n.summary.split(/\r?\n/)[0]!.slice(0, 120));
@@ -332,9 +359,9 @@ async function status(args: string[], io: CliIo): Promise<number> {
     return 0;
   }
   const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
-    run: Run; live: Record<string, boolean>; now: string; pr: { url: string } | null;
+    run: Run; live: Record<string, boolean>; now: string; pr: { url: string } | null; noSignal?: string[];
   };
-  for (const line of renderRun(result.run, result.live, Date.parse(result.now))) io.out(line);
+  for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.noSignal)) io.out(line);
   if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.nodes[0]!.prStatus ?? "pr_open"})`);
   const { conflicts } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}/radar`, undefined, COMMAND_TIMEOUT_MS)
     .catch(() => ({ conflicts: [] })) as { conflicts: { a: string; b: string; files: string[] }[] };

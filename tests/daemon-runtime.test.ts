@@ -91,7 +91,8 @@ describe("starting agents", () => {
     const response = await startLeaf({ dumpEnv: true, stayFor: 400 });
     expect(response.status).toBe(202);
     const { launchId } = await response.json() as { launchId: string };
-    expect(activity()).toBe("active");
+    // Idle until the agent itself reports activity.
+    expect(activity()).toBe("idle");
     await until(() => existsSync(join(leaf, "env.json")));
     expect(JSON.parse(await readFile(join(leaf, "env.json"), "utf8"))).toEqual({
       RIVET_SESSION_ID: "r1-root.1",
@@ -217,15 +218,19 @@ describe("hook activity from agents", () => {
     await start();
     const first = await (await startLeaf({ stayFor: 60_000 })).json() as { launchId: string };
     expect((await post("/api/v1/sessions/r1-root.1/activity", { agentSessionId: "conv-1", launchId: first.launchId })).status).toBe(204);
-    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "idle", launchId: "0000000000000000" })).status).toBe(204);
-    expect(activity()).toBe("active");
-    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "idle", launchId: first.launchId })).status).toBe(204);
+    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "active", launchId: "0000000000000000" })).status).toBe(204);
     expect(activity()).toBe("idle");
+    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "active", launchId: first.launchId })).status).toBe(204);
+    expect(activity()).toBe("active");
     expect((await post("/api/v1/sessions/r1-root.1/activity", {})).status).toBe(400);
     await daemon!.stop();
     daemon = undefined;
     const store = openStore(data);
-    try { expect(store.loadRun("r1").nodes[1]!.agentSessionId).toBe("conv-1"); }
+    try {
+      expect(store.loadRun("r1").nodes[1]!.agentSessionId).toBe("conv-1");
+      expect(store.loadRun("r1").nodes[1]!.firstSignalAt).toBeDefined();
+      expect(store.conversations("r1")).toEqual([{ nodeId: "root.1", agent: "claude", id: "conv-1" }]);
+    }
     finally { store.close(); }
   });
 });

@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deriveActivity } from "../src/cli/activity.js";
-import { runCli, type CliIo } from "../src/cli/commands.js";
+import { renderRun, runCli, type CliIo } from "../src/cli/commands.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { openStore } from "../src/store.js";
-import { buildTree } from "../src/tree.js";
+import { buildTree, type Node } from "../src/tree.js";
 import { makeDataDir, removeRepo } from "./helpers.js";
 
 describe("deriveActivity (Claude Code)", () => {
@@ -396,5 +396,29 @@ describe("daemon autostart", () => {
     const off: CliIo = { ...io({ RIVET_NO_AUTOSTART: "1" }), startDaemon: async () => { throw new Error("should not start"); } };
     expect(await runCli(["status"], off)).toBe(1);
     expect(err.join("\n")).toMatch(/daemon is not running/);
+  });
+});
+
+describe("status view", () => {
+  const t0 = Date.parse("2026-10-13T10:00:00Z");
+  const iso = (s: number) => new Date(t0 + s * 1000).toISOString();
+  const node = (id: string, over: Partial<Node>): Node => ({
+    id, parentId: "root", depth: 1, kind: "leaf", title: id, prompt: "p", files: [], agent: "claude",
+    branch: "b", worktree: "w", status: "running", attempts: 1, ...over,
+  });
+  const run = {
+    id: "r1", project: "p", repo: "r", base: "main", task: "t", createdAt: iso(0),
+    nodes: [
+      { ...node("root", { kind: "parent", parentId: null, depth: 0, status: "waiting" }) },
+      node("root.1", { startedAt: iso(0), finishedAt: iso(100), activity: "exited", activityAt: iso(100) }),
+      node("root.2", { startedAt: iso(0), activity: "idle", activityAt: iso(0) }),
+    ],
+  };
+
+  it("shows how long each leaf worked, a running leaf against its finished siblings, and silence", () => {
+    const lines = renderRun(run, { "root.2": true }, t0 + 250_000, ["root.2"]);
+    expect(lines[2]).toMatch(/\[took 1m40s\]/);
+    expect(lines[3]).toMatch(/no signal for 4m10s/);
+    expect(lines[3]).toMatch(/\[working 4m10s, 2\.5x finished siblings\]/);
   });
 });

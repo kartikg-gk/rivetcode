@@ -137,7 +137,7 @@ export function createScheduler(d: SchedulerDeps) {
       throw e;
     }
     doneReported.delete(sessionId);
-    await d.write(() => d.store.setActivity(run.id, node.id, "active"));
+    await d.write(() => d.store.markLaunched(run.id, node.id));
     await deliverQueued(run.id, node.id);
     return launchId;
   }

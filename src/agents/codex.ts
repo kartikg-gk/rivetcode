@@ -106,6 +106,7 @@ export function codexAgent(binary: string): Agent {
   const hookFlags = () => codexHookFlags(rivetExecutable());
   return {
     name: "codex",
+    signals: true,
     promptVia: "argv",
     acceptsInput: ({ headless }) => !headless,
     launchCommand: async (cfg) => codexStartCommand({

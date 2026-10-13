@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { AGENTS, buildTree, PR_STATUSES, reopen, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
+import { AGENTS, buildTree, noSignal, PR_STATUSES, reopen, setStatus, TreeError, validatePlan, type Node, type PlanNode } from "../src/tree.js";
 
 const leaf = (title: string, files: string[] = []): PlanNode => ({ title, prompt: `do ${title}`, files });
 const data = join("C:", "data x");
@@ -204,5 +204,26 @@ describe("reopen", () => {
 
   it("only reopens done nodes", () => {
     expect(() => reopen(fresh(), "root.1")).toThrow(/only done nodes reopen/);
+  });
+});
+
+describe("no signal", () => {
+  const t0 = Date.parse("2026-10-13T10:00:00Z");
+  const leaf = (over: Partial<Node> = {}): Node => ({
+    id: "root.1", parentId: "root", depth: 1, kind: "leaf", title: "a", prompt: "p", files: [], agent: "claude",
+    branch: "b", worktree: "w", status: "running", attempts: 1, activity: "idle", activityAt: new Date(t0).toISOString(), ...over,
+  });
+
+  it("flags a live agent that has stayed silent past 90 seconds since its launch", () => {
+    expect(noSignal(leaf(), t0 + 90_000, true, true)).toBe(false);
+    expect(noSignal(leaf(), t0 + 90_001, true, true)).toBe(true);
+  });
+
+  it("never flags an agent that was heard from, is not live, sends no hooks, or is busy", () => {
+    const later = t0 + 600_000;
+    expect(noSignal(leaf({ firstSignalAt: new Date(t0 + 5000).toISOString() }), later, true, true)).toBe(false);
+    expect(noSignal(leaf(), later, false, true)).toBe(false);
+    expect(noSignal(leaf(), later, true, false)).toBe(false);
+    expect(noSignal(leaf({ activity: "active" }), later, true, true)).toBe(false);
   });
 });
