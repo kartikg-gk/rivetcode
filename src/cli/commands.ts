@@ -33,6 +33,9 @@ const USAGE = `usage: rivet <command>
                                         start a run (plans first when no --plan is given)
   status [<run>]                        list runs, or show one run's tree
   resume <run>                          retry what was escalated or interrupted
+  pr <run>                              bring in the latest base, push and open the pull request
+  skip <run> <node>                     ship without a leaf (it keeps running for a follow-up)
+  sync [<session>]                      bring the parent's merged work into a running leaf
   clean <run>                           remove a run's worktrees (branches stay)
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
@@ -320,9 +323,13 @@ async function status(args: string[], io: CliIo): Promise<number> {
     return 0;
   }
   const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
-    run: Run; live: Record<string, boolean>; now: string;
+    run: Run; live: Record<string, boolean>; now: string; pr: { url: string } | null;
   };
   for (const line of renderRun(result.run, result.live, Date.parse(result.now))) io.out(line);
+  if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.nodes[0]!.prStatus ?? "pr_open"})`);
+  const { conflicts } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}/radar`, undefined, COMMAND_TIMEOUT_MS)
+    .catch(() => ({ conflicts: [] })) as { conflicts: { a: string; b: string; files: string[] }[] };
+  for (const c of conflicts) io.out(`conflict radar: ${c.a} and ${c.b} would conflict in ${c.files.join(", ")}`);
   return 0;
 }
 
@@ -495,6 +502,30 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "panes": return await panes(args, io);
       case "status": return await status(args, io);
       case "resume": return await runAction("resume", args, io);
+      case "sync": {
+        // Inside an agent: sync this session, and the agent resolves any conflict itself.
+        const self = io.env.RIVET_SESSION_ID?.trim();
+        const target = args[0] ?? self;
+        if (!target) throw new UsageError("sync needs a session id (or run it inside an agent session)");
+        const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(target)}/sync`,
+          { byAgent: !args[0] && !!self }, COMMAND_TIMEOUT_MS) as { synced: boolean; conflicts: string[]; note: string };
+        io.out(result.synced ? `synced: ${result.note}` : `conflicts in ${result.conflicts.join(", ")}: ${result.note}`);
+        return result.synced ? 0 : 1;
+      }
+      case "skip": {
+        const [runId, node] = args;
+        if (!runId || !node) throw new UsageError("skip needs <run> <node>");
+        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/skip`, { node }, COMMAND_TIMEOUT_MS);
+        io.out(`${node} skipped; the run goes on without it (a running agent keeps going for a follow-up)`);
+        return 0;
+      }
+      case "pr": {
+        const [runId] = args;
+        if (!runId) throw new UsageError("pr needs a run id");
+        const pr = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/pr`, undefined, COMMAND_TIMEOUT_MS) as { url: string };
+        io.out(`pull request: ${pr.url}`);
+        return 0;
+      }
       case "clean": return await runAction("clean", args, io);
       case "project": return await project(args, io);
       case "bench": return await bench(args, io);

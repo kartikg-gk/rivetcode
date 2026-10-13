@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { AGENTS, buildTree, PR_STATUSES, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
+import { AGENTS, buildTree, PR_STATUSES, reopen, setStatus, TreeError, validatePlan, type PlanNode } from "../src/tree.js";
 
 const leaf = (title: string, files: string[] = []): PlanNode => ({ title, prompt: `do ${title}`, files });
 const data = join("C:", "data x");
@@ -186,5 +186,23 @@ describe("state lists", () => {
 describe("agents", () => {
   it("includes the fake agent for end-to-end runs", () => {
     expect([...AGENTS]).toEqual(["claude", "codex", "fake"]);
+  });
+});
+
+describe("reopen", () => {
+  const plan: PlanNode = { title: "r", prompt: "p", children: [leaf("a")] };
+  const fresh = () => buildTree({ runId: "r1", project: "proj", dataDir: data, plan, defaultAgent: "claude" });
+
+  it("sends a done leaf back to work and a done parent back to waiting", () => {
+    let nodes = setStatus(setStatus(fresh(), "root.1", "running"), "root.1", "done");
+    nodes = setStatus(setStatus(nodes, "root", "integrating"), "root", "done");
+    nodes = reopen(nodes, "root.1", "CI failed in src/a.ts");
+    nodes = reopen(nodes, "root");
+    expect(nodes[1]).toMatchObject({ status: "running", attempts: 2, summary: "CI failed in src/a.ts" });
+    expect(nodes[0]!.status).toBe("waiting");
+  });
+
+  it("only reopens done nodes", () => {
+    expect(() => reopen(fresh(), "root.1")).toThrow(/only done nodes reopen/);
   });
 });

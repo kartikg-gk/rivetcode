@@ -363,3 +363,28 @@ describe("active files", () => {
     ]));
   });
 });
+
+describe("copy list", () => {
+  it("copies listed ignored files into every worktree and never commits them", async () => {
+    await writeFile(join(repo, ".gitignore"), ".env\n");
+    await git(["add", ".gitignore"], repo);
+    await git(["commit", "-q", "-m", "ignore env"], repo);
+    await writeFile(join(repo, ".env"), "SECRET=1\n");
+    await start();
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/config`, { key: "copy", value: ".env, missing.txt" });
+    const runId = await runPlan({ title: "root", prompt: "r", children: [leaf("a", { files: { "a.txt": "a" } })] });
+    const run = await settled(runId);
+    expect(await readFile(join(run.nodes[1]!.worktree, ".env"), "utf8")).toBe("SECRET=1\n");
+    expect(run.nodes[0]!.status).toBe("done");
+    await expect(show(`rivet/${runId}/root`, ".env")).rejects.toThrow();
+  });
+
+  it("refuses to copy a file git does not ignore", async () => {
+    await writeFile(join(repo, "notes.txt"), "x");
+    await start();
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/config`, { key: "copy", value: "notes.txt" });
+    const res = await api("POST", "/api/v1/runs", { repo, task: "t", plan: leaf("a", {}) });
+    expect(res.status).toBe(400);
+    expect(res.json.error).toMatch(/only takes files git ignores/);
+  });
+});

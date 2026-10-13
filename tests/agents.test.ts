@@ -47,25 +47,29 @@ describe("claude adapter", () => {
       "Notification", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse",
       "SessionEnd", "SessionStart", "Stop", "SubagentStop", "UserPromptSubmit",
     ]);
-    expect(settings.hooks.SessionStart).toEqual([{
-      matcher: "startup|resume|clear|compact|fork",
-      hooks: [{ type: "command", command: "rivet hooks claude-code session-start", timeout: 30 }],
-    }]);
+    // Each hook runs node on Rivet's CLI directly (no shell shim in between).
+    const launcher = `"${process.execPath.replace(/\\/g, "/")}" --disable-warning=ExperimentalWarning "`;
+    const start = settings.hooks.SessionStart[0];
+    expect(start.matcher).toBe("startup|resume|clear|compact|fork");
+    expect(start.hooks).toHaveLength(1);
+    expect(start.hooks[0].timeout).toBe(30);
+    expect(start.hooks[0].command.startsWith(launcher)).toBe(true);
+    expect(start.hooks[0].command).toMatch(/\/cli\/main\.js" hooks claude-code session-start$/);
     const pinned = Object.fromEntries(
       Object.entries(settings.hooks as Record<string, { matcher?: string; hooks: { command: string }[] }[]>)
-        .map(([event, groups]) => [event, [groups[0]!.matcher ?? null, groups[0]!.hooks[0]!.command]]),
+        .map(([event, groups]) => [event, [groups[0]!.matcher ?? null, groups[0]!.hooks[0]!.command.split('" hooks ')[1]]]),
     );
     expect(pinned).toEqual({
-      SessionStart: ["startup|resume|clear|compact|fork", "rivet hooks claude-code session-start"],
-      UserPromptSubmit: [null, "rivet hooks claude-code user-prompt-submit"],
-      PreToolUse: [null, "rivet hooks claude-code pre-tool-use"],
-      PostToolUse: [null, "rivet hooks claude-code post-tool-use"],
-      PostToolUseFailure: [null, "rivet hooks claude-code post-tool-use-failure"],
-      PermissionRequest: [null, "rivet hooks claude-code permission-request"],
-      Stop: [null, "rivet hooks claude-code stop"],
-      Notification: [null, "rivet hooks claude-code notification"],
-      SubagentStop: [null, "rivet hooks claude-code subagent-stop"],
-      SessionEnd: [null, "rivet hooks claude-code session-end"],
+      SessionStart: ["startup|resume|clear|compact|fork", "claude-code session-start"],
+      UserPromptSubmit: [null, "claude-code user-prompt-submit"],
+      PreToolUse: [null, "claude-code pre-tool-use"],
+      PostToolUse: [null, "claude-code post-tool-use"],
+      PostToolUseFailure: [null, "claude-code post-tool-use-failure"],
+      PermissionRequest: [null, "claude-code permission-request"],
+      Stop: [null, "claude-code stop"],
+      Notification: [null, "claude-code notification"],
+      SubagentStop: [null, "claude-code subagent-stop"],
+      SessionEnd: [null, "claude-code session-end"],
     });
     expect(CLAUDE_HOOKS).toHaveLength(10);
     expect(await claude.hooksInstalled(ws)).toBe(true);
@@ -165,5 +169,27 @@ describe("interactive claude", () => {
     const argv = await getAgent("claude").launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: false });
     expect(argv).toContain("--no-chrome");
     expect(argv).not.toContain("-p");
+  });
+});
+
+describe("claude hooks from older installs", () => {
+  let ws: string;
+  beforeEach(async () => { ws = await makeDataDir(); });
+  afterEach(async () => { await removeRepo(ws); });
+
+  it("replaces the old rivet-on-PATH form and other install paths, keeping the user's hooks", async () => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(join(ws, ".claude"), { recursive: true });
+    await writeFile(join(ws, ".claude", "settings.local.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [
+      { type: "command", command: "rivet hooks claude-code stop" },
+      { type: "command", command: '"/old/node" --disable-warning=ExperimentalWarning "/old/rivet/dist/cli/main.js" hooks claude-code stop' },
+      { type: "command", command: "echo mine" },
+    ] }] } }));
+    await getAgent("claude").installHooks(ws);
+    const stop = JSON.parse(await readFile(join(ws, ".claude", "settings.local.json"), "utf8")).hooks.Stop;
+    const commands = stop.flatMap((g: { hooks: { command: string }[] }) => g.hooks.map((h) => h.command));
+    expect(commands.filter((c: string) => c.endsWith("hooks claude-code stop"))).toHaveLength(1);
+    expect(commands).toContain("echo mine");
+    expect(commands.some((c: string) => c.startsWith("rivet "))).toBe(false);
   });
 });
