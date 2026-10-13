@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -159,7 +160,45 @@ describe("watching the pull request", () => {
     await until(() => runOf(runId), (r) => r.run.nodes[0]!.prStatus === "merged");
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     await new Promise((r) => setTimeout(r, 500));
-    expect((await runOf(runId)).run.nodes[0]!.prStatus).toBe("merged");
+    const { run } = await runOf(runId);
+    expect(run.nodes[0]!.prStatus).toBe("merged");
+    // Cleaning after a merge is off unless the project asks for it.
+    expect(run.nodes.every((n) => existsSync(n.worktree))).toBe(true);
+  });
+});
+
+describe("cleaning after the merge", () => {
+  const merge = () => { gh.prs[0]!.merged = true; gh.prs[0]!.state = "closed"; };
+
+  it("removes the run's worktrees once its pull request is merged, and keeps the branches", async () => {
+    await start({ pr: "auto", "clean.onMerge": "true" });
+    const runId = await startRun(twoParts());
+    const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
+    expect(run.nodes.every((n) => existsSync(n.worktree))).toBe(true);
+    merge();
+    await until(() => runOf(runId), (r) => r.pr?.handled === "cleaned");
+    expect(run.nodes.some((n) => existsSync(n.worktree))).toBe(false);
+    for (const n of run.nodes) expect((await git(["branch", "--list", n.branch], repo)).trim()).not.toBe("");
+  });
+
+  it("never forces out a worktree with uncommitted work: it is kept and named", async () => {
+    await start({ pr: "auto", "clean.onMerge": "true" });
+    const runId = await startRun(twoParts());
+    const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
+    const dirty = run.nodes[2]!;
+    await writeFile(join(dirty.worktree, "notes.txt"), "not committed");
+    merge();
+    const { pr } = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("cleaned"));
+    expect(pr!.handled).toBe(`cleaned; kept ${dirty.id}`);
+    expect(existsSync(join(dirty.worktree, "notes.txt"))).toBe(true);
+    expect(existsSync(run.nodes[1]!.worktree)).toBe(false);
+  });
+
+  it("takes only true or false", async () => {
+    await start();
+    const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
+    const res = await api("PUT", `/api/v1/projects/${encodeURIComponent(project)}/config`, { key: "clean.onMerge", value: "yes" });
+    expect(res.status).toBe(400);
   });
 });
 
