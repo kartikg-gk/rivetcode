@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   extractPlan, extractReplan, makePlan, planFiles, planPrompt, PlanError, renderPlan, type PlannerRunner,
 } from "../src/planner/planner.js";
+import { leafPrompt } from "../src/scheduler/prompts.js";
+import { buildTree } from "../src/tree.js";
 
 const good = { title: "api", prompt: "p", children: [
   { title: "routes", prompt: "make routes", files: ["src/routes.ts"] },
@@ -71,5 +73,21 @@ describe("helpers", () => {
   it("reads a re-plan answer", () => {
     expect(extractReplan('{"prompt": "do it this way"}')).toBe("do it this way");
     expect(() => extractReplan('{"other": 1}')).toThrow(/no new prompt/);
+  });
+});
+
+describe("shared files in the plan", () => {
+  it("asks for shared files on the parent and shows what a parent wires", () => {
+    expect(planPrompt("t")).toMatch(/goes in its parent's "shared" list, never in a leaf/);
+    expect(renderPlan({ title: "root", prompt: "r", shared: ["index.js"], children: [{ title: "a", prompt: "p", files: ["a.js"] }] }, "claude"))
+      .toEqual(["root root  (integrates)  wires: index.js", "  root.1 a  (leaf, claude)  files: a.js"]);
+  });
+
+  it("tells a part to leave its parent's shared files alone", () => {
+    const nodes = buildTree({ runId: "r1", project: "p", dataDir: "/d", defaultAgent: "claude",
+      plan: { title: "root", prompt: "r", shared: ["index.js"], children: [{ title: "a", prompt: "p", files: ["a.js"] }, { title: "b", prompt: "q", files: ["b.js"] }] } });
+    const run = { id: "r1", project: "p", repo: "/r", base: "main", task: "t", createdAt: "", nodes };
+    expect(leafPrompt(run, nodes[1]!)).toMatch(/Do not edit these files; they are wired in once every part is merged: index\.js/);
+    expect(leafPrompt(run, nodes[0]!)).not.toMatch(/Do not edit/);
   });
 });

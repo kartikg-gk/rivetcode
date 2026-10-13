@@ -10,7 +10,7 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { claimsOverlap, reopen, setStatus, type Node, type Status } from "../tree.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { checkNote, conflictPrompt, leafPrompt } from "./prompts.js";
+import { checkNote, conflictPrompt, leafPrompt, wiringPrompt } from "./prompts.js";
 import { cleanRun } from "./runs.js";
 
 // Agents run without a terminal for now, so they need leave to edit files and to run
@@ -330,11 +330,12 @@ export function createScheduler(d: SchedulerDeps) {
   }
 
   // Runs the parent's agent on a conflicted merge and waits for it to finish.
-  async function resolveWithAgent(run: Run, parent: Node, child: Node, conflicts: string[]): Promise<{ ok: boolean; reason: string }> {
+  // Runs a parent's agent with one prompt and waits for it to finish.
+  async function parentTurn(run: Run, parent: Node, prompt: string): Promise<{ ok: boolean; reason: string }> {
     const sessionId = sessionIdOf(run.id, parent.id);
     let exited!: Promise<number | null>;
     try {
-      const launchId = await launch(run, parent, conflictPrompt(run, parent, child, conflicts));
+      const launchId = await launch(run, parent, prompt);
       exited = new Promise((resolve) => exitWaiters.set(launchId, resolve));
       if (!d.runtime.isAlive(sessionId)) {
         // Exited before we listened.
@@ -345,6 +346,12 @@ export function createScheduler(d: SchedulerDeps) {
       return { ok: false, reason: `could not start the parent's agent: ${(e as Error).message}` };
     }
     await exited;
+    return { ok: true, reason: "" };
+  }
+
+  async function resolveWithAgent(run: Run, parent: Node, child: Node, conflicts: string[]): Promise<{ ok: boolean; reason: string }> {
+    const turn = await parentTurn(run, parent, conflictPrompt(run, parent, child, conflicts));
+    if (!turn.ok) return turn;
     const result = await finishResolution(parent.worktree, conflicts);
     return result.ok ? { ok: true, reason: "" } : { ok: false, reason: result.reason };
   }
@@ -395,6 +402,21 @@ export function createScheduler(d: SchedulerDeps) {
       await transition(runId, parentId, "waiting");
       return;
     }
+    await partsMerged(runId, parentId);
+  }
+
+  // Every part of a parent is merged (or skipped): it wires its shared files, then the
+  // root runs the full test and a lower parent is merged into its own parent.
+  async function partsMerged(runId: string, parentId: string): Promise<void> {
+    let parent = nodeOf(await load(runId), parentId);
+    if (parent.status !== "integrating") parent = await transition(runId, parentId, "integrating");
+    if (parent.shared.length > 0) {
+      const wired = await wireShared(await load(runId), parent);
+      if (!wired.ok) {
+        await transition(runId, parentId, "escalated", wired.reason);
+        return;
+      }
+    }
     if (parent.parentId === null) {
       await completeRoot(runId);
     } else {
@@ -402,6 +424,31 @@ export function createScheduler(d: SchedulerDeps) {
       await d.write(() => d.store.updateNode(runId, parentId, { finishedAt: new Date().toISOString() }));
       enqueueMerge(runId, parent.parentId, parentId);
     }
+  }
+
+  // One turn of the parent's agent over its shared files. Anything it changes outside
+  // them, or a failing check, undoes the wiring.
+  async function wireShared(run: Run, parent: Node): Promise<{ ok: boolean; reason: string }> {
+    const before = await headOf(parent.worktree);
+    const parts = childrenOf(run, parent.id).filter((c) => c.status === "done");
+    const turn = await parentTurn(run, parent, wiringPrompt(run, parent, parts));
+    if (!turn.ok) return turn;
+    await commitLeftovers(parent.worktree, `rivet: wire ${parent.shared.join(", ")}`);
+    const changed = (await git(["diff", "--name-only", `${before}..HEAD`], parent.worktree)).split(/\r?\n/).filter(Boolean);
+    const outside = changed.filter((f) => !parent.shared.some((s) => claimsOverlap(s, f)));
+    if (outside.length > 0) {
+      await resetTo(parent.worktree, before);
+      return { ok: false, reason: `wiring changed files that are not shared: ${outside.join(", ")}` };
+    }
+    const { check } = await d.write(() => d.store.getConfig(run.project));
+    if (check) {
+      const result = await runCommand(check, parent.worktree, checkTimeout);
+      if (!result.ok) {
+        await resetTo(parent.worktree, before);
+        return { ok: false, reason: `check "${check}" failed after wiring ${parent.shared.join(", ")}:\n${result.output}` };
+      }
+    }
+    return { ok: true, reason: "" };
   }
 
   async function tellSiblings(run: Run, parent: Node, child: Node): Promise<void> {
@@ -651,12 +698,7 @@ export function createScheduler(d: SchedulerDeps) {
     for (const p of [...fresh.nodes].reverse().filter((n) => n.kind === "parent")) {
       const kids = childrenOf(fresh, p.id);
       if (p.status === "waiting" && kids.every((k) => k.status === "done" || k.status === "skipped")) {
-        if (p.parentId === null) await completeRoot(runId);
-        else {
-          await transition(runId, p.id, "integrating");
-          await transition(runId, p.id, "done");
-          enqueueMerge(runId, p.parentId, p.id);
-        }
+        await partsMerged(runId, p.id);
       } else if (p.status === "done" && p.parentId) {
         const up = nodeOf(fresh, p.parentId);
         if (up.status === "waiting") enqueueMerge(runId, p.parentId, p.id);
@@ -704,14 +746,7 @@ export function createScheduler(d: SchedulerDeps) {
     const parent = nodeOf(run, parentId);
     if (parent.status !== "waiting") return;
     if (childrenOf(run, parentId).some((c) => c.status !== "done" && c.status !== "skipped")) return;
-    if (parent.parentId === null) {
-      await completeRoot(runId);
-    } else {
-      await transition(runId, parentId, "integrating");
-      await transition(runId, parentId, "done");
-      await d.write(() => d.store.updateNode(runId, parentId, { finishedAt: new Date().toISOString() }));
-      enqueueMerge(runId, parent.parentId, parentId);
-    }
+    await partsMerged(runId, parentId);
   }
 
   // The user ships without this leaf. Its agent keeps working; when it finishes, its

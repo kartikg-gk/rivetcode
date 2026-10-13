@@ -16,11 +16,14 @@ export function planPrompt(task: string): string {
     "- Siblings must be independent: work that depends on other work goes in the same leaf.",
     "- Every leaf prompt must be self-contained: what to build, where, and how to verify it.",
     "- List the files each leaf will create or change in \"files\". Siblings must not share files",
-    "  (a folder claims everything below it). Shared registration files (an index that every part",
-    "  edits) are fine to leave unclaimed; conflicts there are resolved at merge time.",
+    "  (a folder claims everything below it).",
+    "- A file that several parts would each need to edit (an index that exports every part, a",
+    "  registry, a router) goes in its parent's \"shared\" list, never in a leaf. No leaf edits it;",
+    "  each leaf tests its code by importing it from its own file. The parent wires the shared files",
+    "  once all its parts are merged.",
     "",
     "Answer with only one JSON object, no other text, of this shape:",
-    '{"title": "...", "prompt": "...", "files": ["..."], "children": [ { "title": "...", "prompt": "...", "files": ["..."] } ]}',
+    '{"title": "...", "prompt": "...", "shared": ["..."], "children": [ { "title": "...", "prompt": "...", "files": ["..."] } ]}',
   ].join("\n");
 }
 
@@ -64,8 +67,10 @@ function shapeProblems(value: unknown, id = "root"): string[] {
   const problems: string[] = [];
   if (typeof v.title !== "string") problems.push(`${id} needs a "title" string`);
   if (typeof v.prompt !== "string") problems.push(`${id} needs a "prompt" string`);
-  if (v.files !== undefined && !(Array.isArray(v.files) && v.files.every((f) => typeof f === "string"))) {
-    problems.push(`${id} "files" must be a list of strings`);
+  for (const key of ["files", "shared"]) {
+    if (v[key] !== undefined && !(Array.isArray(v[key]) && (v[key] as unknown[]).every((f) => typeof f === "string"))) {
+      problems.push(`${id} "${key}" must be a list of strings`);
+    }
   }
   if (v.children !== undefined) {
     if (!Array.isArray(v.children)) problems.push(`${id} "children" must be a list`);
@@ -133,7 +138,7 @@ export function renderPlan(plan: PlanNode, defaultAgent: string): string[] {
   const visit = (p: PlanNode, id: string, depth: number) => {
     const kids = p.children ?? [];
     const role = kids.length > 0 ? "integrates" : `leaf, ${p.agent ?? defaultAgent}`;
-    lines.push(`${"  ".repeat(depth)}${id} ${p.title}  (${role})${p.files?.length ? `  files: ${p.files.join(", ")}` : ""}`);
+    lines.push(`${"  ".repeat(depth)}${id} ${p.title}  (${role})${p.files?.length ? `  files: ${p.files.join(", ")}` : ""}${p.shared?.length ? `  wires: ${p.shared.join(", ")}` : ""}`);
     kids.forEach((c, i) => visit(c, `${id}.${i + 1}`, depth + 1));
   };
   visit(plan, "root", 0);

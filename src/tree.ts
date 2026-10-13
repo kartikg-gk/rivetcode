@@ -28,6 +28,9 @@ export type PlanNode = {
   title: string;
   prompt: string;
   files?: string[];
+  // On a parent: files several of its parts need (an index, a registry). No part edits
+  // them; the parent wires them once all its children are merged.
+  shared?: string[];
   agent?: Agent;
   children?: PlanNode[];
 };
@@ -40,6 +43,8 @@ export type Node = {
   title: string;
   prompt: string;
   files: string[];
+  // Files this parent wires after merging its children (none on a leaf).
+  shared: string[];
   agent: Agent;
   branch: string;
   worktree: string;
@@ -120,6 +125,15 @@ export function validatePlan(plan: PlanNode): string[] {
       if (!isValidFile(f)) problems.push(`${id} has invalid file "${String(f)}"`);
     }
     const children = p.children ?? [];
+    for (const f of p.shared ?? []) {
+      if (!isValidFile(f)) { problems.push(`${id} has invalid shared file "${String(f)}"`); continue; }
+      if (children.length === 0) { problems.push(`${id} is a leaf; only a parent wires shared files`); continue; }
+      const shared = normalizeFile(f);
+      children.forEach((c, i) => {
+        const clash = subtreeFiles(c).find((x) => claimsOverlap(x, shared));
+        if (clash !== undefined) problems.push(`${id}.${i + 1} claims ${clash}, which ${id} wires as a shared file`);
+      });
+    }
     if (children.length > MAX_CHILDREN) {
       problems.push(`${id} has ${children.length} children (max ${MAX_CHILDREN})`);
     }
@@ -158,6 +172,7 @@ export function buildTree(o: {
       title: p.title.trim(),
       prompt: p.prompt,
       files: (p.files ?? []).map(normalizeFile),
+      shared: (p.shared ?? []).map(normalizeFile),
       agent: p.agent ?? o.defaultAgent,
       branch: branchName(o.runId, id),
       worktree: worktreePath(o.dataDir, o.project, o.runId, id),

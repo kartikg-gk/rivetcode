@@ -208,6 +208,11 @@ CREATE TABLE conversations (
 );
 ` });
 
+// The files a parent wires after merging its children.
+MIGRATIONS.push({ version: 7, sql: `
+ALTER TABLE nodes ADD COLUMN shared TEXT NOT NULL DEFAULT '[]';
+` });
+
 function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
@@ -236,6 +241,7 @@ type NodeRow = {
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
   summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
   activity_at: string | null; finished_at: string | null; started_at: string | null; first_signal_at: string | null;
+  shared: string;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -256,8 +262,8 @@ export function openStore(data: string): Store {
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
       branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at,
-      started_at, first_signal_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      started_at, first_signal_at, shared)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
   const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
@@ -326,6 +332,7 @@ export function openStore(data: string): Store {
             JSON.stringify(n.files), n.agent, n.branch, n.worktree, n.status, n.attempts,
             n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
             n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
+            JSON.stringify(n.shared ?? []),
           );
         });
         db.exec("COMMIT");
@@ -346,6 +353,7 @@ export function openStore(data: string): Store {
         title: n.title,
         prompt: n.prompt,
         files: JSON.parse(n.files) as string[],
+        shared: JSON.parse(n.shared) as string[],
         agent: n.agent as Node["agent"],
         branch: n.branch,
         worktree: n.worktree,
