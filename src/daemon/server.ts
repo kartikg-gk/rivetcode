@@ -19,7 +19,7 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy", "setup"];
+const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy", "setup", "clean.onMerge"];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -183,6 +183,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   });
   const scheduler = createScheduler({
     data, runFile, store, write, runtime, agents, launches, replan, github,
+    cleanOnMerge: async (run) => (await write(() => store.getConfig(run.project)))["clean.onMerge"] === "true",
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
   });
@@ -481,6 +482,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         throw new HttpError(400, `key must be one of ${CONFIG_KEYS.join(", ")}`);
       }
       if (payload.value !== null && typeof payload.value !== "string") throw new HttpError(400, "value must be a string or null");
+      if (payload.key === "clean.onMerge" && payload.value !== null && payload.value !== "true" && payload.value !== "false") {
+        throw new HttpError(400, "clean.onMerge must be true or false");
+      }
       try {
         await write(() => store.setConfig(project, payload.key as string, payload.value as string | null));
       } catch (error) { throw new HttpError(400, (error as Error).message); }

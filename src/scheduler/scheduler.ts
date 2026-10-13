@@ -7,10 +7,11 @@ import {
 import { normalizePermission } from "../agents/command.js";
 import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
-import type { Run, Store } from "../store.js";
+import type { PullRequest, Run, Store } from "../store.js";
 import { claimsOverlap, reopen, setStatus, type Node, type Status } from "../tree.js";
 import { prStatus, type GitHub } from "../github/github.js";
 import { conflictPrompt, leafPrompt } from "./prompts.js";
+import { cleanRun } from "./runs.js";
 
 // Agents run without a terminal for now, so they need leave to edit files and to run
 // rivet and git on their own; a project can widen or narrow this.
@@ -37,6 +38,8 @@ export type SchedulerDeps = {
   replan?(run: Run, node: Node, why: string): Promise<string | null>;
   // GitHub access for a run's repository; without it there are no pull requests.
   github?(run: Run): Promise<GitHub>;
+  // Whether a run's worktrees go away once its pull request is merged (off unless set).
+  cleanOnMerge?(run: Run): Promise<boolean>;
   // Called with every problem the scheduler could not handle itself (for logs and tests).
   onError?(error: unknown): void;
 };
@@ -495,11 +498,19 @@ export function createScheduler(d: SchedulerDeps) {
     if (!pr) return null;
     const run = await load(runId);
     const root = run.nodes[0]!;
-    if (root.prStatus === "merged" || root.prStatus === "terminated") return root.prStatus;
+    if (root.prStatus === "merged") {
+      await cleanAfterMerge(run, pr);
+      return "merged";
+    }
+    if (root.prStatus === "terminated") return root.prStatus;
     const github = await d.github(run);
     const facts = await github.facts(pr.number);
     const status = prStatus(facts);
     await d.write(() => d.store.updateNode(runId, root.id, { prStatus: status }));
+    if (status === "merged") {
+      await cleanAfterMerge(await load(runId), pr);
+      return status;
+    }
     const key = `${status}:${facts.mergeability}:${facts.headSha}`;
     // Work is already under way, or this exact state was handled before.
     if (pr.handled === key || root.status !== "done") return status;
@@ -521,6 +532,17 @@ export function createScheduler(d: SchedulerDeps) {
     }
     await d.write(() => d.store.setPr(runId, { ...pr, handled: key }));
     return status;
+  }
+
+  // Once the pull request is merged and no agent is at work, the run's worktrees go
+  // (only when the project asks for it). Branches stay, and a worktree with uncommitted
+  // work is never forced: it is kept and listed. Tried once per run.
+  async function cleanAfterMerge(run: Run, pr: PullRequest): Promise<void> {
+    if (pr.handled?.startsWith("cleaned") || !(await d.cleanOnMerge?.(run))) return;
+    if (run.nodes.some((n) => n.status === "running" || n.status === "integrating")) return;
+    const { kept } = await cleanRun(d.data, run);
+    await d.write(() => d.store.setPr(run.id, { ...pr, handled: kept.length ? `cleaned; kept ${kept.join(", ")}` : "cleaned" }));
+    if (kept.length) report(new Error(`run ${run.id}: kept worktrees with uncommitted work: ${kept.join(", ")}`));
   }
 
   let watcher: NodeJS.Timeout | undefined;
