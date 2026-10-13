@@ -2,6 +2,7 @@ import { appendFile, readFile, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { git } from "../git.js";
 import { defaultProjectId } from "../paths.js";
+import { totalTokens, type TokenUse } from "../usage.js";
 import type { Run } from "../store.js";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -348,6 +349,12 @@ export function renderRun(run: Run, live: Record<string, boolean>, now: number, 
   return lines;
 }
 
+// Tokens only: on a subscription a price would not be what the run cost.
+export function usageLine(u: { conversations: number; tokens: TokenUse }): string {
+  const t = u.tokens;
+  return `usage: ${totalTokens(t)} tokens over ${u.conversations} agent conversations (input ${t.input}, cache write ${t.cacheWrite}, cache read ${t.cacheRead}, output ${t.output})`;
+}
+
 async function status(args: string[], io: CliIo): Promise<number> {
   const [runId] = args;
   if (!runId) {
@@ -360,8 +367,10 @@ async function status(args: string[], io: CliIo): Promise<number> {
   }
   const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
     run: Run; live: Record<string, boolean>; now: string; pr: { url: string } | null; noSignal?: string[];
+    usage?: { conversations: number; tokens: TokenUse };
   };
   for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.noSignal)) io.out(line);
+  if (result.usage && result.usage.conversations > 0) io.out(usageLine(result.usage));
   if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.nodes[0]!.prStatus ?? "pr_open"})`);
   const { conflicts } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}/radar`, undefined, COMMAND_TIMEOUT_MS)
     .catch(() => ({ conflicts: [] })) as { conflicts: { a: string; b: string; files: string[] }[] };

@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { killRuleVerdict, runBench, type ModeResult } from "../src/bench/bench.js";
-import { claudeSessionTokens } from "../src/bench/tokens.js";
+import { claudeSessionTokens } from "../src/usage.js";
 import type { PlanNode } from "../src/tree.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
