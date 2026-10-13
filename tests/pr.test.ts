@@ -138,7 +138,8 @@ describe("watching the pull request", () => {
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     gh.annotations[9] = [{ path: "a.txt" }];
     const { run } = await until(() => runOf(runId), (r) => r.run.nodes[1]!.attempts === 2 && r.run.nodes[0]!.status === "done" && (r.pr?.handled ?? "").startsWith("ci_failed"));
-    expect(run.nodes[1]!.summary).toMatch(/CI failed on the pull request in: a\.txt/);
+    // Fixed and finished: the CI failure no longer stands on the leaf.
+    expect(run.nodes[1]!.summary ?? null).toBeNull();
     expect(run.nodes[2]!.attempts).toBe(1);
     // Fixed once; the same failure is not acted on again.
     await new Promise((r) => setTimeout(r, 600));

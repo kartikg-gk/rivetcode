@@ -10,7 +10,7 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { claimsOverlap, reopen, setStatus, type Node, type Status } from "../tree.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { conflictPrompt, leafPrompt } from "./prompts.js";
+import { checkNote, conflictPrompt, leafPrompt } from "./prompts.js";
 import { cleanRun } from "./runs.js";
 
 // Agents run without a terminal for now, so they need leave to edit files and to run
@@ -97,6 +97,12 @@ export function createScheduler(d: SchedulerDeps) {
     const config = await d.write(() => d.store.getConfig(run.project));
     const model = config["worker.model"]?.trim();
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    // The agent must be able to run what Rivet will judge its work by.
+    for (const command of [config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
+      allowedTools.push(`Bash(${command})`, `Bash(${command}:*)`);
+    }
+    const check = config.check?.trim();
+    if (check && prompt !== undefined && node.kind === "leaf" && node.agent !== "fake") prompt += checkNote(check);
     // interactive: the agent's own app in a terminal you can attach to; headless: it runs to the end on its own.
     const headless = config["worker.mode"] !== "interactive";
     const argv = await agent.launchCommand({
@@ -183,7 +189,8 @@ export function createScheduler(d: SchedulerDeps) {
     const node = nodeOf(run, nodeId);
     if (node.status !== "running" || node.finishedAt) return;
     await commitLeftovers(node.worktree, `rivet: save work left uncommitted by "${node.title}"`);
-    await d.write(() => d.store.updateNode(runId, nodeId, { finishedAt: new Date().toISOString() }));
+    // Any failure noted on an earlier attempt is over now.
+    await d.write(() => d.store.updateNode(runId, nodeId, { finishedAt: new Date().toISOString(), summary: null }));
     if (node.parentId === null) {
       // A single-leaf run: the leaf is the root, nothing to merge into.
       await completeRoot(runId);
