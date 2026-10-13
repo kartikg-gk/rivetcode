@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { readRunFile } from "../runfile.js";
 import { makePlan, planFiles, renderPlan, type PlannerRunner } from "../planner/planner.js";
 import { claimsOverlap, type PlanNode } from "../tree.js";
+import type { Probes } from "./doctor.js";
 import { agentSessionIdOf, deriveActivity } from "./activity.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
 
@@ -21,6 +22,8 @@ export type CliIo = {
   planner?(repo: string): PlannerRunner;
   // The real terminal, for attach (raw keys in, resize events).
   tty?: { input: NodeJS.ReadStream; output: NodeJS.WriteStream };
+  // Replaces what doctor checks on this machine (tests).
+  doctorProbes?: Probes;
   // Starts the daemon in the background (absent in tests that do not want it).
   startDaemon?(): Promise<void>;
   // Writes output exactly as received (a session's screen), without a newline.
@@ -45,6 +48,7 @@ const USAGE = `usage: rivet <command>
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
   panes <run>                           show every running agent of a run side by side
   daemon start|stop|status              run or control the background daemon
+  doctor                                check what Rivet needs on this machine
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
                                         report this session's state (inside an agent)
@@ -516,6 +520,24 @@ async function ensureDaemon(io: CliIo): Promise<void> {
   }
 }
 
+async function doctorCommand(io: CliIo): Promise<number> {
+  const { doctor, realProbes } = await import("./doctor.js");
+  let probes = io.doctorProbes;
+  if (!probes) {
+    const { findClaude, findCodex } = await import("../agents/locate.js");
+    const { loadPty } = await import("../runtime/runtime.js");
+    const { githubToken } = await import("../github/github.js");
+    const remote = (await git(["remote", "get-url", "origin"], io.cwd).catch(() => "")).trim();
+    probes = realProbes({
+      findClaude: () => findClaude(), findCodex: () => findCodex(), loadPty: () => loadPty() !== null,
+      daemonUp: () => daemonUp(io), githubToken: () => githubToken(io.env, remote),
+    });
+  }
+  const checks = await doctor(dataDirFrom(io.env), probes);
+  for (const c of checks) io.out(`${(c.level === "fail" ? "FAIL" : c.level).padEnd(5)} ${c.name.padEnd(10)} ${c.message}`);
+  return checks.some((c) => c.level === "fail") ? 1 : 0;
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
@@ -526,6 +548,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "report": return await report(args, io);
       case "send": return await send(args, io);
       case "daemon": return await daemon(args, io);
+      case "doctor": return await doctorCommand(io);
       case "run": return await run(args, io);
       case "plan": return await planCommand(args, io);
       case "attach": return await attach(args, io);
