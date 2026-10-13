@@ -351,10 +351,13 @@ export function renderRun(run: Run, live: Record<string, boolean>, now: number, 
   return lines;
 }
 
-// Tokens only: on a subscription a price would not be what the run cost.
-export function usageLine(u: { conversations: number; tokens: TokenUse }): string {
+// Tokens, not money: on a subscription a price would not be what the run cost. The
+// price-weighted figure counts the run in plain input tokens, so cheap cache reads do
+// not dominate it.
+export function usageLine(u: { conversations: number; tokens: TokenUse; inputEquivalent?: number }): string {
   const t = u.tokens;
-  return `usage: ${totalTokens(t)} tokens over ${u.conversations} agent conversations (input ${t.input}, cache write ${t.cacheWrite}, cache read ${t.cacheRead}, output ${t.output})`;
+  const weighted = u.inputEquivalent !== undefined ? `, worth ${u.inputEquivalent} input tokens at list-price ratios` : "";
+  return `usage: ${totalTokens(t)} tokens over ${u.conversations} agent conversations${weighted} (input ${t.input}, cache write ${t.cacheWrite}, cache read ${t.cacheRead}, output ${t.output})`;
 }
 
 async function status(args: string[], io: CliIo): Promise<number> {
@@ -369,7 +372,7 @@ async function status(args: string[], io: CliIo): Promise<number> {
   }
   const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
     run: Run; live: Record<string, boolean>; now: string; pr: { url: string } | null; noSignal?: string[];
-    usage?: { conversations: number; tokens: TokenUse };
+    usage?: { conversations: number; tokens: TokenUse; inputEquivalent?: number };
   };
   for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.noSignal)) io.out(line);
   if (result.usage && result.usage.conversations > 0) io.out(usageLine(result.usage));

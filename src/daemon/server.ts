@@ -14,7 +14,7 @@ import { radar } from "../scheduler/radar.js";
 import { cleanRun, prepareRun, RunInputError, SetupError } from "../scheduler/runs.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
-import { runTokens } from "../usage.js";
+import { runUsage } from "../usage.js";
 import { ACTIVITY_STATES, noSignal, type ActivityState, type Node } from "../tree.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
@@ -430,7 +430,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const silent = run.nodes.filter((n) => noSignal(n, at, live[n.id]!, getAgent(n.agent).signals)).map((n) => n.id);
         // Every conversation its agents had (retries and conflict fixes too), from their own files.
         const conversations = await write(() => store.conversations(run.id));
-        const usage = { conversations: conversations.length, tokens: runTokens(conversations) };
+        const usage = { conversations: conversations.length, ...runUsage(conversations) };
         reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, now: new Date(at).toISOString() });
         return;
       }
