@@ -370,3 +370,26 @@ describe("attach and panes", () => {
     expect(out.join("\n")).toMatch(/no agent of run r1 is running/);
   });
 });
+
+describe("daemon autostart", () => {
+  it("starts the daemon for a command you type, once, and never for agent commands", async () => {
+    let starts = 0;
+    const cli: CliIo = { ...io({}), startDaemon: async () => { starts++; daemon = await startDaemon({ data, runFile, port: 0 }); } };
+    expect(await runCli(["status"], cli)).toBe(0);
+    expect(starts).toBe(1);
+    expect(err.join("\n")).toMatch(/starting the daemon in the background/);
+    expect(await runCli(["status"], cli)).toBe(0);
+    expect(starts).toBe(1);
+    await daemon!.stop();
+    daemon = undefined;
+    expect(await runCli(["report", "--done", "--note", "x"], { ...cli, env: { ...cli.env, RIVET_SESSION_ID: "r1-root.1" } })).toBe(1);
+    expect(await runCli(["hooks", "claude-code", "stop"], { ...cli, env: { ...cli.env, RIVET_SESSION_ID: "r1-root.1" } })).toBe(0);
+    expect(starts).toBe(1);
+  });
+
+  it("can be turned off, and explains a daemon that never comes up", async () => {
+    const off: CliIo = { ...io({ RIVET_NO_AUTOSTART: "1" }), startDaemon: async () => { throw new Error("should not start"); } };
+    expect(await runCli(["status"], off)).toBe(1);
+    expect(err.join("\n")).toMatch(/daemon is not running/);
+  });
+});

@@ -21,6 +21,8 @@ export type CliIo = {
   planner?(repo: string): PlannerRunner;
   // The real terminal, for attach (raw keys in, resize events).
   tty?: { input: NodeJS.ReadStream; output: NodeJS.WriteStream };
+  // Starts the daemon in the background (absent in tests that do not want it).
+  startDaemon?(): Promise<void>;
   // Writes output exactly as received (a session's screen), without a newline.
   raw?(chunk: string): void;
   out(line: string): void;
@@ -489,10 +491,36 @@ async function panes(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
+// Commands you type yourself start the daemon when it is down. Commands agents run
+// (hooks, report, send, sync) never do: their daemon is the one that started them.
+const AUTOSTART = new Set(["run", "plan", "status", "resume", "clean", "project", "pr", "skip", "attach", "panes"]);
+const AUTOSTART_WAIT_MS = 15_000;
+
+async function daemonUp(io: CliIo): Promise<boolean> {
+  try {
+    await callDaemon(io.env, "GET", "/healthz", undefined, 2_000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureDaemon(io: CliIo): Promise<void> {
+  if (!io.startDaemon || io.env.RIVET_NO_AUTOSTART === "1" || (await daemonUp(io))) return;
+  io.err("rivet: starting the daemon in the background");
+  await io.startDaemon();
+  const end = Date.now() + AUTOSTART_WAIT_MS;
+  while (!(await daemonUp(io))) {
+    if (Date.now() > end) throw new Error(`the daemon did not come up within ${AUTOSTART_WAIT_MS / 1000} s; see ${join(dataDirFrom(io.env), "daemon.log")}`);
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
   try {
+    if (AUTOSTART.has(command ?? "")) await ensureDaemon(io);
     switch (command) {
       case "hooks": return await hooks(args, io);
       case "report": return await report(args, io);
