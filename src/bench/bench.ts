@@ -1,8 +1,9 @@
-import { mkdir } from "node:fs/promises";
+import { cp, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Agent } from "../agents/agent.js";
 import { startDaemon } from "../daemon/server.js";
 import { git } from "../git.js";
+import { runCommand } from "../merge.js";
 import type { Run } from "../store.js";
 import type { Node, PlanNode } from "../tree.js";
 import { waitForTrash } from "../worktree.js";
@@ -17,6 +18,11 @@ export type BenchSpec = {
   test?: string;
   // Check after every merge.
   check?: string;
+  // Commands run in every new worktree before agents start, one per line.
+  setup?: string;
+  // A held-out test the agents never see: once a mode's run is done, the files in
+  // `files` (a folder) are copied into the result at `into` and `command` decides.
+  accept?: { files: string; into: string; command: string };
   model?: string;
   permission?: string;
   timeoutMinutes?: number;
@@ -32,8 +38,13 @@ export type ModeResult = {
   leaves: number;
   attempts: number;
   escalations: number;
-  // Merges that needed the parent's agent to resolve a conflict, plus unresolved ones.
+  // Turns of a parent's agent on a merge conflict (parent conversations minus wiring).
   conflicts: number;
+  // Every agent conversation of the run: leaves, retries, conflict fixes, wiring.
+  conversations: number;
+  // The held-out acceptance test; null when there is none or the run did not finish.
+  accepted: boolean | null;
+  acceptOutput?: string;
   tokens: TokenUse;
   // The same tokens weighted by price, counted in plain input tokens.
   inputEquivalent: number;
@@ -70,10 +81,11 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
   // Every conversation of the run, retries and conflict fixes included.
   let tokens: TokenUse = NO_TOKENS;
   let inputEquivalent = 0;
+  let byNode: Record<string, number> = {};
   try {
     const project = repo.split(/[\\/]/).pop()!.toLowerCase().trim().replace(/ /g, "-");
     const settings: Record<string, string | undefined> = {
-      test: spec.test, check: spec.check, "worker.model": spec.model, "worker.permission": spec.permission,
+      test: spec.test, check: spec.check, setup: spec.setup, "worker.model": spec.model, "worker.permission": spec.permission,
     };
     for (const [key, value] of Object.entries(settings)) {
       if (value) await api("PUT", `/api/v1/projects/${encodeURIComponent(project)}/config`, { key, value });
@@ -89,7 +101,7 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
         await daemon.idle();
         const final = await api("GET", `/api/v1/runs/${runId}`);
         run = final.run as Run;
-        ({ tokens, inputEquivalent } = final.usage as { tokens: TokenUse; inputEquivalent: number });
+        ({ tokens, inputEquivalent, byNode } = final.usage as { tokens: TokenUse; inputEquivalent: number; byNode: Record<string, number> });
         break;
       }
       if (Date.now() > deadline) { error = `timed out after ${spec.timeoutMinutes ?? 30} minutes`; break; }
@@ -102,16 +114,32 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
     await waitForTrash();
   }
   const nodes = run?.nodes ?? [];
+  const done = nodes[0]?.status === "done" && !error;
+  let accepted: boolean | null = null;
+  let acceptOutput: string | undefined;
+  if (done && spec.accept) {
+    const root = nodes[0]!.worktree;
+    await cp(spec.accept.files, join(root, spec.accept.into), { recursive: true });
+    const result = await runCommand(spec.accept.command, root, 10 * 60_000);
+    accepted = result.ok;
+    if (!result.ok) acceptOutput = result.output.slice(-3000);
+  }
+  const parents = nodes.filter((n) => n.kind === "parent");
+  const parentTurns = parents.reduce((a, n) => a + (byNode[n.id] ?? 0), 0);
+  const wiring = parents.filter((n) => n.shared.length > 0 && (byNode[n.id] ?? 0) > 0).length;
   return {
     mode,
     runId: run?.id ?? "",
     rootStatus: nodes[0]?.status ?? "not started",
-    passed: nodes[0]?.status === "done" && !error,
+    passed: done && accepted !== false,
     seconds: Math.round((Date.now() - started) / 100) / 10,
     leaves: nodes.filter((n) => n.kind === "leaf").length,
     attempts: nodes.filter((n) => n.kind === "leaf").reduce((a, n) => a + n.attempts, 0),
     escalations: nodes.filter((n) => n.status === "escalated").length,
-    conflicts: nodes.filter((n) => n.kind === "parent" && (n.activity !== undefined || /conflicts in/.test(n.summary ?? ""))).length,
+    conflicts: Math.max(0, parentTurns - wiring) + parents.filter((n) => /conflicts in/.test(n.summary ?? "")).length,
+    conversations: Object.values(byNode).reduce((a, b) => a + b, 0),
+    accepted,
+    ...(acceptOutput ? { acceptOutput } : {}),
     tokens,
     inputEquivalent,
     ...(error ? { error } : {}),
@@ -145,5 +173,6 @@ export async function runBench(spec: BenchSpec, o: { workDir: string; agents?: (
 
 export function formatResult(r: ModeResult): string {
   const tokens = r.tokens.input + r.tokens.cacheWrite + r.tokens.cacheRead + r.tokens.output;
-  return `${r.mode.padEnd(8)} ${r.passed ? "pass" : "FAIL"}  ${String(r.seconds).padStart(7)}s  leaves ${r.leaves}  attempts ${r.attempts}  conflicts ${r.conflicts}  escalated ${r.escalations}  tokens ${tokens} (out ${r.tokens.output}, worth ${r.inputEquivalent} input)${r.error ? `  error: ${r.error}` : ""}`;
+  const accept = r.accepted === null ? "" : `  accept ${r.accepted ? "ok" : "FAILED"}`;
+  return `${r.mode.padEnd(8)} ${r.passed ? "pass" : "FAIL"}${accept}  ${String(r.seconds).padStart(7)}s  leaves ${r.leaves}  attempts ${r.attempts}  conversations ${r.conversations}  conflicts ${r.conflicts}  escalated ${r.escalations}  tokens ${tokens} (out ${r.tokens.output}, worth ${r.inputEquivalent} input)${r.error ? `  error: ${r.error}` : ""}`;
 }

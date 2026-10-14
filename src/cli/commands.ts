@@ -437,6 +437,7 @@ async function bench(args: string[], io: CliIo): Promise<number> {
   const full = resolve(io.cwd, specFile);
   const spec = JSON.parse(await readFile(full, "utf8"));
   spec.repo = resolve(dirname(full), spec.repo);
+  if (spec.accept) spec.accept.files = resolve(dirname(full), spec.accept.files);
   const workDir = await mkdtemp(join(tmpdir(), "rivet bench "));
   io.out(`benchmark "${spec.name}" in ${workDir}`);
   const result = await runBench(spec, { workDir, log: io.out });

@@ -47,7 +47,7 @@ describe("runBench", () => {
 describe("killRuleVerdict", () => {
   const r = (mode: string, over: Partial<ModeResult>): ModeResult => ({
     mode, runId: "r", rootStatus: "done", passed: true, seconds: 100, leaves: 2, attempts: 2, escalations: 0, conflicts: 0,
-    tokens: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }, inputEquivalent: 0, ...over,
+    tokens: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }, inputEquivalent: 0, conversations: 0, accepted: null, ...over,
   });
   it("keeps the tree only when it passes and is no slower, with no more conflicts", () => {
     expect(killRuleVerdict([r("flat", {}), r("tree", { seconds: 105 })])).toMatch(/tree beats flat/);
@@ -67,4 +67,21 @@ describe("claudeSessionTokens", () => {
     expect(claudeSessionTokens("s1", root)).toEqual({ input: 2, cacheWrite: 20, cacheRead: 200, output: 12 });
     expect(claudeSessionTokens("missing", root)).toEqual({ input: 0, cacheWrite: 0, cacheRead: 0, output: 0 });
   });
+});
+
+describe("held-out acceptance", () => {
+  it("copies the hidden test into the finished result and lets it decide", async () => {
+    const hidden = join(work, "hidden");
+    await mkdir(hidden, { recursive: true });
+    await writeFile(join(hidden, "check.js"), "require('fs').accessSync('a.txt'); if (require('fs').readFileSync('a.txt', 'utf8') !== 'right') process.exit(1);");
+    const spec = (content: string) => ({
+      name: "accept", repo, task: "write a.txt",
+      accept: { files: hidden, into: "hidden", command: "node hidden/check.js" },
+      modes: { single: leaf("a", { files: { "a.txt": content }, commit: "a" }) },
+    });
+    const good = await runBench(spec("right"), { workDir: join(work, "good") });
+    expect(good.results[0]).toMatchObject({ passed: true, accepted: true });
+    const bad = await runBench(spec("wrong"), { workDir: join(work, "bad") });
+    expect(bad.results[0]).toMatchObject({ passed: false, accepted: false, rootStatus: "done" });
+  }, 120_000);
 });

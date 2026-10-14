@@ -430,7 +430,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const silent = run.nodes.filter((n) => noSignal(n, at, live[n.id]!, getAgent(n.agent).signals)).map((n) => n.id);
         // Every conversation its agents had (retries and conflict fixes too), from their own files.
         const conversations = await write(() => store.conversations(run.id));
-        const usage = { conversations: conversations.length, ...runUsage(conversations) };
+        const byNode: Record<string, number> = {};
+        for (const c of conversations) byNode[c.nodeId] = (byNode[c.nodeId] ?? 0) + 1;
+        const usage = { conversations: conversations.length, byNode, ...runUsage(conversations) };
         reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, now: new Date(at).toISOString() });
         return;
       }
