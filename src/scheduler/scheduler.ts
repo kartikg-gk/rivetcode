@@ -18,6 +18,28 @@ import { cleanRun } from "./runs.js";
 export const DEFAULT_PERMISSION = "accept-edits";
 export const DEFAULT_ALLOWED_TOOLS = "Bash(rivet:*),Bash(git:*)";
 
+// Runners whose next word names the tool ("uv run ruff", "npx tsc"); for the rest the
+// first word is the tool. Bare interpreters are never opened up as a whole.
+const RUNNERS = [["uv", "run"], ["poetry", "run"], ["pipx", "run"], ["python", "-m"], ["python3", "-m"], ["npm", "run"], ["pnpm", "run"], ["yarn", "run"], ["npx"], ["pnpx"], ["bunx"]];
+const INTERPRETERS = new Set(["node", "python", "python3", "py", "bash", "sh", "cmd", "powershell", "pwsh", "deno", "bun"]);
+
+// Permission rules that let an agent run a project command the way it will need to:
+// the whole command, each step of a compound one (agents' permission checks look at
+// every step of "a && b" on its own), and each step's tool with other arguments
+// (for example "uv run ruff check --fix" next to the configured "uv run ruff check src").
+export function commandRules(command: string): string[] {
+  const rules = new Set<string>([`Bash(${command})`, `Bash(${command}:*)`]);
+  for (const step of command.split(/&&|\|\||;|\|/).map((s) => s.trim()).filter(Boolean)) {
+    rules.add(`Bash(${step})`);
+    rules.add(`Bash(${step}:*)`);
+    const words = step.split(/\s+/);
+    const runner = RUNNERS.find((r) => r.every((w, i) => words[i] === w));
+    if (runner && words.length > runner.length) rules.add(`Bash(${words.slice(0, runner.length + 1).join(" ")}:*)`);
+    else if (!runner && !INTERPRETERS.has(words[0]!)) rules.add(`Bash(${words[0]}:*)`);
+  }
+  return [...rules];
+}
+
 // A leaf gets this many launches before Rivet stops retrying and asks the user.
 export const MAX_ATTEMPTS = 2;
 const OUTPUT_FOR_RETRY = 40;
@@ -101,7 +123,7 @@ export function createScheduler(d: SchedulerDeps) {
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
     // The agent must be able to run what Rivet will judge its work by.
     for (const command of [config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
-      allowedTools.push(`Bash(${command})`, `Bash(${command}:*)`);
+      for (const rule of commandRules(command)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
     }
     const check = config.check?.trim();
     if (check && prompt !== undefined && node.kind === "leaf" && node.agent !== "fake" && !o.resume) prompt += checkNote(check);
@@ -471,8 +493,10 @@ export function createScheduler(d: SchedulerDeps) {
     if (test) {
       const result = await runCommand(test, root.worktree, testTimeout);
       if (!result.ok) {
-        await transition(runId, root.id, root.kind === "leaf" ? "escalated" : "failed",
-          `tests "${test}" failed on the integrated result:\n${result.output}`);
+        const why = `tests "${test}" failed on the integrated result:\n${result.output}`;
+        // A one-leaf run is still a leaf: it gets the same retries as any other.
+        if (root.kind === "leaf") await leafFailed(runId, root.id, why);
+        else await transition(runId, root.id, "failed", why);
         return;
       }
     }

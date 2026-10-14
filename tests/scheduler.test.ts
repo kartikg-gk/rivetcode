@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getAgent, type Agent } from "../src/agents/agent.js";
+import { commandRules } from "../src/scheduler/scheduler.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import type { Run } from "../src/store.js";
@@ -501,5 +502,34 @@ describe("shared files", () => {
     const run = await settled(runId);
     expect(run.nodes[0]).toMatchObject({ status: "escalated", summary: "wiring changed files that are not shared: a.txt" });
     expect((await git(["show", "HEAD:a.txt"], run.nodes[0]!.worktree)).trim()).toBe("a");
+  });
+});
+
+describe("command permissions", () => {
+  it("allows a compound check's whole command, each step, and each step's tool with other arguments", () => {
+    expect(commandRules("uv run ruff check src tests && uv run pytest -q -x")).toEqual([
+      "Bash(uv run ruff check src tests && uv run pytest -q -x)", "Bash(uv run ruff check src tests && uv run pytest -q -x:*)",
+      "Bash(uv run ruff check src tests)", "Bash(uv run ruff check src tests:*)", "Bash(uv run ruff:*)",
+      "Bash(uv run pytest -q -x)", "Bash(uv run pytest -q -x:*)", "Bash(uv run pytest:*)",
+    ]);
+  });
+
+  it("never opens up a bare interpreter", () => {
+    expect(commandRules("node scripts/check.mjs")).toEqual(["Bash(node scripts/check.mjs)", "Bash(node scripts/check.mjs:*)"]);
+    expect(commandRules("npx tsc --noEmit")).toContain("Bash(npx tsc:*)");
+    expect(commandRules("make test")).toContain("Bash(make:*)");
+  });
+});
+
+describe("one-leaf runs", () => {
+  it("retry a leaf whose test fails on the result, like any other leaf", async () => {
+    await start();
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(projectOf(repo))}/config`, {
+      // Fails the first time it runs, passes after: only a retry can finish the run.
+      key: "test", value: `node -e "const f=process.argv[1]; if (require('fs').existsSync(f)) process.exit(0); require('fs').writeFileSync(f, 'x'); process.exit(1)" "${join(data, "tested-once")}"`,
+    });
+    const runId = await runPlan(leaf("only", { files: { "good.txt": "g" }, commit: "g" }));
+    const run = await settled(runId);
+    expect(run.nodes[0]).toMatchObject({ status: "done", attempts: 2 });
   });
 });
