@@ -506,9 +506,12 @@ export function createScheduler(d: SchedulerDeps) {
       await track(workFinished(runId));
     } else if (!d.runtime.isAlive(sessionOf(run))) {
       if (run.role === "orchestrator") {
-        // It continues its own conversation, so it does not start the same workers again.
-        const note = "Rivet was restarted. Check rivet status before starting anything; your workers may still be running.";
-        await launch(run, note, { resume: true }).catch(() => launch(run, orchestratorPrompt(run))).catch(report);
+        // A terminal agent may keep no conversation to resume, so it starts again and is
+        // told to look first: the workers it started may still be running or done.
+        const note = "Rivet was restarted. Before starting anything, run rivet status: workers you started earlier may still be running or already done.";
+        await launch(run, `${note}
+
+${orchestratorPrompt(run)}`).catch(report);
       } else {
         const note = "Rivet was restarted while you worked; continue from the current state of the worktree.";
         await launch(run, workerPrompt(run, note)).catch(report);

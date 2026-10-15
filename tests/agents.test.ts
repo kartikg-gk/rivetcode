@@ -51,6 +51,10 @@ describe("claude adapter", () => {
     expect(await claude.restoreCommand({ sessionId: "r1-root.1", workspace: ws })).toEqual([
       "claude", "--resume", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77",
     ]);
+    // In a terminal it must not stop at the browser question either.
+    expect(await claude.restoreCommand({ sessionId: "r1-root.1", workspace: ws, headless: false })).toEqual([
+      "claude", "--resume", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77", "--no-chrome",
+    ]);
   });
 
   it("installs the ten Claude Code hooks into .claude/settings.local.json", async () => {

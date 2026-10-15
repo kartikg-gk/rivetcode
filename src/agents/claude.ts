@@ -84,7 +84,9 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
         ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },
-    restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
+    restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({
+      binary, ...cfg, ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+    }),
     installHooks: (workspace) => claudeHooks.install(workspace),
     uninstallHooks: (workspace) => claudeHooks.uninstall(workspace),
     hooksInstalled: (workspace) => claudeHooks.installed(workspace),
