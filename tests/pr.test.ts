@@ -36,9 +36,12 @@ afterEach(async () => {
   for (const d of [repo, origin, data]) await removeRepo(d);
 });
 
+let errors: unknown[] = [];
+
 async function start(config: Record<string, string> = {}): Promise<void> {
+  errors = [];
   daemon = await startDaemon({
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150,
+    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150, onError: (e) => errors.push(e),
     agents: () => getAgent("fake"),
     github: async () => githubClient({ repo: "o/r", token: "t0ken", api: gh.api }),
   });
@@ -205,5 +208,20 @@ describe("radar", () => {
     const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
     const res = await until(async () => (await api("GET", `/api/v1/projects/${encodeURIComponent(project)}/radar`)).json, (j) => j.conflicts.length > 0);
     expect(res.conflicts).toEqual([{ a: one, b: two, files: ["s.txt"] }]);
+  });
+});
+
+describe("runs saved before a run was one session", () => {
+  it("are left alone by the watcher and on restart", async () => {
+    const { openStore } = await import("../src/store.js");
+    const { sessionRun } = await import("./helpers.js");
+    const store = openStore(data);
+    const old = sessionRun(data, { id: "rold", project: "p" });
+    store.saveRun({ ...old, repo, node: { ...old.node, id: "root", branch: "rivet/rold/root", status: "done" } });
+    store.setPr("rold", { number: 99, url: "https://github.com/o/r/pull/99" });
+    store.close();
+    await start();
+    await new Promise((r) => setTimeout(r, 600));
+    expect(errors).toEqual([]);
   });
 });

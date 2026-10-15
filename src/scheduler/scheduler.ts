@@ -429,6 +429,8 @@ export function createScheduler(d: SchedulerDeps) {
     if (!pr) return null;
     const run = await load(runId);
     const node = run.node;
+    // Runs saved before a run was one session are left as they were.
+    if (node.id !== NODE_ID) return null;
     if (node.prStatus === "merged") {
       await terminateAfterMerge(run, pr);
       return "merged";
@@ -499,11 +501,17 @@ export function createScheduler(d: SchedulerDeps) {
   async function recover(runId: string): Promise<void> {
     const run = await load(runId);
     const node = run.node;
-    if (node.status === "running") {
-      if (node.finishedAt) await track(workFinished(runId));
-      else if (!d.runtime.isAlive(sessionOf(run))) {
+    if (node.id !== NODE_ID || node.status !== "running") return;
+    if (node.finishedAt) {
+      await track(workFinished(runId));
+    } else if (!d.runtime.isAlive(sessionOf(run))) {
+      if (run.role === "orchestrator") {
+        // It continues its own conversation, so it does not start the same workers again.
+        const note = "Rivet was restarted. Check rivet status before starting anything; your workers may still be running.";
+        await launch(run, note, { resume: true }).catch(() => launch(run, orchestratorPrompt(run))).catch(report);
+      } else {
         const note = "Rivet was restarted while you worked; continue from the current state of the worktree.";
-        await launch(run, run.role === "worker" ? workerPrompt(run, note) : orchestratorPrompt(run)).catch(report);
+        await launch(run, workerPrompt(run, note)).catch(report);
       }
     }
   }

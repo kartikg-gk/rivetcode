@@ -314,3 +314,18 @@ describe("command permissions", () => {
     expect(commandRules("make test")).toContain("Bash(make:*)");
   });
 });
+
+describe("an orchestrator after a restart", () => {
+  it("comes back running (its own conversation when the agent can resume one)", async () => {
+    await start();
+    const orch = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    await new Promise((r) => setTimeout(r, 300));
+    await daemon!.stop();
+    daemon = undefined;
+    await start();
+    const back = await api("GET", `/api/v1/runs/${orch}`);
+    expect(back.json.run.node).toMatchObject({ status: "running", attempts: 1 });
+    expect(back.json.live).toBe(true);
+    expect(errors).toEqual([]);
+  });
+});

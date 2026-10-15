@@ -217,8 +217,10 @@ describe("terminal sessions", () => {
     const attached = runtime.attach("r1-t", (c) => seen.push(c))!;
     expect(attached.replay).toContain("tty=true");
     await runtime.write("r1-t", "hi");
-    // The typed line arrives with the carriage return that submits it.
-    await until(() => seen.join("").includes('"hi\\r"'));
+    // The text first, then the Enter that submits it on its own, so a terminal app does
+    // not take the Enter as part of a paste.
+    await until(() => seen.join("").includes('"hi"') && seen.join("").includes('"\\r"'));
+    expect(seen.join("")).not.toContain('"hi\\r"');
     runtime.resize("r1-t", 120, 40);
     const done = exited("r1-t");
     runtime.input("r1-t", "q");
