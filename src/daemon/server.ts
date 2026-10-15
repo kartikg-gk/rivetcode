@@ -370,7 +370,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (typeof payload.repo !== "string" || typeof payload.task !== "string") {
         throw new HttpError(400, "repo and task must be strings");
       }
-      const base = optionalString(payload.base, "base");
       const agent = optionalString(payload.agent, "agent");
       const name = optionalString(payload.name, "name");
       const model = optionalString(payload.model, "model");
@@ -379,15 +378,22 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       // A worker started from inside an orchestrator's session reports back to it.
       const from = optionalString(payload.from, "from");
       let orchestrator: string | undefined;
+      let repo = payload.repo;
+      let base = optionalString(payload.base, "base");
       if (from !== undefined) {
         const { runId: fromRun } = session(from);
         const sender = await write(() => store.loadRun(fromRun)).catch(() => null);
-        if (sender?.role === "orchestrator") orchestrator = sessionIdOf(sender.id, sender.node.id);
+        if (sender?.role === "orchestrator") {
+          orchestrator = sessionIdOf(sender.id, sender.node.id);
+          // Its agent runs in its own worktree; a worker belongs to the project, from its base.
+          repo = sender.repo;
+          base ??= sender.base;
+        }
       }
       let run;
       try {
         run = await prepareRun({
-          data, repo: payload.repo, task: payload.task, role,
+          data, repo, task: payload.task as string, role,
           ...(name !== undefined ? { name } : {}), ...(model !== undefined ? { model } : {}), ...(orchestrator ? { orchestrator } : {}),
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
           defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],

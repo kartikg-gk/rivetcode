@@ -245,11 +245,17 @@ describe("spawn, status, resume, clean, project", () => {
     expect(await runCli(["orchestrator", "--agent", "fake", JSON.stringify({ stayFor: 20_000 })], inRepo())).toBe(0);
     const orchestrator = /orchestrator (r\w+) started/.exec(out.join("\n"))![1]!;
     out = [];
-    // Run from inside the orchestrator's session, as its agent would.
+    // Run from inside the orchestrator's own worktree and session, as its agent would.
+    const store = openStore(data);
+    const orchWorktree = store.loadRun(orchestrator).node.worktree;
+    store.close();
     const task = JSON.stringify({ files: { "w.txt": "w" }, commit: "w" });
-    expect(await runCli(["spawn", "--agent", "fake", "--name", "write w", task], inRepo({ RIVET_SESSION_ID: `${orchestrator}-agent` }))).toBe(0);
+    expect(await runCli(["spawn", "--agent", "fake", "--name", "write w", task], { ...io({ RIVET_SESSION_ID: `${orchestrator}-agent` }), cwd: orchWorktree })).toBe(0);
     const worker = /worker (r\w+) started/.exec(out.join("\n"))![1]!;
     await waitFor(worker, "done");
+    // The worker belongs to the project: the main checkout and its base, not the orchestrator's branch.
+    const check = openStore(data);
+    try { expect(check.loadRun(worker)).toMatchObject({ repo, base: "main" }); } finally { check.close(); }
     expect(out.join("\n")).toMatch(new RegExp(`\\[started by ${orchestrator}-agent\\]`));
     const db = new DatabaseSync(join(data, "rivet.db"), { readOnly: true });
     try {

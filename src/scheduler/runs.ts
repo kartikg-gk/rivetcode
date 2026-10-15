@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { cp, mkdir, realpath } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { git } from "../git.js";
 import { runCommand } from "../merge.js";
 import { assertProjectId, branchName, defaultProjectId, worktreePath } from "../paths.js";
@@ -35,8 +35,12 @@ export type NewRun = {
   setupFor?(project: string): string[];
 };
 
+// The main checkout, also when asked from inside a linked worktree (an agent's own), so
+// a new session never starts from another session's worktree.
 async function repoRoot(dir: string): Promise<string> {
   try {
+    const common = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], dir)).trim();
+    if (basename(common) === ".git") return await realpath(dirname(common));
     return await realpath((await git(["rev-parse", "--show-toplevel"], dir)).trim());
   } catch {
     throw new RunInputError(`not a git repository: ${dir}`);

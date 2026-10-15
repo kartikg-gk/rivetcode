@@ -167,6 +167,8 @@ async function daemon(args: string[], io: CliIo): Promise<number> {
         data: dataDirFrom(io.env),
         runFile,
         ...(io.env.RIVET_PORT !== undefined ? { port: Number(io.env.RIVET_PORT) } : {}),
+        // Problems handled in the background (a pull request that could not open) go to the log.
+        onError: (e) => io.err(`${new Date().toISOString()} ${(e as Error)?.message ?? String(e)}`),
       });
       io.out(`rivet daemon listening on 127.0.0.1:${d.port} (pid ${process.pid})`);
       await d.stopped;
