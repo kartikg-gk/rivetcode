@@ -1,76 +1,65 @@
 import type { Run } from "../store.js";
-import type { Node } from "../tree.js";
 
-// What a leaf's agent is told. The fake agent's prompt is a script, so it gets it verbatim.
-export function leafPrompt(run: Run, node: Node, retry?: string): string {
-  if (node.agent === "fake") return node.prompt;
+// What a worker's agent is told. The fake agent's prompt is a script, so it gets it verbatim.
+export function workerPrompt(run: Run, retry?: string): string {
+  if (run.node.agent === "fake") return run.node.prompt;
   const lines = [
-    `You are one of several coding agents working on this task together: ${run.task}`,
+    `Your task: ${run.task}`,
     "",
-    `Your part: ${node.title}`,
-    node.prompt,
-  ];
-  if (node.files.length > 0) {
-    lines.push("", `Files you own (stay within them where you can): ${node.files.join(", ")}`);
-  }
-  const wired = sharedAbove(run, node);
-  if (wired.length > 0) {
-    lines.push(
-      "", `Do not edit these files; they are wired in once every part is merged: ${wired.join(", ")}`,
-      "Test your code by importing it from its own file, not through them.",
-    );
-  }
-  lines.push(
-    "",
-    "You work in your own git worktree on your own branch. Commit your work as you go.",
-    "Other agents work on the other parts in parallel; do not do their parts.",
-    `When your part is finished, run: rivet report --done --note "<one line summary>"`,
+    "You work alone in your own git worktree and branch; other agents may work on other tasks",
+    "in their own worktrees. Keep your changes to this task, and commit as you go.",
+    `When the task is finished, run: rivet report --done --note "<one line summary>"`,
     `If you are stuck, run: rivet report --stuck --note "<what blocks you>"`,
-    `If you need a decision from the user, run: rivet report --needs-input --note "<question>"`,
-  );
-  if (retry) lines.push("", "A previous attempt at this part failed:", retry, "", "Fix that and finish the part.");
+    `If you need a decision, run: rivet report --needs-input --note "<question>"`,
+    "Do not use your own subagent or task tools to hand work off; finish it here.",
+  ];
+  if (retry) lines.push("", "A previous attempt at this task failed:", retry, "", "Fix that and finish the task.");
   return lines.join("\n");
 }
 
-// The project's check runs after every merge and a failure sends the work back, so a
-// leaf runs it itself before saying it is done.
+// The project's check runs when a worker says it is done and a failure sends the work
+// back, so a worker runs it itself first.
 export function checkNote(check: string): string {
-  return `\nBefore you report done, run the project's check and make it pass: ${check}\nRivet runs it again after merging your work; if it fails, the part comes back to you.`;
+  return `\nBefore you report done, run the project's check and make it pass: ${check}\nRivet runs it again when you report done; if it fails, the task comes back to you.`;
 }
 
-// The shared files of every parent above a node: a part leaves them alone.
-export function sharedAbove(run: Run, node: Node): string[] {
-  const files: string[] = [];
-  for (let p = run.nodes.find((n) => n.id === node.parentId); p; p = run.nodes.find((n) => n.id === p!.parentId)) {
-    files.push(...p.shared);
-  }
-  return files;
-}
-
-// What a parent's agent is told once all its parts are merged: wire them into the
-// shared files, and nothing else.
-export function wiringPrompt(run: Run, parent: Node, children: Node[]): string {
-  if (parent.agent === "fake") return parent.prompt;
+// What an orchestrator's agent is told: it plans and coordinates, workers do the work.
+export function orchestratorPrompt(run: Run): string {
+  if (run.node.agent === "fake") return run.node.prompt;
   return [
-    `You integrate work for the task: ${run.task}`,
-    `Every part of "${parent.title}" is now merged into this branch:`,
-    ...children.map((c) => `  - ${c.title}${c.files.length ? ` (${c.files.join(", ")})` : ""}`),
+    `You coordinate coding work on the project "${run.project}" (${run.repo}). Workers do the work;`,
+    "you do not change code yourself. Each worker is an agent in its own git worktree and",
+    "branch, started from the base branch, and opens its own pull request when it is done.",
     "",
-    `Wire them into these shared files, and change no other file: ${parent.shared.join(", ")}`,
-    "Read the merged parts to see what each one needs there (exports, registrations, routes).",
-    "Do not add features or change the parts themselves. Commit your change.",
+    "How you work:",
+    "- Look at what is already running before starting anything, so work is not duplicated.",
+    "- Split what the user asks for into tasks that do not depend on each other, and start",
+    "  one worker per task. Work that depends on other work stays in one task.",
+    "- Give every worker a clear, self-contained task with the expected result and how to verify it.",
+    "- Follow progress, answer workers' questions, and tell the user where things stand.",
+    "- Never edit files, commit, push or open pull requests here. If asked to, start a worker.",
+    "",
+    "Commands:",
+    `- rivet spawn --name "<label, at most 100 characters>" [--agent claude|codex] [--model <id>] "<task>"`,
+    "    starts a worker",
+    "- rivet status [<run>]   lists sessions, or shows one with its pull request",
+    `- rivet send --session <run>-agent --message "<text>"   messages a worker`,
+    "- rivet stop <run>   stops a worker",
+    "",
+    "Workers' reports (done, stuck, needs input) arrive here as messages.",
+    ...(run.task ? ["", `The user asks: ${run.task}`] : []),
   ].join("\n");
 }
 
-// What a parent's agent is told when merging a child conflicts. It may only resolve.
-export function conflictPrompt(run: Run, parent: Node, child: Node, conflicts: string[]): string {
-  if (parent.agent === "fake") return parent.prompt;
+// What a worker's agent is told when bringing the latest base into its branch conflicts.
+export function conflictPrompt(run: Run, conflicts: string[]): string {
+  if (run.node.agent === "fake") return run.node.prompt;
   return [
-    `You integrate work for the task: ${run.task}`,
-    `Merging "${child.title}" (branch ${child.branch}) into this branch stopped on conflicts in:`,
+    `Your task was: ${run.task}`,
+    `Merging the latest ${run.base} into your branch stopped on conflicts in:`,
     ...conflicts.map((f) => `  ${f}`),
     "",
-    "Resolve only these conflicts, keeping the intent of both sides. Do not change any other file",
-    "and do not add features. Remove every conflict marker, then stage the files and commit the merge.",
+    "Resolve only these conflicts, keeping the intent of both sides. Do not change any other file.",
+    "Remove every conflict marker, then stage the files and commit the merge.",
   ].join("\n");
 }

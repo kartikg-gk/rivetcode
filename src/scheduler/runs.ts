@@ -3,9 +3,9 @@ import { cp, mkdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { git } from "../git.js";
 import { runCommand } from "../merge.js";
-import { assertProjectId, defaultProjectId } from "../paths.js";
+import { assertProjectId, branchName, defaultProjectId, worktreePath } from "../paths.js";
 import { newRunId, type Run } from "../store.js";
-import { buildTree, TreeError, AGENTS, type Agent, type PlanNode } from "../tree.js";
+import { AGENTS, NODE_ID, ROLES, type Agent, type Role } from "../model.js";
 import { createWorktree, DirtyWorktreeError, removeWorktree } from "../worktree.js";
 
 export class RunInputError extends Error {
@@ -19,7 +19,12 @@ export type NewRun = {
   data: string;
   repo: string;
   task: string;
-  plan: PlanNode;
+  role?: Role;
+  // A short label for lists; at most 100 characters.
+  name?: string;
+  // The orchestrator session that asked for this worker.
+  orchestrator?: string;
+  model?: string;
   base?: string;
   agent?: string;
   // The project's configured default agent, used when no agent is given.
@@ -38,8 +43,8 @@ async function repoRoot(dir: string): Promise<string> {
   }
 }
 
-// Builds the tree and gives every node its worktree: the root branches from the base,
-// every child from its parent's branch. Nothing is left behind if a step fails.
+// One session with its own worktree and branch, started from the base. Nothing is left
+// behind if a step fails.
 export async function prepareRun(o: NewRun): Promise<Run> {
   if (!o.task.trim()) throw new RunInputError("task is empty");
   const repo = await repoRoot(o.repo);
@@ -53,35 +58,32 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   try { assertProjectId(project); } catch (e) { throw new RunInputError((e as Error).message); }
   const agent = (o.agent ?? o.defaultAgentFor?.(project) ?? "claude") as Agent;
   if (!AGENTS.includes(agent)) throw new RunInputError(`unknown agent "${o.agent}"`);
+  const role = o.role ?? "worker";
+  if (!ROLES.includes(role)) throw new RunInputError(`unknown role "${String(role)}"`);
+  const name = (o.name ?? "").trim();
+  if (name.length > 100) throw new RunInputError(`name is ${name.length} characters; at most 100`);
 
   const id = newRunId();
-  let nodes;
+  const node = {
+    id: NODE_ID, title: name || o.task.trim().split(/\r?\n/)[0]!.slice(0, 100), prompt: o.task.trim(), agent,
+    branch: branchName(id, NODE_ID), worktree: worktreePath(o.data, project, id, NODE_ID),
+    status: "pending" as const, attempts: 0,
+  };
+  await createWorktree({ repo, path: node.worktree, branch: node.branch, from: base });
   try {
-    nodes = buildTree({ runId: id, project, dataDir: o.data, plan: o.plan, defaultAgent: agent });
-  } catch (e) {
-    if (e instanceof TreeError) throw new RunInputError(e.message);
-    throw e;
-  }
-
-  const made: { path: string; branch: string }[] = [];
-  try {
-    for (const n of nodes) {
-      const from = n.parentId === null ? base : nodes.find((p) => p.id === n.parentId)!.branch;
-      await createWorktree({ repo, path: n.worktree, branch: n.branch, from });
-      await copyListed(repo, n.worktree, o.copyFor?.(project) ?? []);
-      made.push({ path: n.worktree, branch: n.branch });
-    }
-    // Every worktree is provisioned (e.g. dependencies installed) before any agent starts.
+    await copyListed(repo, node.worktree, o.copyFor?.(project) ?? []);
+    // The worktree is provisioned (e.g. dependencies installed) before its agent starts.
     const steps = o.setupFor?.(project) ?? [];
-    if (steps.length > 0) await Promise.all(nodes.map((n) => runSetup(repo, n.worktree, n.id, steps)));
+    if (steps.length > 0) await runSetup(repo, node.worktree, id, steps);
   } catch (e) {
-    for (const m of made.reverse()) {
-      await removeWorktree(o.data, repo, m.path).catch(() => {});
-      await git(["branch", "-D", m.branch], repo).catch(() => {});
-    }
+    await removeWorktree(o.data, repo, node.worktree).catch(() => {});
+    await git(["branch", "-D", node.branch], repo).catch(() => {});
     throw e;
   }
-  return { id, project, repo, base, task: o.task.trim(), createdAt: new Date().toISOString(), nodes };
+  return {
+    id, project, repo, base, task: o.task.trim(), createdAt: new Date().toISOString(), role, name,
+    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), node,
+  };
 }
 
 // Only the listed files, never everything untracked; a missing one is skipped. They are
@@ -129,18 +131,13 @@ async function runSetup(repo: string, worktree: string, nodeId: string, steps: s
   }
 }
 
-// Removes a run's worktrees. Branches stay (they hold the work); dirty worktrees stay too.
+// Removes a run's worktree. The branch stays (it holds the work); a dirty worktree stays too.
 export async function cleanRun(data: string, run: Run): Promise<{ removed: string[]; kept: string[] }> {
-  const removed: string[] = [];
-  const kept: string[] = [];
-  for (const n of [...run.nodes].reverse()) {
-    try {
-      await removeWorktree(data, run.repo, n.worktree);
-      removed.push(n.id);
-    } catch (e) {
-      if (e instanceof DirtyWorktreeError) kept.push(n.id);
-      else throw e;
-    }
+  try {
+    await removeWorktree(data, run.repo, run.node.worktree);
+    return { removed: [run.node.id], kept: [] };
+  } catch (e) {
+    if (e instanceof DirtyWorktreeError) return { removed: [], kept: [run.node.id] };
+    throw e;
   }
-  return { removed, kept };
 }

@@ -18,22 +18,17 @@ export function wouldConflict(repo: string, a: string, b: string): Promise<strin
   });
 }
 
-// Live conflict check: each running leaf against its running siblings and against what
-// its parent already merged. Finds clashes while agents still work, not at merge time.
-export async function radar(run: Run): Promise<RadarHit[]> {
+// Live conflict check between workers of one project that are still working: which pairs
+// would clash when both land, found while they work rather than when the second PR merges.
+export async function radar(runs: Run[]): Promise<RadarHit[]> {
   const hits: RadarHit[] = [];
-  const working = run.nodes.filter((n) => n.kind === "leaf" && n.status === "running");
+  const working = runs.filter((r) => r.role === "worker" && r.node.status === "running");
   for (let i = 0; i < working.length; i++) {
-    const leaf = working[i]!;
-    const parent = run.nodes.find((n) => n.id === leaf.parentId);
-    if (parent) {
-      const files = await wouldConflict(run.repo, parent.branch, leaf.branch);
-      if (files?.length) hits.push({ a: leaf.id, b: parent.id, files });
-    }
     for (const other of working.slice(i + 1)) {
-      if (other.parentId !== leaf.parentId) continue;
-      const files = await wouldConflict(run.repo, leaf.branch, other.branch);
-      if (files?.length) hits.push({ a: leaf.id, b: other.id, files });
+      const a = working[i]!;
+      if (a.repo !== other.repo) continue;
+      const files = await wouldConflict(a.repo, a.node.branch, other.node.branch);
+      if (files?.length) hits.push({ a: a.id, b: other.id, files });
     }
   }
   return hits;

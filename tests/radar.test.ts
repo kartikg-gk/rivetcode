@@ -4,8 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { radar, wouldConflict } from "../src/scheduler/radar.js";
 import type { Run } from "../src/store.js";
-import { buildTree } from "../src/tree.js";
-import { makeRepo, removeRepo } from "./helpers.js";
+import { makeRepo, removeRepo, sessionRun } from "./helpers.js";
 
 let repo: string;
 beforeEach(async () => { repo = await makeRepo(); });
@@ -32,18 +31,17 @@ describe("wouldConflict", () => {
 });
 
 describe("radar", () => {
-  it("flags running siblings and leaves that clash with their parent", async () => {
-    const nodes = buildTree({ runId: "r1", project: "p", dataDir: repo, defaultAgent: "claude", plan: {
-      title: "root", prompt: "r", children: [{ title: "x", prompt: "x" }, { title: "y", prompt: "y" }, { title: "z", prompt: "z" }],
-    } });
-    await branch("rivet/r1/root", "main", { "README.txt": "parent version\n" });
-    await branch("rivet/r1/root.1", "main", { "shared.txt": "x\n" });
-    await branch("rivet/r1/root.2", "main", { "shared.txt": "y\n" });
-    await branch("rivet/r1/root.3", "main", { "README.txt": "z version\n" });
-    const run: Run = { id: "r1", project: "p", repo, base: "main", task: "t", createdAt: "", nodes: nodes.map((n) => (n.kind === "leaf" ? { ...n, status: "running" } : n)) };
-    expect(await radar(run)).toEqual([
-      { a: "root.1", b: "root.2", files: ["shared.txt"] },
-      { a: "root.3", b: "root", files: ["README.txt"] },
-    ]);
+  it("flags running workers of a project whose branches would clash", async () => {
+    const worker = (id: string, status: "running" | "done", role: "worker" | "orchestrator" = "worker"): Run => {
+      const r = sessionRun(repo, { id, project: "p", role });
+      return { ...r, repo, node: { ...r.node, status } };
+    };
+    await branch("rivet/r1/agent", "main", { "shared.txt": "x\n" });
+    await branch("rivet/r2/agent", "main", { "shared.txt": "y\n" });
+    await branch("rivet/r3/agent", "main", { "other.txt": "z\n" });
+    await branch("rivet/r4/agent", "main", { "shared.txt": "done already\n" });
+    await branch("rivet/r5/agent", "main", { "shared.txt": "orchestrator\n" });
+    const runs = [worker("r1", "running"), worker("r2", "running"), worker("r3", "running"), worker("r4", "done"), worker("r5", "running", "orchestrator")];
+    expect(await radar(runs)).toEqual([{ a: "r1", b: "r2", files: ["shared.txt"] }]);
   });
 });

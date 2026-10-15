@@ -4,11 +4,9 @@ import { git } from "../git.js";
 import { defaultProjectId } from "../paths.js";
 import { totalTokens, type TokenUse } from "../usage.js";
 import type { Run } from "../store.js";
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { mkdirSync } from "node:fs";
 import { readRunFile } from "../runfile.js";
-import { makePlan, planFiles, renderPlan, type PlannerRunner } from "../planner/planner.js";
-import { claimsOverlap, type PlanNode } from "../tree.js";
 import type { Probes } from "./doctor.js";
 import { agentSessionIdOf, deriveActivity } from "./activity.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
@@ -19,8 +17,6 @@ export type CliIo = {
   readStdin(): Promise<string>;
   // Asks the user a question (only when a terminal is attached).
   ask?(question: string): Promise<string>;
-  // Replaces the claude planner (tests).
-  planner?(repo: string): PlannerRunner;
   // The real terminal, for attach (raw keys in, resize events).
   tty?: { input: NodeJS.ReadStream; output: NodeJS.WriteStream };
   // Replaces what doctor checks on this machine (tests).
@@ -34,21 +30,20 @@ export type CliIo = {
 };
 
 const USAGE = `usage: rivet <command>
-  plan [--repo <dir>] <task>             let the planner propose a task tree and preview it
-  run [--plan <file>] [--yes] [--repo <dir>] [--base <branch>] [--agent <name>] <task>
-                                        start a run (plans first when no --plan is given)
-  status [<run>]                        list runs, or show one run's tree
+  spawn [--name <label>] [--agent <name>] [--model <id>] [--repo <dir>] [--base <branch>] <task>
+                                        start a worker on a task in its own worktree
+  orchestrator [--agent <name>] [--repo <dir>] [<what you want>]
+                                        start an agent that splits work and spawns workers
+  status [<run>]                        list sessions, or show one with its pull request
+  stop <run>                            stop a session's agent
   resume <run>                          retry what was escalated or interrupted
   pr <run>                              bring in the latest base, push and open the pull request
-  skip <run> <node>                     ship without a leaf (it keeps running for a follow-up)
-  sync [<session>]                      bring the parent's merged work into a running leaf
-  clean <run>                           remove a run's worktrees (branches stay)
+  clean <run>                           remove a run's worktree (the branch stays)
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
-  bench <spec.json>                     compare ways of splitting one task (e.g. single, flat, tree)
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
-  panes <run>                           show every running agent of a run side by side
+  panes                                 show every running agent side by side
   daemon start|stop|status              run or control the background daemon
   doctor                                check what Rivet needs on this machine
   hooks <agent> <event>                 receive an agent hook (called by the agent)
@@ -205,96 +200,20 @@ async function repoTop(dir: string): Promise<string> {
   }
 }
 
-// The planner's model comes from the project settings when the daemon is up.
-async function defaultPlanner(io: CliIo, repo: string): Promise<PlannerRunner> {
-  const { findClaude } = await import("../agents/locate.js");
-  const { claudePlanner } = await import("../planner/claude-runner.js");
-  const config = await callDaemon(io.env, "GET", `/api/v1/projects/${encodeURIComponent(defaultProjectId(repo))}/config`, undefined, HOOK_TIMEOUT_MS)
-    .catch(() => ({})) as Record<string, string>;
-  const model = config["planner.model"] ?? config["worker.model"];
-  return claudePlanner({ binary: findClaude(), repo, ...(model ? { model } : {}) });
-}
-
-// Files the plan claims that a run in flight is already touching.
-async function overlaps(io: CliIo, repo: string, plan: PlanNode): Promise<string[]> {
-  const result = await callDaemon(io.env, "GET", `/api/v1/projects/${encodeURIComponent(defaultProjectId(repo))}/active-files`, undefined, COMMAND_TIMEOUT_MS)
-    .catch(() => ({ files: [] })) as { files: { file: string; runId: string; nodeId: string }[] };
-  const warnings: string[] = [];
-  for (const mine of planFiles(plan)) {
-    for (const theirs of result.files) {
-      if (claimsOverlap(mine, theirs.file)) warnings.push(`${mine} overlaps ${theirs.file} (run ${theirs.runId}, ${theirs.nodeId})`);
-    }
-  }
-  return warnings;
-}
-
-async function planAndPreview(io: CliIo, repo: string, task: string, agent: string): Promise<{ plan: PlanNode; file: string; warnings: string[] }> {
-  io.out("planning...");
-  const runner = io.planner ? io.planner(repo) : await defaultPlanner(io, repo);
-  const plan = await makePlan(task, runner);
-  const dir = join(dataDirFrom(io.env), "plans");
-  mkdirSync(dir, { recursive: true });
-  const file = join(dir, `plan-${Date.now()}.json`);
-  await writeFile(file, `${JSON.stringify(plan, null, 2)}\n`);
-  for (const line of renderPlan(plan, agent)) io.out(line);
-  const warnings = await overlaps(io, repo, plan);
-  for (const w of warnings) io.out(`warning: ${w}`);
-  io.out(`plan saved to ${file}`);
-  return { plan, file, warnings };
-}
-
-async function planCommand(args: string[], io: CliIo): Promise<number> {
-  const { flags, rest } = parseFlags(args, ["repo", "agent"]);
+// Starts one session on the daemon: a worker, or an orchestrator that starts workers.
+async function startSession(args: string[], io: CliIo, role: "worker" | "orchestrator"): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["repo", "base", "agent", "name", "model"]);
   const task = rest.join(" ").trim();
-  if (!task) throw new UsageError("plan needs a task description");
+  if (role === "worker" && !task) throw new UsageError("spawn needs a task description");
   const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
-  const agent = typeof flags.get("agent") === "string" ? (flags.get("agent") as string) : "claude";
-  const { file } = await planAndPreview(io, repo, task, agent);
-  io.out(`start it with: rivet run --plan "${file}" ${task}`);
-  return 0;
-}
-
-async function run(args: string[], io: CliIo): Promise<number> {
-  const { flags, rest } = parseFlags(args, ["plan", "repo", "base", "agent"]);
-  const planFile = flags.get("plan");
-  const task = rest.join(" ").trim();
-  if (!task) throw new UsageError("run needs a task description");
-  const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
-  const base = flags.get("base");
-  const agent = flags.get("agent");
-  let plan: unknown;
-  if (typeof planFile === "string") {
-    try {
-      plan = JSON.parse(await readFile(resolve(io.cwd, planFile), "utf8"));
-    } catch (e) {
-      throw new Error(`could not read plan ${planFile}: ${(e as Error).message}`);
-    }
-  } else {
-    // No plan given: the planner proposes one and the user decides.
-    const preview = await planAndPreview(io, repo, task, typeof agent === "string" ? agent : "claude");
-    plan = preview.plan;
-    if (!flags.has("yes")) {
-      if (!io.ask) {
-        io.out(`not starting without confirmation; rerun with --yes or: rivet run --plan "${preview.file}" ${task}`);
-        return 1;
-      }
-      const answer = (await io.ask("run this plan? [y]es / [e]dit / [n]o: ")).trim().toLowerCase();
-      if (answer.startsWith("e")) {
-        io.out(`edit ${preview.file}, then: rivet run --plan "${preview.file}" ${task}`);
-        return 0;
-      }
-      if (!answer.startsWith("y")) {
-        io.out("cancelled");
-        return 0;
-      }
-    }
-  }
+  const text = (key: string) => (typeof flags.get(key) === "string" ? { [key]: flags.get(key) as string } : {});
+  // Inside an orchestrator's session the new worker reports back to it.
+  const from = io.env.RIVET_SESSION_ID?.trim();
   const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
-    repo, task, plan,
-    ...(typeof base === "string" ? { base } : {}),
-    ...(typeof agent === "string" ? { agent } : {}),
+    repo, task, role, ...text("base"), ...text("agent"), ...text("name"), ...text("model"), ...(from ? { from } : {}),
   }, RUN_TIMEOUT_MS) as { runId: string };
-  io.out(`run ${result.runId} started; follow it with: rivet status ${result.runId}`);
+  if (role === "orchestrator") io.out(`orchestrator ${result.runId} started; talk to it with: rivet attach ${result.runId}-agent`);
+  else io.out(`worker ${result.runId} started; follow it with: rivet status ${result.runId}`);
   return 0;
 }
 
@@ -304,8 +223,8 @@ function ago(iso: string | undefined, now: number): string {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-// How long a leaf has worked: from its first start to when it finished (or now).
-function elapsedMs(n: Run["nodes"][number], now: number): number | null {
+// How long a session has worked: from its first start to when it finished (or now).
+function elapsedMs(n: Run["node"], now: number): number | null {
   if (!n.startedAt) return null;
   return (n.finishedAt ? Date.parse(n.finishedAt) : now) - Date.parse(n.startedAt);
 }
@@ -314,40 +233,23 @@ function duration(ms: number): string {
   return ago(new Date(0).toISOString(), ms);
 }
 
-// A running leaf against its finished siblings (the median of their times). Display only.
-function versusSiblings(run: Run, n: Run["nodes"][number], now: number): string {
-  if (n.finishedAt || n.status !== "running") return "";
-  const mine = elapsedMs(n, now);
-  const done = run.nodes
-    .filter((s) => s.id !== n.id && s.kind === "leaf" && s.parentId === n.parentId && s.finishedAt)
-    .map((s) => elapsedMs(s, now))
-    .filter((ms): ms is number => ms !== null && ms > 0)
-    .sort((a, b) => a - b);
-  if (mine === null || done.length === 0) return "";
-  const median = done[Math.floor(done.length / 2)]!;
-  return `, ${(mine / median).toFixed(1)}x finished siblings`;
-}
-
-// One line per node: what it is, where it stands, how long its agent has been quiet, and
-// how long it has worked compared with its siblings.
-export function renderRun(run: Run, live: Record<string, boolean>, now: number, silent: string[] = []): string[] {
-  const lines = [`run ${run.id} (root: ${run.nodes[0]!.status}) ${run.task}`];
-  for (const n of run.nodes) {
-    const name = `${"  ".repeat(n.depth)}${n.id} ${n.title}`;
-    const parts = [name.padEnd(34), n.status.padEnd(11)];
-    if (n.kind === "leaf" && n.activity) {
-      const quiet = n.activity !== "active" && n.activity !== "exited" ? ` for ${ago(n.activityAt, now)}` : "";
-      parts.push((silent.includes(n.id) ? `no signal for ${ago(n.activityAt, now)}` : `${n.activity}${quiet}`).padEnd(20));
-    } else {
-      parts.push("".padEnd(20));
-    }
-    const worked = n.kind === "leaf" ? elapsedMs(n, now) : null;
-    if (worked !== null) parts.push(`[${n.finishedAt ? "took" : "working"} ${duration(worked)}${versusSiblings(run, n, now)}]`);
-    if (live[n.id]) parts.push("[agent running]");
-    if (n.finishedAt && n.status === "running") parts.push("[finished, waiting to merge]");
-    if (n.summary) parts.push(n.summary.split(/\r?\n/)[0]!.slice(0, 120));
-    lines.push(parts.join(" ").trimEnd());
+// One session: what it is, where it stands, how long its agent has been quiet, and how
+// long it has worked.
+export function renderRun(run: Run, live: boolean, now: number, silent = false): string[] {
+  const n = run.node;
+  const label = run.name ? ` (${run.name})` : "";
+  const lines = [`${run.role} ${run.id}${label}: ${n.status}  ${run.task.split(/\r?\n/)[0]}`];
+  const parts = [`  session ${run.id}-${n.id}`, n.agent];
+  if (n.activity) {
+    const quiet = n.activity !== "active" && n.activity !== "exited" ? ` for ${ago(n.activityAt, now)}` : "";
+    parts.push(silent ? `no signal for ${ago(n.activityAt, now)}` : `${n.activity}${quiet}`);
   }
+  const worked = elapsedMs(n, now);
+  if (worked !== null) parts.push(`[${n.finishedAt ? "took" : "working"} ${duration(worked)}]`);
+  if (live) parts.push("[agent running]");
+  if (run.orchestrator) parts.push(`[started by ${run.orchestrator}]`);
+  lines.push(parts.join("  "));
+  if (n.summary) lines.push(`  ${n.summary.split(/\r?\n/)[0]!.slice(0, 160)}`);
   return lines;
 }
 
@@ -364,22 +266,28 @@ async function status(args: string[], io: CliIo): Promise<number> {
   const [runId] = args;
   if (!runId) {
     const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as {
-      runs: { id: string; status: string; task: string; project: string }[];
+      runs: { id: string; status: string; task: string; project: string; role: string; name: string; agent: string; live: boolean }[];
     };
-    if (runs.length === 0) io.out("no runs yet");
-    for (const r of runs) io.out(`${r.id}  ${r.status.padEnd(11)} ${r.task}  [${r.project}]`);
+    if (runs.length === 0) io.out("no sessions yet");
+    for (const r of runs) {
+      const label = r.name || r.task.split(/\r?\n/)[0]!.slice(0, 60);
+      io.out(`${r.id}  ${r.role.padEnd(12)} ${r.status.padEnd(9)} ${r.agent.padEnd(6)} ${r.live ? "live " : "     "} ${label}  [${r.project}]`);
+    }
+    // Workers of one project that would clash when both land.
+    for (const project of new Set(runs.map((r) => r.project))) {
+      const { conflicts } = await callDaemon(io.env, "GET", `/api/v1/projects/${encodeURIComponent(project)}/radar`, undefined, COMMAND_TIMEOUT_MS)
+        .catch(() => ({ conflicts: [] })) as { conflicts: { a: string; b: string; files: string[] }[] };
+      for (const c of conflicts) io.out(`conflict radar: ${c.a} and ${c.b} would conflict in ${c.files.join(", ")}`);
+    }
     return 0;
   }
   const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
-    run: Run; live: Record<string, boolean>; now: string; pr: { url: string } | null; noSignal?: string[];
+    run: Run; live: boolean; now: string; pr: { url: string } | null; noSignal?: boolean;
     usage?: { conversations: number; tokens: TokenUse; inputEquivalent?: number };
   };
   for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.noSignal)) io.out(line);
   if (result.usage && result.usage.conversations > 0) io.out(usageLine(result.usage));
-  if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.nodes[0]!.prStatus ?? "pr_open"})`);
-  const { conflicts } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}/radar`, undefined, COMMAND_TIMEOUT_MS)
-    .catch(() => ({ conflicts: [] })) as { conflicts: { a: string; b: string; files: string[] }[] };
-  for (const c of conflicts) io.out(`conflict radar: ${c.a} and ${c.b} would conflict in ${c.files.join(", ")}`);
+  if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.node.prStatus ?? "pr_open"})`);
   return 0;
 }
 
@@ -391,7 +299,7 @@ async function runAction(action: "resume" | "clean", args: string[], io: CliIo):
     io.out(`run ${runId} resumed`);
   } else {
     const { removed, kept } = result as { removed: string[]; kept: string[] };
-    io.out(`removed ${removed.length} worktrees` + (kept.length ? `; kept ${kept.join(", ")} (uncommitted work)` : ""));
+    io.out(removed.length ? "removed its worktree (the branch stays)" : kept.length ? "kept its worktree: it has uncommitted work" : "nothing to remove");
   }
   return 0;
 }
@@ -425,28 +333,6 @@ async function project(args: string[], io: CliIo): Promise<number> {
     return 0;
   }
   throw new UsageError("project needs get, set <key> <value> or unset <key>");
-}
-
-async function bench(args: string[], io: CliIo): Promise<number> {
-  const [specFile] = args;
-  if (!specFile) throw new UsageError("bench needs a spec file");
-  const { runBench, formatResult } = await import("../bench/bench.js");
-  const { mkdtemp } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { dirname, join } = await import("node:path");
-  const full = resolve(io.cwd, specFile);
-  const spec = JSON.parse(await readFile(full, "utf8"));
-  spec.repo = resolve(dirname(full), spec.repo);
-  if (spec.accept) spec.accept.files = resolve(dirname(full), spec.accept.files);
-  const workDir = await mkdtemp(join(tmpdir(), "rivet bench "));
-  io.out(`benchmark "${spec.name}" in ${workDir}`);
-  const result = await runBench(spec, { workDir, log: io.out });
-  const out = join(dirname(full), `${spec.name.replace(/[^\w.-]+/g, "-")}-results-${Date.now()}.json`);
-  await writeFile(out, `${JSON.stringify(result, null, 2)}\n`);
-  for (const r of result.results) io.out(formatResult(r));
-  io.out(result.verdict);
-  io.out(`results: ${out}`);
-  return 0;
 }
 
 const DETACH_KEY = "\u001d"; // Ctrl-]
@@ -504,17 +390,17 @@ async function attach(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
-async function panes(args: string[], io: CliIo): Promise<number> {
-  const [runId] = args;
-  if (!runId) throw new UsageError("panes needs a run id");
-  const { run, live } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
-    run: Run; live: Record<string, boolean>;
+// Every running agent side by side (orchestrator and workers alike).
+async function panes(io: CliIo): Promise<number> {
+  const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as {
+    runs: { id: string; task: string; name: string; role: string; live: boolean }[];
   };
-  const sessions = run.nodes.filter((n) => live[n.id]).map((n) => ({ id: `${run.id}-${n.id}`, title: `${n.id} ${n.title}` }));
+  const sessions = runs.filter((r) => r.live).map((r) => ({ id: `${r.id}-agent`, title: `${r.role} ${r.name || r.task.slice(0, 40)}` }));
   if (sessions.length === 0) {
-    io.out(`no agent of run ${runId} is running right now`);
+    io.out("no agent is running right now");
     return 1;
   }
+  const runId = "rivet";
   const { panesPlan } = await import("./panes.js");
   const { rivetBinDir } = await import("../runtime/env.js");
   const { execFileSync, spawn } = await import("node:child_process");
@@ -539,8 +425,8 @@ async function panes(args: string[], io: CliIo): Promise<number> {
 }
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
-// (hooks, report, send, sync) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["run", "plan", "status", "resume", "clean", "merge-policy", "project", "pr", "skip", "attach", "panes"]);
+// (hooks, report, send) never do: their daemon is the one that started them.
+const AUTOSTART = new Set(["spawn", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -592,29 +478,19 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "send": return await send(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
-      case "run": return await run(args, io);
-      case "plan": return await planCommand(args, io);
-      case "attach": return await attach(args, io);
-      case "panes": return await panes(args, io);
-      case "status": return await status(args, io);
-      case "resume": return await runAction("resume", args, io);
-      case "sync": {
-        // Inside an agent: sync this session, and the agent resolves any conflict itself.
-        const self = io.env.RIVET_SESSION_ID?.trim();
-        const target = args[0] ?? self;
-        if (!target) throw new UsageError("sync needs a session id (or run it inside an agent session)");
-        const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(target)}/sync`,
-          { byAgent: !args[0] && !!self }, COMMAND_TIMEOUT_MS) as { synced: boolean; conflicts: string[]; note: string };
-        io.out(result.synced ? `synced: ${result.note}` : `conflicts in ${result.conflicts.join(", ")}: ${result.note}`);
-        return result.synced ? 0 : 1;
-      }
-      case "skip": {
-        const [runId, node] = args;
-        if (!runId || !node) throw new UsageError("skip needs <run> <node>");
-        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/skip`, { node }, COMMAND_TIMEOUT_MS);
-        io.out(`${node} skipped; the run goes on without it (a running agent keeps going for a follow-up)`);
+      case "spawn": return await startSession(args, io, "worker");
+      case "orchestrator": return await startSession(args, io, "orchestrator");
+      case "stop": {
+        const [runId] = args;
+        if (!runId) throw new UsageError("stop needs a run id");
+        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/stop`, undefined, COMMAND_TIMEOUT_MS);
+        io.out(`stopped ${runId}`);
         return 0;
       }
+      case "attach": return await attach(args, io);
+      case "panes": return await panes(io);
+      case "status": return await status(args, io);
+      case "resume": return await runAction("resume", args, io);
       case "pr": {
         const [runId] = args;
         if (!runId) throw new UsageError("pr needs a run id");
@@ -631,7 +507,6 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return 0;
       }
       case "project": return await project(args, io);
-      case "bench": return await bench(args, io);
       default: throw new UsageError(command ? `unknown command "${command}"` : "no command given");
     }
   } catch (e) {
