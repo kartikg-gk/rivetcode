@@ -497,7 +497,9 @@ export function createScheduler(d: SchedulerDeps) {
       if (run.node.status !== "running") await transition(runId, "running");
       // A terminal agent may keep no conversation to resume, so it starts again and is
       // told to look first: the workers it started may still be running or done.
-      await launch(await load(runId), [RESTART_NOTE, "", orchestratorPrompt(run)].join("\n"));
+      // The test fake's prompt is its script, so it gets no note.
+      const prompt = run.node.agent === "fake" ? orchestratorPrompt(run) : [RESTART_NOTE, "", orchestratorPrompt(run)].join("\n");
+      await launch(await load(runId), prompt);
       return;
     }
     if (run.node.status === "escalated" || run.node.status === "failed" || run.node.status === "pending") {
