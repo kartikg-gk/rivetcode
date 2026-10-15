@@ -442,7 +442,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       if (action === "stop") {
-        await scheduler.stopSession(sessionIdOf(run.id, run.node.id));
+        await scheduler.stopRun(run.id);
         reply(res, 204);
         return;
       }

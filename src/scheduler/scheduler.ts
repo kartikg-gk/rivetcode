@@ -37,6 +37,9 @@ export function commandRules(command: string): string[] {
   return [...rules];
 }
 
+// What an orchestrator brought back by resume is told before anything else.
+const RESTART_NOTE = "Rivet was restarted. Before starting anything, run rivet status: workers you started earlier may still be running or already done, so do not start the same work again.";
+
 // A worker gets this many launches before Rivet stops retrying and asks the user.
 export const MAX_ATTEMPTS = 2;
 const OUTPUT_FOR_RETRY = 40;
@@ -489,6 +492,14 @@ export function createScheduler(d: SchedulerDeps) {
   // it, then continues whatever was interrupted.
   async function resume(runId: string): Promise<void> {
     const run = await load(runId);
+    if (run.role === "orchestrator") {
+      if (d.runtime.isAlive(sessionOf(run))) return;
+      if (run.node.status !== "running") await transition(runId, "running");
+      // A terminal agent may keep no conversation to resume, so it starts again and is
+      // told to look first: the workers it started may still be running or done.
+      await launch(await load(runId), [RESTART_NOTE, "", orchestratorPrompt(run)].join("\n"));
+      return;
+    }
     if (run.node.status === "escalated" || run.node.status === "failed" || run.node.status === "pending") {
       await runSession(runId, run.node.summary).catch(report);
       return;
@@ -496,26 +507,27 @@ export function createScheduler(d: SchedulerDeps) {
     await recover(runId);
   }
 
+  // The user stops a session for good: a worker waits for resume, an orchestrator is over.
+  // Neither comes back on its own when the daemon restarts.
+  async function stopRun(runId: string): Promise<void> {
+    const run = await load(runId);
+    await stopSession(sessionOf(run));
+    if (run.node.status !== "running") return;
+    await transition(runId, run.role === "orchestrator" ? "done" : "escalated", "stopped by the user");
+  }
+
   // After a daemon restart (or a resume): finish what was in flight. A session that never
-  // started is left alone. Idempotent.
+  // started is left alone, and so is an orchestrator: it is someone you talk to, and a
+  // fresh one could start the same work again, so it comes back only through resume.
   async function recover(runId: string): Promise<void> {
     const run = await load(runId);
     const node = run.node;
-    if (node.id !== NODE_ID || node.status !== "running") return;
+    if (node.id !== NODE_ID || node.status !== "running" || run.role !== "worker") return;
     if (node.finishedAt) {
       await track(workFinished(runId));
     } else if (!d.runtime.isAlive(sessionOf(run))) {
-      if (run.role === "orchestrator") {
-        // A terminal agent may keep no conversation to resume, so it starts again and is
-        // told to look first: the workers it started may still be running or done.
-        const note = "Rivet was restarted. Before starting anything, run rivet status: workers you started earlier may still be running or already done.";
-        await launch(run, `${note}
-
-${orchestratorPrompt(run)}`).catch(report);
-      } else {
-        const note = "Rivet was restarted while you worked; continue from the current state of the worktree.";
-        await launch(run, workerPrompt(run, note)).catch(report);
-      }
+      const note = "Rivet was restarted while you worked; continue from the current state of the worktree.";
+      await launch(run, workerPrompt(run, note)).catch(report);
     }
   }
 
@@ -526,7 +538,7 @@ ${orchestratorPrompt(run)}`).catch(report);
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onReport, resume, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs };
+  return { launch, startRun, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

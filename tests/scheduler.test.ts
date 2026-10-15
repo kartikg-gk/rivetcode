@@ -174,13 +174,16 @@ describe("resume and recovery", () => {
     expect((await settled(runId)).node.status).toBe("done");
   });
 
-  it("stop ends the agent without counting it as a failure", async () => {
+  it("stop holds a worker until resume, and it does not come back on a restart", async () => {
     await start();
     const runId = await spawn({ stayFor: 60_000 });
     await new Promise((r) => setTimeout(r, 300));
     expect((await api("POST", `/api/v1/runs/${runId}/stop`)).status).toBe(204);
-    await new Promise((r) => setTimeout(r, 500));
-    expect((await getRun(runId)).node).toMatchObject({ status: "running", attempts: 1 });
+    expect((await getRun(runId)).node).toMatchObject({ status: "escalated", attempts: 1, summary: "stopped by the user" });
+    await daemon!.stop();
+    daemon = undefined;
+    await start();
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.live).toBe(false);
   });
 });
 
@@ -316,16 +319,18 @@ describe("command permissions", () => {
 });
 
 describe("an orchestrator after a restart", () => {
-  it("comes back running (its own conversation when the agent can resume one)", async () => {
+  it("waits for resume instead of coming back on its own; stop ends it", async () => {
     await start();
     const orch = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId as string;
     await new Promise((r) => setTimeout(r, 300));
     await daemon!.stop();
     daemon = undefined;
     await start();
-    const back = await api("GET", `/api/v1/runs/${orch}`);
-    expect(back.json.run.node).toMatchObject({ status: "running", attempts: 1 });
-    expect(back.json.live).toBe(true);
+    expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(false);
+    expect((await api("POST", `/api/v1/runs/${orch}/resume`)).status).toBe(202);
+    expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(true);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
+    expect((await getRun(orch)).node).toMatchObject({ status: "done", summary: "stopped by the user" });
     expect(errors).toEqual([]);
   });
 });
