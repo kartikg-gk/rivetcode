@@ -18,7 +18,19 @@ import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "pr", "github.repo", "copy", "setup"];
+const CONFIG_KEYS = [
+  "check",
+  "test",
+  "worker.agent",
+  "worker.permission",
+  "worker.model",
+  "worker.allowedTools",
+  "worker.mode",
+  "pr",
+  "github.repo",
+  "copy",
+  "setup",
+];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
