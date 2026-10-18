@@ -35,6 +35,9 @@ export type NewRun = {
   setupFor?(project: string): string[];
 };
 
+// Model names that plainly belong to one agent, so the other is never started with them.
+const MODEL_FAMILIES = { claude: /^(claude|opus|sonnet|haiku)/i, codex: /^(gpt|o\d|codex)/i };
+
 // The main checkout, also when asked from inside a linked worktree (an agent's own), so
 // a new session never starts from another session's worktree.
 async function repoRoot(dir: string): Promise<string> {
@@ -64,6 +67,10 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   if (!AGENTS.includes(agent)) throw new RunInputError(`unknown agent "${o.agent}"`);
   const role = o.role ?? "worker";
   if (!ROLES.includes(role)) throw new RunInputError(`unknown role "${String(role)}"`);
+  const otherFamily = MODEL_FAMILIES[agent === "claude" ? "codex" : "claude"];
+  if (o.model && agent !== "fake" && otherFamily.test(o.model.trim())) {
+    throw new RunInputError(`model "${o.model.trim()}" is not a ${agent} model; leave --model off to use ${agent}'s default`);
+  }
   const name = (o.name ?? "").trim();
   if (name.length > 100) throw new RunInputError(`name is ${name.length} characters; at most 100`);
 

@@ -180,6 +180,14 @@ describe("an orchestrator", () => {
     await api("POST", `/api/v1/runs/${orchestrator}/stop`);
   });
 
+  it("refuses a model that belongs to the other agent", async () => {
+    await start();
+    const codex = await api("POST", "/api/v1/runs", { repo, task: "x", agent: "codex", model: "claude-opus-5-5" });
+    expect(codex.status).toBe(400);
+    expect(codex.json.error).toMatch(/model "claude-opus-5-5" is not a codex model; leave --model off/);
+    expect((await api("POST", "/api/v1/runs", { repo, task: "x", agent: "claude", model: "gpt-5-codex" })).status).toBe(400);
+  });
+
   it("refuses an unknown role", async () => {
     await start();
     expect((await api("POST", "/api/v1/runs", { repo, task: "t", role: "boss" })).status).toBe(400);
