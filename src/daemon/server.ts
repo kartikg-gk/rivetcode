@@ -27,6 +27,7 @@ const CONFIG_KEYS = [
   "worker.allowedTools",
   "worker.mode",
   "pr",
+  "pr.feedback",
   "github.repo",
   "copy",
   "setup",

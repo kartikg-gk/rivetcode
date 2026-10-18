@@ -8,7 +8,7 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { checkNote, conflictPrompt, orchestratorPrompt, workerPrompt } from "./prompts.js";
+import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
 import { cleanRun } from "./runs.js";
 
@@ -123,6 +123,9 @@ export function createScheduler(d: SchedulerDeps) {
       for (const command of [config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
         for (const rule of commandRules(command)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       }
+      // A worker with a pull request may read its feedback itself (see checkPr).
+      const pr = config["pr.feedback"] !== "full" ? await d.write(() => d.store.getPr(run.id)) : null;
+      if (pr) for (const rule of feedbackRules(pr)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       const check = config.check?.trim();
       if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check);
     }
@@ -452,13 +455,13 @@ export function createScheduler(d: SchedulerDeps) {
     const key = `${status}:${facts.mergeability}:${facts.headSha}`;
     // Work is already under way, or this exact state was handled before.
     if (pr.handled === key || node.status !== "done") return status;
+    // By default the worker is told where the feedback is and reads it itself; "full" has
+    // Rivet fetch it and hand it over.
+    const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
     if (status === "ci_failed") {
-      const paths = await github.failedPaths(pr.number);
-      await reopen(runId, `CI failed on the pull request${paths.length ? ` in: ${paths.join(", ")}` : ""}. Fix it.`);
+      await reopen(runId, ciFeedback(pr, full ? await github.failedPaths(pr.number) : undefined));
     } else if (status === "changes_requested") {
-      const comments = await github.reviewComments(pr.number);
-      const text = comments.map((c) => `${c.path}${c.line ? `:${c.line}` : ""}: ${c.body}`).join("\n");
-      await reopen(runId, `Review comments on the pull request:\n${text}\nAddress them.`);
+      await reopen(runId, reviewFeedback(pr, full ? await github.reviewComments(pr.number) : undefined));
     } else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") {
       await publish(runId).catch(report);
     }
