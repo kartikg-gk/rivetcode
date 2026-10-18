@@ -13,6 +13,12 @@ export function workerPrompt(run: Run, retry?: string): string {
     `If you need a decision, run: rivet report --needs-input --note "<question>"`,
     "Do not use your own subagent or task tools to hand work off; finish it here.",
   ];
+  // Codex's sandbox does not let it write a linked worktree's git data (it lives in the
+  // main repository's .git), so its commits fail; Rivet commits for it.
+  if (run.node.agent === "codex") {
+    lines.push("If git commit fails with \"Permission denied\" (your sandbox), leave the changes uncommitted:",
+      "Rivet commits them when you report done.");
+  }
   if (retry) lines.push("", "A previous attempt at this task failed:", retry, "", "Fix that and finish the task.");
   return lines.join("\n");
 }
