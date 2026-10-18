@@ -38,6 +38,14 @@ export function commandRules(command: string): string[] {
   return [...rules];
 }
 
+// A model name only means something to its own agent: "claude.model" and "codex.model"
+// set each, and "worker.model" applies to the project's default agent only.
+export function modelFor(agent: Node["agent"], config: Record<string, string>): string | undefined {
+  const own = config[`${agent}.model`]?.trim();
+  if (own) return own;
+  return agent === (config["worker.agent"]?.trim() || "claude") ? config["worker.model"]?.trim() || undefined : undefined;
+}
+
 // What an orchestrator brought back by resume is told before anything else.
 const RESTART_NOTE = "Rivet was restarted. Before starting anything, run rivet status: workers you started earlier may still be running or already done, so do not start the same work again.";
 
@@ -115,7 +123,7 @@ export function createScheduler(d: SchedulerDeps) {
     const agent = d.agents(node.agent);
     const launchId = newLaunchId();
     const config = await d.write(() => d.store.getConfig(run.project));
-    const model = run.model ?? config["worker.model"]?.trim();
+    const model = run.model ?? modelFor(node.agent, config);
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
     const worker = run.role === "worker";
     if (worker) {

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getAgent, type Agent } from "../src/agents/agent.js";
-import { commandRules } from "../src/scheduler/scheduler.js";
+import { commandRules, modelFor } from "../src/scheduler/scheduler.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import type { Run } from "../src/store.js";
@@ -394,5 +394,16 @@ describe("an orchestrator's conversation", () => {
     expect(await readFile(file, "utf8")).toMatch(/^Rivet was restarted\. Before starting anything, run rivet status/);
     expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
     expect(errors).toEqual([]);
+  });
+});
+
+describe("models", () => {
+  it("gives each agent only a model meant for it", () => {
+    expect(modelFor("claude", { "worker.model": "haiku" })).toBe("haiku");
+    expect(modelFor("codex", { "worker.model": "haiku" })).toBeUndefined();
+    expect(modelFor("codex", { "worker.model": "haiku", "codex.model": "gpt-5-codex" })).toBe("gpt-5-codex");
+    expect(modelFor("codex", { "worker.agent": "codex", "worker.model": "o4" })).toBe("o4");
+    expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4", "claude.model": "sonnet" })).toBe("sonnet");
+    expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4" })).toBeUndefined();
   });
 });
