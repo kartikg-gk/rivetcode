@@ -9,6 +9,7 @@ import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
 import { checkNote, conflictPrompt, orchestratorPrompt, workerPrompt } from "./prompts.js";
+import { radar } from "./radar.js";
 import { cleanRun } from "./runs.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
@@ -328,6 +329,7 @@ export function createScheduler(d: SchedulerDeps) {
   async function shutdown(): Promise<void> {
     shuttingDown = true;
     if (watcher) clearInterval(watcher);
+    if (radarTimer) clearInterval(radarTimer);
     await d.runtime.stopAll();
     await idle();
   }
@@ -477,6 +479,38 @@ export function createScheduler(d: SchedulerDeps) {
     if (kept.length) report(new Error(`run ${run.id}: kept its worktree, which has uncommitted work`));
   }
 
+  // Clashes already told, so each is told once per daemon.
+  const warned = new Set<string>();
+
+  // Tells the orchestrators of two workers whose branches would conflict, while one of
+  // them still works, so it can sequence them or settle who changes the files.
+  async function checkRadar(): Promise<void> {
+    const runs = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id)));
+    const byId = new Map(runs.map((r) => [r.id, r]));
+    const projects = new Set(runs.filter((r) => r.role === "worker" && r.orchestrator).map((r) => r.project));
+    for (const project of projects) {
+      for (const hit of await radar(runs.filter((r) => r.project === project))) {
+        const key = `${hit.a}|${hit.b}|${hit.files.join(",")}`;
+        if (warned.has(key)) continue;
+        warned.add(key);
+        const a = byId.get(hit.a)!, b = byId.get(hit.b)!;
+        const label = (r: Run) => `${r.id}${r.name ? ` (${r.name})` : ""}, ${r.node.status === "running" ? "working" : "done"}`;
+        const message = `Workers ${label(a)} and ${label(b)} both change ${hit.files.join(", ")}: their work will conflict when both merge. Have one wait for the other or leave those files to it.`;
+        for (const session of new Set([a.orchestrator, b.orchestrator].filter((o): o is string => !!o))) {
+          const target = session.slice(0, session.indexOf("-"));
+          const id = await d.write(() => d.store.queueMessage(target, NODE_ID, message, "rivet"));
+          if (id !== null) await deliverQueued(target).catch(report);
+        }
+      }
+    }
+  }
+
+  let radarTimer: NodeJS.Timeout | undefined;
+  function watchRadar(intervalMs: number): void {
+    radarTimer = setInterval(() => { void checkRadar().catch(report); }, intervalMs);
+    radarTimer.unref();
+  }
+
   let watcher: NodeJS.Timeout | undefined;
   // Looks at every open pull request on a timer until shutdown.
   function watchPrs(intervalMs: number): void {
@@ -546,7 +580,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs };
+  return { launch, startRun, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

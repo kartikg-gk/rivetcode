@@ -18,15 +18,22 @@ export function wouldConflict(repo: string, a: string, b: string): Promise<strin
   });
 }
 
-// Live conflict check between workers of one project that are still working: which pairs
-// would clash when both land, found while they work rather than when the second PR merges.
+// Work that has yet to land: a worker still working, or done with its work not merged.
+function unlanded(r: Run): boolean {
+  if (r.role !== "worker") return false;
+  return r.node.status === "running" || (r.node.status === "done" && r.node.prStatus !== "merged" && r.node.prStatus !== "terminated");
+}
+
+// Live conflict check between workers of one project: which pairs would clash when both
+// land, found while one of them still works rather than when the second PR merges.
 export async function radar(runs: Run[]): Promise<RadarHit[]> {
   const hits: RadarHit[] = [];
-  const working = runs.filter((r) => r.role === "worker" && r.node.status === "running");
+  const working = runs.filter(unlanded);
   for (let i = 0; i < working.length; i++) {
     for (const other of working.slice(i + 1)) {
       const a = working[i]!;
       if (a.repo !== other.repo) continue;
+      if (a.node.status !== "running" && other.node.status !== "running") continue;
       const files = await wouldConflict(a.repo, a.node.branch, other.node.branch);
       if (files?.length) hits.push({ a: a.id, b: other.id, files });
     }

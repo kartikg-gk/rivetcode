@@ -30,9 +30,9 @@ afterEach(async () => {
   await removeRepo(data);
 });
 
-async function start(claude?: Agent): Promise<void> {
+async function start(claude?: Agent, more: { radarMs?: number } = {}): Promise<void> {
   daemon = await startDaemon({
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
+    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, ...more,
     agents: (name) => (name === "claude" && claude ? claude : getAgent("fake")),
     onError: (e) => errors.push(e),
   });
@@ -145,6 +145,22 @@ describe("an orchestrator", () => {
     // A worker spawned from another worker's session reports to nobody.
     const loner = await spawn({ commit: "none" }, { from: `${worker}-agent` });
     expect((await settled(loner)).orchestrator).toBeUndefined();
+  });
+
+  it("is told once when two of its workers' work would conflict", async () => {
+    await start(undefined, { radarMs: 100 });
+    const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const from = `${orchestrator}-agent`;
+    const one = await spawn({ files: { "shared.txt": "one" }, commit: "one", stayFor: 1500 }, { name: "first", from });
+    const two = await spawn({ files: { "shared.txt": "two" }, commit: "two", stayFor: 1500 }, { name: "second", from });
+    await settled(one);
+    await settled(two);
+    await new Promise((r) => setTimeout(r, 300));
+    const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
+    const warnings = inbox.split(/\r?\n/).filter((l) => l.includes("their work will conflict"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`Workers ${one} (first), working and ${two} (second), working both change shared.txt`);
+    await api("POST", `/api/v1/runs/${orchestrator}/stop`);
   });
 
   it("refuses an unknown role", async () => {

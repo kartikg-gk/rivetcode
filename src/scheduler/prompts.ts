@@ -46,7 +46,8 @@ export function orchestratorPrompt(run: Run): string {
     `- rivet send --session <run>-agent --message "<text>"   messages a worker`,
     "- rivet stop <run>   stops a worker",
     "",
-    "Workers' reports (done, stuck, needs input) arrive here as messages.",
+    "Workers' reports (done, stuck, needs input) arrive here as messages, and so does a warning",
+    "when two workers change the same files in ways that will conflict.",
     ...(run.task ? ["", `The user asks: ${run.task}`] : []),
   ].join("\n");
 }

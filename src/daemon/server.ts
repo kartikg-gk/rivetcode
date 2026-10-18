@@ -36,6 +36,8 @@ export type DaemonOptions = {
   github?(run: Run): Promise<GitHub>;
   // How often open pull requests are checked.
   prWatchMs?: number;
+  // How often workers' branches are checked for clashes to tell their orchestrators about.
+  radarMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -499,6 +501,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
+    scheduler.watchRadar(opts.radarMs ?? 60_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {
       void scheduler.recover(id).catch((e) => opts.onError?.(e));
