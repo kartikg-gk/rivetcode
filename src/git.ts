@@ -12,12 +12,12 @@ export class GitError extends Error {
 }
 
 // Runs the real git binary without a shell, so paths with spaces need no quoting.
-export function git(args: string[], cwd: string): Promise<string> {
+export function git(args: string[], cwd: string, env?: Record<string, string>): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       "git",
       args,
-      { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
+      { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024, ...(env ? { env: { ...process.env, ...env } } : {}) },
       (err, stdout, stderr) => {
         if (err) {
           const code = typeof err.code === "number" ? err.code : null;

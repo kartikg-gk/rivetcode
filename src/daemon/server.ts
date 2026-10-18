@@ -21,6 +21,7 @@ const BODY_LIMIT = 1024 * 1024;
 const CONFIG_KEYS = [
   "check",
   "test",
+  "verify.reuse",
   "worker.agent",
   "worker.permission",
   "worker.model",
@@ -349,6 +350,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (id === null) throw new HttpError(404, "unknown session");
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
+      return;
+    }
+    const check = /^\/api\/v1\/sessions\/([^/]+)\/check$/.exec(path);
+    if (check) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId } = session(check[1]);
+      reply(res, 200, await scheduler.agentCheck(runId));
       return;
     }
     const send = /^\/api\/v1\/sessions\/([^/]+)\/send$/.exec(path);

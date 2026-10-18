@@ -49,6 +49,7 @@ const USAGE = `usage: rivet <command>
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
                                         report this session's state (inside an agent)
+  check                                 run the project's check and tests on this worktree (inside a worker)
   send --session <id> --message <text>  send a message to a running session`;
 
 class UsageError extends Error {}
@@ -155,6 +156,15 @@ async function send(args: string[], io: CliIo): Promise<number> {
     : delivery === "next-launch" ? `queued for ${session}: it is not running and gets the message when it starts again`
     : `sent to ${session}`);
   return 0;
+}
+
+// Run by a worker's agent: Rivet runs the project's check and tests on its worktree.
+async function check(io: CliIo): Promise<number> {
+  const session = io.env.RIVET_SESSION_ID?.trim();
+  if (!session) throw new UsageError("check runs inside a worker started by Rivet");
+  const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/check`, {}, RUN_TIMEOUT_MS) as { ok: boolean; output: string };
+  (result.ok ? io.out : io.err)(result.output);
+  return result.ok ? 0 : 1;
 }
 
 async function daemon(args: string[], io: CliIo): Promise<number> {
@@ -478,6 +488,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "hooks": return await hooks(args, io);
       case "report": return await report(args, io);
       case "send": return await send(args, io);
+      case "check": return await check(io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
       case "spawn": return await startSession(args, io, "worker");

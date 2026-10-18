@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { git } from "../git.js";
 import type { Agent } from "../agents/agent.js";
-import { abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand } from "../merge.js";
+import { abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand, workingTree } from "../merge.js";
 import { normalizePermission } from "../agents/command.js";
 import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
@@ -124,7 +124,7 @@ export function createScheduler(d: SchedulerDeps) {
         for (const rule of commandRules(command)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       }
       const check = config.check?.trim();
-      if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check);
+      if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check, config["verify.reuse"] !== "off");
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
@@ -213,8 +213,38 @@ export function createScheduler(d: SchedulerDeps) {
     });
   }
 
+  // The project's check, then its tests, on a worker's worktree as it is now.
+  async function verify(run: Run): Promise<{ ok: true } | { ok: false; why: string }> {
+    const config = await d.write(() => d.store.getConfig(run.project));
+    for (const [what, command, timeout] of [["check", config.check, checkTimeout], ["tests", config.test, testTimeout]] as const) {
+      if (!command) continue;
+      const result = await runCommand(command, run.node.worktree, timeout);
+      if (!result.ok) return { ok: false, why: `${what} "${command}" failed on the finished work:\n${result.output}` };
+    }
+    return { ok: true };
+  }
+
+  // Worktree states whose check and tests a worker got to pass with "rivet check".
+  const passed = new Map<string, string>();
+
+  // "rivet check" from a worker: Rivet runs the check and tests for it and remembers a
+  // pass, so the same files are not checked again when it reports done.
+  async function agentCheck(runId: string): Promise<{ ok: boolean; output: string }> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker runs the check");
+    const tree = await workingTree(run.node.worktree);
+    const result = await verify(run);
+    if (!result.ok) {
+      passed.delete(runId);
+      return { ok: false, output: result.why };
+    }
+    passed.set(runId, tree);
+    return { ok: true, output: "check and tests passed" };
+  }
+
   // A worker says it is done: its leftovers are committed, the check and the tests
-  // decide, and a pass opens or updates its pull request.
+  // decide, and a pass opens or updates its pull request. A pass the worker already got
+  // from "rivet check" on these exact files counts, unless the project turned that off.
   async function workFinished(runId: string): Promise<void> {
     const run = await load(runId);
     if (run.node.status !== "running" || run.node.finishedAt) return;
@@ -222,11 +252,12 @@ export function createScheduler(d: SchedulerDeps) {
     // Any failure noted on an earlier attempt is over now.
     await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString(), summary: null }));
     const config = await d.write(() => d.store.getConfig(run.project));
-    for (const [what, command, timeout] of [["check", config.check, checkTimeout], ["tests", config.test, testTimeout]] as const) {
-      if (!command) continue;
-      const result = await runCommand(command, run.node.worktree, timeout);
+    const reused = config["verify.reuse"] !== "off" && passed.get(runId) === await workingTree(run.node.worktree);
+    passed.delete(runId);
+    if (!reused) {
+      const result = await verify(run);
       if (!result.ok) {
-        await workFailed(runId, `${what} "${command}" failed on the finished work:\n${result.output}`);
+        await workFailed(runId, result.why);
         return;
       }
     }
@@ -580,7 +611,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
+  return { launch, startRun, agentCheck, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;
