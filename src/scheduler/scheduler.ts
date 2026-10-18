@@ -495,11 +495,17 @@ export function createScheduler(d: SchedulerDeps) {
     if (run.role === "orchestrator") {
       if (d.runtime.isAlive(sessionOf(run))) return;
       if (run.node.status !== "running") await transition(runId, "running");
-      // A terminal agent may keep no conversation to resume, so it starts again and is
-      // told to look first: the workers it started may still be running or done.
-      // The test fake's prompt is its script, so it gets no note.
-      const prompt = run.node.agent === "fake" ? orchestratorPrompt(run) : [RESTART_NOTE, "", orchestratorPrompt(run)].join("\n");
-      await launch(await load(runId), prompt);
+      const fresh = await load(runId);
+      // It continues its own conversation, told to look first: the workers it started may
+      // have finished or reported while it was away.
+      if (await d.agents(fresh.node.agent).restoreCommand({ sessionId: sessionOf(fresh), workspace: fresh.node.worktree, ...(fresh.node.agentSessionId ? { capturedId: fresh.node.agentSessionId } : {}) })) {
+        await launch(fresh, RESTART_NOTE, { resume: true });
+        return;
+      }
+      // No saved conversation: it starts again with the same note. The test fake's prompt
+      // is its script, so it gets no note.
+      const prompt = fresh.node.agent === "fake" ? orchestratorPrompt(fresh) : [RESTART_NOTE, "", orchestratorPrompt(fresh)].join("\n");
+      await launch(fresh, prompt);
       return;
     }
     if (run.node.status === "escalated" || run.node.status === "failed" || run.node.status === "pending") {

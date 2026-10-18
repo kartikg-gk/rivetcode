@@ -334,3 +334,32 @@ describe("an orchestrator after a restart", () => {
     expect(errors).toEqual([]);
   });
 });
+
+describe("an orchestrator's conversation", () => {
+  // Starts by staying alive; a resume writes the prompt it was given, then stays alive.
+  function resumable(): Agent {
+    const fake = getAgent("fake");
+    const script = fileURLToPath(new URL("../src/agents/fake-agent.mjs", import.meta.url));
+    return {
+      ...fake,
+      launchCommand: async () => [process.execPath, script, "--", JSON.stringify({ stayFor: 60_000 })],
+      restoreCommand: async (cfg) => [process.execPath, script, "--", JSON.stringify({ files: { "resumed.txt": cfg.prompt ?? "" }, stayFor: 60_000 })],
+    };
+  }
+
+  it("is continued by resume after a restart, told to check status before starting anything", async () => {
+    await start(resumable());
+    const orch = (await api("POST", "/api/v1/runs", { repo, task: "split the work", agent: "claude", role: "orchestrator" })).json.runId as string;
+    await new Promise((r) => setTimeout(r, 300));
+    await daemon!.stop();
+    daemon = undefined;
+    await start(resumable());
+    expect((await api("POST", `/api/v1/runs/${orch}/resume`)).status).toBe(202);
+    const file = join((await getRun(orch)).node.worktree, "resumed.txt");
+    const end = Date.now() + 10_000;
+    while (!existsSync(file) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    expect(await readFile(file, "utf8")).toMatch(/^Rivet was restarted\. Before starting anything, run rivet status/);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
+    expect(errors).toEqual([]);
+  });
+});
