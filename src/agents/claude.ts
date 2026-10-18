@@ -62,7 +62,20 @@ function conversationExists(projectsDir: string, id: string): boolean {
   return folders.some((f) => existsSync(join(projectsDir, f, `${id}.jsonl`)));
 }
 
-export function claudeAgent(binary: string, configPath = claudeConfigPath(), projectsDir = claudeProjectsDir()): Agent {
+// On Windows Claude runs shell commands through its PowerShell tool as well as Bash, and a
+// Bash rule does not cover PowerShell: each command rule is given for both, or an agent
+// that picks PowerShell stops at a permission question.
+export function shellRules(rules: string[] | undefined, platform: string = process.platform): string[] | undefined {
+  if (!rules || platform !== "win32") return rules;
+  const out = [...rules];
+  for (const rule of rules) {
+    const command = /^Bash\((.*)\)$/.exec(rule)?.[1];
+    if (command !== undefined && !out.includes(`PowerShell(${command})`)) out.push(`PowerShell(${command})`);
+  }
+  return out;
+}
+
+export function claudeAgent(binary: string, configPath = claudeConfigPath(), projectsDir = claudeProjectsDir(), platform: string = process.platform): Agent {
   return {
     // Only the interactive app asks about folder trust; print mode does not.
     prepare: async ({ workspace, headless }) => {
@@ -79,8 +92,9 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
     // id it already has, so a new one is taken. Hooks report whichever id Claude runs with.
     launchCommand: ({ headless, ...cfg }) => {
       const taken = !cfg.nativeSessionId && !!cfg.sessionId && conversationExists(projectsDir, claudeSessionId(cfg.sessionId));
+      const allowedTools = shellRules(cfg.allowedTools, platform);
       return claudeStartCommand({
-        binary, ...cfg, ...(taken ? { nativeSessionId: randomUUID() } : {}),
+        binary, ...cfg, ...(allowedTools ? { allowedTools } : {}), ...(taken ? { nativeSessionId: randomUUID() } : {}),
         ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },
@@ -88,8 +102,9 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
     restoreCommand: async ({ headless, ...cfg }) => {
       const id = resumeId(cfg.sessionId, cfg.capturedId);
       if (id === null || !conversationExists(projectsDir, id)) return null;
+      const allowedTools = shellRules(cfg.allowedTools, platform);
       return claudeResumeCommand({
-        binary, ...cfg, ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+        binary, ...cfg, ...(allowedTools ? { allowedTools } : {}), ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },
     installHooks: (workspace) => claudeHooks.install(workspace),
