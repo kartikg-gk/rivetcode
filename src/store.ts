@@ -21,6 +21,13 @@ export type Store = {
   listRuns(project?: string): string[];
   // state null keeps the current activity (a hook that only reports the agent's own session id).
   setActivity(runId: string, nodeId: string, state: ActivityState | null, agentSessionId?: string): boolean;
+  // A hook from the agent itself: activity, the first-signal time for this launch, and the
+  // agent's conversation id (kept for every launch, so usage counts retries too).
+  recordSignal(runId: string, nodeId: string, state: ActivityState | null, agentSessionId?: string): boolean;
+  // A launch: idle until the agent's hooks say otherwise; it must prove its signal again.
+  markLaunched(runId: string, nodeId: string): void;
+  // Every agent conversation a run's nodes have had.
+  conversations(runId: string): { nodeId: string; agent: string; id: string }[];
   createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
   queueMessage(runId: string, nodeId: string, message: string, from?: string): number | null;
   undeliveredMessages(runId: string, nodeId: string): { id: number; message: string }[];
@@ -186,6 +193,21 @@ MIGRATIONS.push({ version: 5, sql: `
 ALTER TABLE runs ADD COLUMN terminate_on_pr_merge INTEGER NOT NULL DEFAULT 0 CHECK (terminate_on_pr_merge IN (0, 1));
 ` });
 
+// When a node first started, the first hook of its current launch, and every agent
+// conversation a node has had (one per launch, plus conflict fixes on parents).
+MIGRATIONS.push({ version: 6, sql: `
+ALTER TABLE nodes ADD COLUMN started_at TEXT;
+ALTER TABLE nodes ADD COLUMN first_signal_at TEXT;
+CREATE TABLE conversations (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  seen_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, node_id, conversation_id)
+);
+` });
+
 function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
@@ -213,7 +235,7 @@ type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
   summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
-  activity_at: string | null; finished_at: string | null;
+  activity_at: string | null; finished_at: string | null; started_at: string | null; first_signal_at: string | null;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -233,8 +255,9 @@ export function openStore(data: string): Store {
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
-      branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at,
+      started_at, first_signal_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
   const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
@@ -253,6 +276,18 @@ export function openStore(data: string): Store {
   const selectUndelivered = db.prepare(`SELECT id, message FROM outbox
     WHERE run_id = ? AND node_id = ? AND delivered_at IS NULL ORDER BY id`);
   const updateDelivered = db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
+  const updateSignal = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
+    activity_at = CASE WHEN ? IS NULL THEN activity_at ELSE ? END,
+    agent_session_id = COALESCE(?, agent_session_id),
+    first_signal_at = COALESCE(first_signal_at, ?)
+    WHERE run_id = ? AND id = ?`);
+  const insertConversation = db.prepare(`INSERT INTO conversations (run_id, node_id, agent, conversation_id, seen_at)
+    SELECT run_id, id, agent, ?, ? FROM nodes WHERE run_id = ? AND id = ?
+    ON CONFLICT DO NOTHING`);
+  const updateLaunched = db.prepare(`UPDATE nodes SET activity = 'idle', activity_at = ?, first_signal_at = NULL,
+    started_at = COALESCE(started_at, ?) WHERE run_id = ? AND id = ?`);
+  const selectConversations = db.prepare(`SELECT node_id, agent, conversation_id FROM conversations
+    WHERE run_id = ? ORDER BY seen_at, node_id`);
   const updateStale = db.prepare("UPDATE nodes SET activity = 'exited' WHERE activity IS NOT NULL AND activity <> 'exited'");
 
   function check(run: Run): void {
@@ -290,7 +325,7 @@ export function openStore(data: string): Store {
             run.id, n.id, position, n.parentId, n.depth, n.kind, n.title, n.prompt,
             JSON.stringify(n.files), n.agent, n.branch, n.worktree, n.status, n.attempts,
             n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
-            n.activityAt ?? null, n.finishedAt ?? null,
+            n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
           );
         });
         db.exec("COMMIT");
@@ -322,6 +357,8 @@ export function openStore(data: string): Store {
         ...(n.pr_status !== null ? { prStatus: n.pr_status as Node["prStatus"] } : {}),
         ...(n.activity_at !== null ? { activityAt: n.activity_at } : {}),
         ...(n.finished_at !== null ? { finishedAt: n.finished_at } : {}),
+        ...(n.started_at !== null ? { startedAt: n.started_at } : {}),
+        ...(n.first_signal_at !== null ? { firstSignalAt: n.first_signal_at } : {}),
       }));
       return {
         id: r.id, project: r.project, repo: r.repo, base: r.base, task: r.task,
@@ -339,6 +376,24 @@ export function openStore(data: string): Store {
     setActivity(runId, nodeId, state, agentSessionId) {
       const now = state === null ? null : new Date().toISOString();
       return updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
+    },
+
+    recordSignal(runId, nodeId, state, agentSessionId) {
+      const now = new Date().toISOString();
+      const at = state === null ? null : now;
+      const found = updateSignal.run(state, at, at, agentSessionId ?? null, now, runId, nodeId).changes > 0;
+      if (found && agentSessionId) insertConversation.run(agentSessionId, now, runId, nodeId);
+      return found;
+    },
+
+    markLaunched(runId, nodeId) {
+      const now = new Date().toISOString();
+      updateLaunched.run(now, now, runId, nodeId);
+    },
+
+    conversations(runId) {
+      return (selectConversations.all(runId) as { node_id: string; agent: string; conversation_id: string }[])
+        .map((r) => ({ nodeId: r.node_id, agent: r.agent, id: r.conversation_id }));
     },
 
     createReport(runId, nodeId, kind, message) {

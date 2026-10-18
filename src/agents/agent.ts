@@ -28,6 +28,8 @@ export type Agent = {
   promptVia: PromptVia;
   // Whether text typed into its stdin reaches it (how sent messages are delivered).
   acceptsInput(o: { headless: boolean }): boolean;
+  // Whether its hooks report activity to Rivet, so silence means something.
+  signals: boolean;
   launchCommand(cfg: AgentLaunch): Promise<string[]>;
   restoreCommand(cfg: AgentRestore): Promise<string[] | null>;
   installHooks(workspace: string): Promise<void>;

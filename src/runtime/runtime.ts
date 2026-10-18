@@ -33,6 +33,8 @@ export type ExitListener = (sessionId: string, launchId: string, exitCode: numbe
 export type Runtime = {
   start(o: StartOptions): Promise<Launch>;
   isAlive(sessionId: string): boolean;
+  // Whether a running session reads what is typed to it (a headless agent does not).
+  takesInput(sessionId: string): boolean;
   output(sessionId: string, lines: number): Output | null;
   // Types a line (text, then Enter).
   write(sessionId: string, text: string): Promise<void>;
@@ -248,6 +250,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
   return {
     start,
     isAlive: (sessionId) => procs.get(sessionId)?.alive ?? false,
+    takesInput: (sessionId) => { const p = procs.get(sessionId); return !!p?.alive && p.handle.takesInput; },
     output(sessionId, lines) {
       const p = procs.get(sessionId);
       if (!p) return null;

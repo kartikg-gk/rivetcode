@@ -54,6 +54,11 @@ describe("codex commands", () => {
       .toEqual(["codex", "resume", ...BASE, "--dangerously-bypass-approvals-and-sandbox", "-c", "projects={'/w'={trust_level=\"trusted\"}}", "th-1", "--", "continue"]);
   });
 
+  it("resumes headless through exec resume, with the sandbox as config", () => {
+    expect(codexResumeCommand({ binary: "codex", workspace: "/w", capturedId: "th-1", prompt: "messages", permission: "accept-edits", headless: true, hookFlags: [] }))
+      .toEqual(["codex", "exec", "resume", ...BASE, "-c", 'sandbox_mode="workspace-write"', "-c", "projects={'/w'={trust_level=\"trusted\"}}", "th-1", "--", "messages"]);
+  });
+
   it("delivers its hooks as per-launch config calling this rivet by absolute path", () => {
     expect(hooks).toEqual([
       "-c", 'hooks.SessionStart=[{hooks=[{type="command",command="\'/opt/rivet/bin/rivet\' hooks codex session-start",timeout=5}]}]',

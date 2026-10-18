@@ -88,7 +88,9 @@ export function createScheduler(d: SchedulerDeps) {
   };
   const childrenOf = (run: Run, id: string) => run.nodes.filter((n) => n.parentId === id);
 
-  async function launch(run: Run, node: Node, prompt?: string): Promise<string> {
+  // resume: continue the agent's last conversation (the one its hooks reported) instead
+  // of starting a new one; null when the agent has none Rivet can resume.
+  async function launch(run: Run, node: Node, prompt?: string, o: { resume?: boolean } = {}): Promise<string> {
     const sessionId = sessionIdOf(run.id, node.id);
     if (d.runtime.isAlive(sessionId)) throw new SchedulerError(409, "session is already running");
     if (!existsSync(node.worktree)) throw new SchedulerError(409, `worktree is missing: ${node.worktree}`);
@@ -102,16 +104,20 @@ export function createScheduler(d: SchedulerDeps) {
       allowedTools.push(`Bash(${command})`, `Bash(${command}:*)`);
     }
     const check = config.check?.trim();
-    if (check && prompt !== undefined && node.kind === "leaf" && node.agent !== "fake") prompt += checkNote(check);
+    if (check && prompt !== undefined && node.kind === "leaf" && node.agent !== "fake" && !o.resume) prompt += checkNote(check);
     // interactive: the agent's own app in a terminal you can attach to; headless: it runs to the end on its own.
     const headless = config["worker.mode"] !== "interactive";
-    const argv = await agent.launchCommand({
+    const cfg = {
       sessionId, workspace: node.worktree, headless,
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
       ...(model ? { model } : {}),
       ...(allowedTools.length ? { allowedTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
-    });
+    };
+    const argv = o.resume
+      ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })
+      : await agent.launchCommand(cfg);
+    if (!argv) throw new SchedulerError(409, `${node.id} has no conversation to resume`);
     await agent.installHooks(node.worktree);
     await agent.prepare?.({ workspace: node.worktree, headless });
     // Recorded before the process exists, so even an instant exit is attributed to it.
@@ -137,7 +143,7 @@ export function createScheduler(d: SchedulerDeps) {
       throw e;
     }
     doneReported.delete(sessionId);
-    await d.write(() => d.store.setActivity(run.id, node.id, "active"));
+    await d.write(() => d.store.markLaunched(run.id, node.id));
     await deliverQueued(run.id, node.id);
     return launchId;
   }
@@ -157,7 +163,8 @@ export function createScheduler(d: SchedulerDeps) {
     const sessionId = sessionIdOf(runId, nodeId);
     const pending = await d.write(() => d.store.undeliveredMessages(runId, nodeId));
     for (const m of pending) {
-      if (!d.runtime.isAlive(sessionId)) return;
+      // A headless agent gets its messages when its turn ends (see messagesAtTurnEnd).
+      if (!d.runtime.takesInput(sessionId)) return;
       try { await d.runtime.write(sessionId, m.message); } catch { return; }
       await d.write(() => d.store.markDelivered(m.id));
     }
@@ -252,8 +259,33 @@ export function createScheduler(d: SchedulerDeps) {
       }
       return;
     }
-    if (code === 0 || doneReported.has(sessionId)) await leafFinished(runId, nodeId);
-    else await leafFailed(runId, nodeId, `agent exited with code ${code}\n${lastOutput(sessionId)}`);
+    if (code === 0 || doneReported.has(sessionId)) {
+      if (await messagesAtTurnEnd(run, node)) return;
+      await leafFinished(runId, nodeId);
+    } else await leafFailed(runId, nodeId, `agent exited with code ${code}\n${lastOutput(sessionId)}`);
+  }
+
+  // A headless agent could not read messages sent while it worked. Before its work is
+  // taken, its conversation is resumed once with them; that turn's end is its finish.
+  // False when there is nothing to deliver or no conversation to resume (they then wait
+  // for the next launch).
+  async function messagesAtTurnEnd(run: Run, node: Node): Promise<boolean> {
+    const pending = await d.write(() => d.store.undeliveredMessages(run.id, node.id));
+    if (pending.length === 0) return false;
+    const prompt = [
+      "Messages arrived while you worked on your part:",
+      ...pending.map((m) => `- ${m.message}`),
+      "",
+      "Act on them if they change your part and commit any change, then report done again.",
+    ].join("\n");
+    try {
+      await launch(run, node, prompt, { resume: true });
+    } catch (e) {
+      report(e);
+      return false;
+    }
+    for (const m of pending) await d.write(() => d.store.markDelivered(m.id));
+    return true;
   }
 
   // "rivet report --done": the agent says it is finished; stop it and take the work.
@@ -376,6 +408,8 @@ export function createScheduler(d: SchedulerDeps) {
     const message = `Note from Rivet: "${child.title}" is finished and merged into ${parent.branch}.`;
     for (const s of childrenOf(run, parent.id)) {
       if (s.id === child.id || s.kind !== "leaf" || s.status !== "running" || s.finishedAt) continue;
+      // A headless agent reads nothing while it works, and a note is not worth another turn.
+      if (!d.runtime.takesInput(sessionIdOf(run.id, s.id))) continue;
       const id = await d.write(() => d.store.queueMessage(run.id, s.id, message, sessionIdOf(run.id, parent.id)));
       if (id !== null) await deliverQueued(run.id, s.id).catch(report);
     }

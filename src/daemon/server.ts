@@ -14,7 +14,8 @@ import { radar } from "../scheduler/radar.js";
 import { cleanRun, prepareRun, RunInputError, SetupError } from "../scheduler/runs.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
-import { ACTIVITY_STATES, type ActivityState, type Node } from "../tree.js";
+import { runTokens } from "../usage.js";
+import { ACTIVITY_STATES, noSignal, type ActivityState, type Node } from "../tree.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
@@ -342,7 +343,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 204);
         return;
       }
-      const found = await write(() => store.setActivity(runId, nodeId, state, agentSessionId));
+      const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
       reply(res, 204);
       return;
@@ -368,8 +369,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const from = optionalString(payload.from, "from");
       const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from));
       if (id === null) throw new HttpError(404, "unknown session");
-      if (runtime.isAlive(sessionIdOf(runId, nodeId))) await scheduler.deliver(runId, nodeId);
-      reply(res, 202, { id });
+      const target = sessionIdOf(runId, nodeId);
+      // Typed in now, handed over when a headless agent ends its turn, or at the next launch.
+      const delivery = runtime.takesInput(target) ? "now" : runtime.isAlive(target) ? "turn-end" : "next-launch";
+      if (delivery === "now") await scheduler.deliver(runId, nodeId);
+      reply(res, 202, { id, delivery });
       return;
     }
     if (path === "/api/v1/runs") {
@@ -422,7 +426,12 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const live = Object.fromEntries(run.nodes.map((n) => [n.id, runtime.isAlive(sessionIdOf(run.id, n.id))]));
         const pr = await write(() => store.getPr(run.id));
         const terminateOnPrMerge = await write(() => store.getTerminateOnPrMerge(run.id));
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, now: new Date().toISOString() });
+        const at = Date.now();
+        const silent = run.nodes.filter((n) => noSignal(n, at, live[n.id]!, getAgent(n.agent).signals)).map((n) => n.id);
+        // Every conversation its agents had (retries and conflict fixes too), from their own files.
+        const conversations = await write(() => store.conversations(run.id));
+        const usage = { conversations: conversations.length, tokens: runTokens(conversations) };
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, now: new Date(at).toISOString() });
         return;
       }
       if (action === "radar") {

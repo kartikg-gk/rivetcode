@@ -53,7 +53,22 @@ export type Node = {
   activityAt?: string;
   // When a leaf's work finished; it then waits for its parent to merge it.
   finishedAt?: string;
+  // When the node's agent first started in this run (retries keep it).
+  startedAt?: string;
+  // The first hook of the current launch; unset means the agent has not been heard from.
+  firstSignalAt?: string;
 };
+
+// How long a launched agent may stay silent before Rivet stops calling it idle: its boot
+// plus the gap to its first hook. Past it, silence looks the same as broken hooks.
+export const NO_SIGNAL_GRACE_MS = 90_000;
+
+// A live agent that should report through hooks, has not since this launch, and has
+// been quiet past the grace period: working or stuck can not be told apart.
+export function noSignal(node: Node, now: number, alive: boolean, signals: boolean): boolean {
+  return alive && signals && !node.firstSignalAt && node.activity === "idle"
+    && !!node.activityAt && now - Date.parse(node.activityAt) > NO_SIGNAL_GRACE_MS;
+}
 
 // Every level adds a parent that waits on its children, so the tree stays shallow.
 export const MAX_LEVELS = 3;

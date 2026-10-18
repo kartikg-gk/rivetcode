@@ -6,7 +6,7 @@ import { git } from "../git.js";
 import type { Run } from "../store.js";
 import type { Node, PlanNode } from "../tree.js";
 import { waitForTrash } from "../worktree.js";
-import { addTokens, claudeSessionTokens, NO_TOKENS, type TokenUse } from "./tokens.js";
+import { NO_TOKENS, type TokenUse } from "../usage.js";
 
 // One task, the same repo, several ways of splitting it (e.g. single, flat, tree).
 export type BenchSpec = {
@@ -65,6 +65,8 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
   const started = Date.now();
   let run: Run | undefined;
   let error: string | undefined;
+  // Every conversation of the run, retries and conflict fixes included.
+  let tokens: TokenUse = NO_TOKENS;
   try {
     const project = repo.split(/[\\/]/).pop()!.toLowerCase().trim().replace(/ /g, "-");
     const settings: Record<string, string | undefined> = {
@@ -80,7 +82,13 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
       const root = run.nodes[0]!;
       const finished = ["done", "failed", "escalated"].includes(root.status) && !run.nodes.some(BUSY);
       const stuck = !run.nodes.some(BUSY) && run.nodes.some((n) => n.status === "escalated");
-      if (finished || stuck) { await daemon.idle(); run = (await api("GET", `/api/v1/runs/${runId}`)).run as Run; break; }
+      if (finished || stuck) {
+        await daemon.idle();
+        const final = await api("GET", `/api/v1/runs/${runId}`);
+        run = final.run as Run;
+        tokens = (final.usage as { tokens: TokenUse }).tokens;
+        break;
+      }
       if (Date.now() > deadline) { error = `timed out after ${spec.timeoutMinutes ?? 30} minutes`; break; }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -91,7 +99,6 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
     await waitForTrash();
   }
   const nodes = run?.nodes ?? [];
-  const tokens = nodes.reduce((t, n) => (n.agentSessionId ? addTokens(t, claudeSessionTokens(n.agentSessionId)) : t), NO_TOKENS);
   return {
     mode,
     runId: run?.id ?? "",
