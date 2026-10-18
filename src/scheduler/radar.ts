@@ -25,15 +25,18 @@ function unlanded(r: Run): boolean {
 }
 
 // Live conflict check between workers of one project: which pairs would clash when both
-// land, found while one of them still works rather than when the second PR merges.
-export async function radar(runs: Run[]): Promise<RadarHit[]> {
+// land, found while one of them still works rather than when the second PR merges. With
+// focus, only that worker's pairs, whether or not the other still works (checked the
+// moment it finishes, since workers often commit only at the end).
+export async function radar(runs: Run[], focus?: string): Promise<RadarHit[]> {
   const hits: RadarHit[] = [];
   const working = runs.filter(unlanded);
   for (let i = 0; i < working.length; i++) {
     for (const other of working.slice(i + 1)) {
       const a = working[i]!;
       if (a.repo !== other.repo) continue;
-      if (a.node.status !== "running" && other.node.status !== "running") continue;
+      if (focus !== undefined && a.id !== focus && other.id !== focus) continue;
+      if (focus === undefined && a.node.status !== "running" && other.node.status !== "running") continue;
       const files = await wouldConflict(a.repo, a.node.branch, other.node.branch);
       if (files?.length) hits.push({ a: a.id, b: other.id, files });
     }

@@ -231,6 +231,8 @@ export function createScheduler(d: SchedulerDeps) {
       }
     }
     await transition(runId, "done");
+    // Checked now as well as on the timer: its work may only now be committed.
+    await checkRadar(runId).catch(report);
     await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} is done and its check passed.`);
     // A run with a pull request pushes every new result; "pr=auto" opens one the first time.
     const hasPr = (await d.write(() => d.store.getPr(runId))) !== null;
@@ -484,18 +486,21 @@ export function createScheduler(d: SchedulerDeps) {
 
   // Tells the orchestrators of two workers whose branches would conflict, while one of
   // them still works, so it can sequence them or settle who changes the files.
-  async function checkRadar(): Promise<void> {
+  async function checkRadar(focus?: string): Promise<void> {
     const runs = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id)));
     const byId = new Map(runs.map((r) => [r.id, r]));
     const projects = new Set(runs.filter((r) => r.role === "worker" && r.orchestrator).map((r) => r.project));
     for (const project of projects) {
-      for (const hit of await radar(runs.filter((r) => r.project === project))) {
+      for (const hit of await radar(runs.filter((r) => r.project === project), focus)) {
         const key = `${hit.a}|${hit.b}|${hit.files.join(",")}`;
         if (warned.has(key)) continue;
         warned.add(key);
         const a = byId.get(hit.a)!, b = byId.get(hit.b)!;
         const label = (r: Run) => `${r.id}${r.name ? ` (${r.name})` : ""}, ${r.node.status === "running" ? "working" : "done"}`;
-        const message = `Workers ${label(a)} and ${label(b)} both change ${hit.files.join(", ")}: their work will conflict when both merge. Have one wait for the other or leave those files to it.`;
+        const working = a.node.status === "running" || b.node.status === "running";
+        const message = `Workers ${label(a)} and ${label(b)} both change ${hit.files.join(", ")}: their work will conflict when both merge. ${working
+          ? "Have one wait for the other or leave those files to it."
+          : "Once one is merged, Rivet brings the other up to date and its worker resolves the conflict."}`;
         for (const session of new Set([a.orchestrator, b.orchestrator].filter((o): o is string => !!o))) {
           const target = session.slice(0, session.indexOf("-"));
           const id = await d.write(() => d.store.queueMessage(target, NODE_ID, message, "rivet"));

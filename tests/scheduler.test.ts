@@ -163,6 +163,23 @@ describe("an orchestrator", () => {
     await api("POST", `/api/v1/runs/${orchestrator}/stop`);
   });
 
+  it("is told when a worker finishes on work that clashes with a finished one, without waiting for the timer", async () => {
+    await start(undefined, { radarMs: 3_600_000 });
+    const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const from = `${orchestrator}-agent`;
+    const one = await spawn({ files: { "shared.txt": "one" }, commit: "one" }, { name: "first", from });
+    await settled(one);
+    const two = await spawn({ files: { "shared.txt": "two" }, commit: "two" }, { name: "second", from });
+    await settled(two);
+    await new Promise((r) => setTimeout(r, 300));
+    const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
+    const warnings = inbox.split(/\r?\n/).filter((l) => l.includes("their work will conflict"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`Workers ${one} (first), done and ${two} (second), done both change shared.txt`);
+    expect(warnings[0]).toContain("Once one is merged, Rivet brings the other up to date");
+    await api("POST", `/api/v1/runs/${orchestrator}/stop`);
+  });
+
   it("refuses an unknown role", async () => {
     await start();
     expect((await api("POST", "/api/v1/runs", { repo, task: "t", role: "boss" })).status).toBe(400);
