@@ -143,6 +143,24 @@ describe("watching the pull request", () => {
     expect((await runOf(runId)).run.node.attempts).toBe(2);
   });
 
+  it("leaves reading the failure to the worker unless the project asks Rivet to fetch it", async () => {
+    const runId = await opened();
+    gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
+    gh.annotations[9] = [{ path: "a.txt" }];
+    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("ci_failed"));
+    expect(gh.requests.some((r) => r.includes("/annotations"))).toBe(false);
+  });
+
+  it("fetches the failing paths itself when pr.feedback is full", async () => {
+    await start({ pr: "auto", "pr.feedback": "full" });
+    const runId = await spawn();
+    await until(() => runOf(runId), (r) => r.pr !== null);
+    gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
+    gh.annotations[9] = [{ path: "a.txt" }];
+    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("ci_failed"));
+    expect(gh.requests.some((r) => r.includes("/check-runs/9/annotations"))).toBe(true);
+  });
+
   it("sends review comments to the worker", async () => {
     const runId = await opened();
     gh.comments[1] = [{ commit_id: "sha1", path: "a.txt", line: 1, body: "please use lowercase" }];

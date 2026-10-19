@@ -1,4 +1,4 @@
-import type { Run } from "../store.js";
+import type { PullRequest, Run } from "../store.js";
 
 // What a worker's agent is told. The fake agent's prompt is a script, so it gets it verbatim.
 export function workerPrompt(run: Run, retry?: string): string {
@@ -65,5 +65,42 @@ export function conflictPrompt(run: Run, conflicts: string[]): string {
     "",
     "Resolve only these conflicts, keeping the intent of both sides. Do not change any other file.",
     "Remove every conflict marker, then stage the files and commit the merge.",
+  ].join("\n");
+}
+
+// "owner/repo" from a pull request's web address.
+function repoOf(pr: PullRequest): string | null {
+  return /github\.com\/([^/]+\/[^/]+)\/pull\/\d+/.exec(pr.url)?.[1] ?? null;
+}
+
+// The read-only commands a worker may run to see its pull request's feedback for itself.
+export function feedbackRules(pr: PullRequest): string[] {
+  const repo = repoOf(pr);
+  return [
+    `Bash(gh pr checks ${pr.number}:*)`, `Bash(gh pr view ${pr.number}:*)`, "Bash(gh run view:*)",
+    ...(repo ? [`Bash(gh api repos/${repo}/pulls/${pr.number}/comments)`] : []),
+  ];
+}
+
+// What a worker is told when CI fails on its pull request. With the failing paths it gets
+// them; without, it is told where to look.
+export function ciFeedback(pr: PullRequest, paths?: string[]): string {
+  if (paths) return `CI failed on the pull request${paths.length ? ` in: ${paths.join(", ")}` : ""}. Fix it.`;
+  return [
+    `CI failed on pull request #${pr.number} (${pr.url}).`,
+    `See what failed with "gh pr checks ${pr.number}" and read the failing run's log with "gh run view <run id> --log-failed", then fix it.`,
+  ].join("\n");
+}
+
+// What a worker is told when its pull request gets review comments asking for changes.
+export function reviewFeedback(pr: PullRequest, comments?: { path: string; line?: number | null; body: string }[]): string {
+  if (comments) {
+    const text = comments.map((c) => `${c.path}${c.line ? `:${c.line}` : ""}: ${c.body}`).join("\n");
+    return `Review comments on the pull request:\n${text}\nAddress them.`;
+  }
+  const repo = repoOf(pr);
+  return [
+    `Pull request #${pr.number} (${pr.url}) has review comments asking for changes.`,
+    `Read them with "gh pr view ${pr.number} --comments"${repo ? ` and the comments on code lines with "gh api repos/${repo}/pulls/${pr.number}/comments"` : ""}, then address each one.`,
   ].join("\n");
 }
