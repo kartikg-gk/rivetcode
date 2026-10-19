@@ -586,3 +586,34 @@ describe("a task's own spec", () => {
     expect((await api("POST", "/api/v1/runs", { repo, task: "x", agent: "fake", spec: { minutes: -2 } })).json.error).toMatch(/must be a positive number/);
   });
 });
+
+describe("switching a worker's agent", () => {
+  it("stops the running agent and starts the other in the same worktree with a handoff", async () => {
+    const seen: string[] = [];
+    const fake = getAgent("fake");
+    const recording: Agent = {
+      ...fake,
+      launchCommand: async (cfg) => { seen.push(cfg.prompt ?? ""); return fake.launchCommand({ ...cfg, prompt: JSON.stringify({ stayFor: 60_000 }) }); },
+    };
+    await start(recording);
+    const runId = await spawn({ files: { "w.txt": "w" }, commit: "half done", stayFor: 60_000 });
+    await new Promise((r) => setTimeout(r, 500));
+    const before = (await getRun(runId)).node.worktree;
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude", model: "gpt-5" })).json.error).toMatch(/not a claude model/);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).status).toBe(202);
+    const run = await getRun(runId);
+    expect(run.node).toMatchObject({ agent: "claude", status: "running", worktree: before });
+    expect(seen[0]).toContain("You take over this task from another agent (fake), in the same worktree, branch and pull request.");
+    expect(seen[0]).toMatch(/Commits since the base:\n\w+ half done/);
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.live).toBe(true);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).json.error).toMatch(/already runs claude/);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("refuses a finished worker", async () => {
+    await start();
+    const runId = await spawn({ commit: "none" });
+    await settled(runId);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "codex" })).json.error).toMatch(/is done/);
+  });
+});

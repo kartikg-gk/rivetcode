@@ -129,10 +129,14 @@ export type NodeUpdate = {
   prompt?: string;
   // Where the root's pull request stands.
   prStatus?: Node["prStatus"] | null;
+  // The agent running the session (changed by a switch), and its own conversation id.
+  agent?: Node["agent"];
+  agentSessionId?: string | null;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
   status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt", prStatus: "pr_status",
+  agent: "agent", agentSessionId: "agent_session_id",
 };
 
 export class RunStoreError extends Error {

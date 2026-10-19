@@ -8,10 +8,10 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
+import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
 import { outsidePaths } from "./tasks.js";
-import { runUsage } from "../usage.js";
+import { conversationFile, runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
@@ -772,6 +772,30 @@ export function createScheduler(d: SchedulerDeps) {
     limitTimer.unref();
   }
 
+  // --- Switching a worker to another agent: the running one stops, the new one starts in
+  // the same worktree, branch and pull request with a handoff of where things are.
+  async function switchAgent(runId: string, to: Node["agent"], model?: string): Promise<void> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
+    if (run.node.status === "done" || run.node.status === "pending") throw new SchedulerError(409, `run ${runId} is ${run.node.status}; switch a worker that is working, failed or escalated`);
+    if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
+    const from = run.node.agent;
+    const conversation = run.node.agentSessionId ? conversationFile(from, run.node.agentSessionId) : null;
+    await stopSession(sessionOf(run));
+    const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
+    const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
+    await d.write(() => {
+      d.store.updateNode(runId, NODE_ID, { agent: to, agentSessionId: null });
+      const fresh = d.store.loadRun(runId);
+      const { model: _old, ...rest } = fresh;
+      d.store.saveRun(model ? { ...rest, model } : rest);
+    });
+    if (run.node.status !== "running") await transition(runId, "running");
+    const switched = await load(runId);
+    await launch(switched, switchPrompt(switched, { agent: from, conversation, log, status }));
+    await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
+  }
+
   let watcher: NodeJS.Timeout | undefined;
   // Looks at every open pull request on a timer until shutdown.
   function watchPrs(intervalMs: number): void {
@@ -853,7 +877,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits };
+  return { launch, startRun, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

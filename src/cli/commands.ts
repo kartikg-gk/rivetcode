@@ -44,6 +44,8 @@ const USAGE = `usage: rivet <command>
   review submit --verdict approved|changes_requested --summary <text> [--comment "<path>:<line>: <text>" ...]
                                         submit a review (inside a reviewer)
   clean <run>                           remove a run's worktree (the branch stays)
+  switch <run> claude|codex [--model <id>]
+                                        hand a worker's task to another agent in the same worktree
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
   cue list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
                                         saved prompts (to a session, or a new worker) and commands (run here)
@@ -636,7 +638,7 @@ async function panes(io: CliIo): Promise<number> {
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["spawn", "review", "cue", "automation", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -708,6 +710,15 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);
       case "cue": return await cue(args, io);
+      case "switch": {
+        const { flags, rest } = parseFlags(args, ["model"]);
+        const [runId, agent] = rest;
+        if (!runId || !agent) throw new UsageError("switch needs a run id and claude or codex");
+        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/switch`,
+          { agent, ...(typeof flags.get("model") === "string" ? { model: flags.get("model") } : {}) }, COMMAND_TIMEOUT_MS);
+        io.out(`${runId} now runs ${agent}, picking up from where the work stands`);
+        return 0;
+      }
       case "run": return await runFile(args, io);
       case "automation": return await automation(args, io);
       case "daemon": return await daemon(args, io);

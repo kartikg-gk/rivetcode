@@ -39,7 +39,7 @@ export type NewRun = {
 };
 
 // Model names that plainly belong to one agent, so the other is never started with them.
-const MODEL_FAMILIES = { claude: /^(claude|opus|sonnet|haiku)/i, codex: /^(gpt|o\d|codex)/i };
+export const MODEL_FAMILIES: Record<string, RegExp> = { claude: /^(claude|opus|sonnet|haiku)/i, codex: /^(gpt|o\d|codex)/i };
 
 // The main checkout, also when asked from inside a linked worktree (an agent's own), so
 // a new session never starts from another session's worktree.

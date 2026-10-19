@@ -10,7 +10,7 @@ import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } fr
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
-import { cleanRun, prepareRun, repoRoot, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
+import { cleanRun, MODEL_FAMILIES, prepareRun, repoRoot, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
 import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
@@ -596,7 +596,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 200, { ...found, enabled, nextRunAt });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review|switch))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -631,6 +631,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const payload = await body(req);
         const workers = await scheduler.stopRun(run.id, { keepWorkers: payload.keepWorkers === true });
         reply(res, 200, { workers });
+        return;
+      }
+      if (action === "switch") {
+        const payload = await body(req);
+        const to = optionalString(payload.agent, "agent");
+        if (!to || !AGENTS.includes(to as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
+        const model = optionalString(payload.model, "model");
+        if (model && MODEL_FAMILIES[to === "claude" ? "codex" : "claude"]?.test(model)) throw new HttpError(400, `model "${model}" is not a ${to} model`);
+        await scheduler.switchAgent(run.id, to as never, model);
+        reply(res, 202, { runId: run.id, agent: to });
         return;
       }
       if (action === "review") {
