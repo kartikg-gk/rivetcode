@@ -115,6 +115,18 @@ describe("opening the pull request", () => {
     expect((await onOrigin(`rivet/${runId}/agent`, "a.txt")).trim()).toBe("a");
   });
 
+  it("opens no pull request for work that changed nothing", async () => {
+    await start({ pr: "auto" });
+    const runId = await spawn({ stayFor: 100 });
+    const { run, pr } = await until(() => runOf(runId), (r) => r.run.node.status === "done");
+    await daemon!.idle();
+    expect(pr).toBeNull();
+    expect(run.node.summary).toBe("no changes: main already has what the task asks for");
+    expect(gh.prs).toHaveLength(0);
+    expect((await api("POST", `/api/v1/runs/${runId}/pr`)).json.error).toMatch(/changed nothing/);
+    expect(errors).toEqual([]);
+  });
+
   it("refuses a worker that is not done, and an orchestrator", async () => {
     await start();
     const slow = await spawn({ stayFor: 60_000 });

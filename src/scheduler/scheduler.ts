@@ -264,6 +264,12 @@ export function createScheduler(d: SchedulerDeps) {
         return;
       }
     }
+    // Work that changed nothing (the base already had it) is done, with no pull request to open.
+    if (!(await hasChanges(run))) {
+      await transition(runId, "done", `no changes: ${run.base} already has what the task asks for`);
+      await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} finished with no changes: ${run.base} already has what it was asked for.`);
+      return;
+    }
     await transition(runId, "done");
     // Checked now as well as on the timer: its work may only now be committed.
     await checkRadar(runId).catch(report);
@@ -390,6 +396,12 @@ export function createScheduler(d: SchedulerDeps) {
     return result.ok ? { ok: true, reason: "" } : { ok: false, reason: result.reason };
   }
 
+  // Whether the worker's branch has commits its base does not.
+  async function hasChanges(run: Run): Promise<boolean> {
+    const count = await git(["rev-list", "--count", `${run.base}..HEAD`], run.node.worktree).catch(() => "1");
+    return Number(count.trim()) > 0;
+  }
+
   async function filesChanged(run: Run): Promise<string[]> {
     const out = await git(["diff", "--name-only", `${run.base}...${run.node.branch}`], run.repo).catch(() => "");
     return out.split(/\r?\n/).filter(Boolean);
@@ -413,6 +425,7 @@ export function createScheduler(d: SchedulerDeps) {
     const node = run.node;
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker opens a pull request");
     if (node.status !== "done") throw new SchedulerError(409, `run ${runId} is not done (it is ${node.status})`);
+    if (!(await hasChanges(run))) throw new SchedulerError(409, `run ${runId} changed nothing, so there is no pull request to open`);
     const before = await headOf(node.worktree);
     try {
       await git(["fetch", "-q", "origin", run.base], node.worktree);
