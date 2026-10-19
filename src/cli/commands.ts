@@ -46,6 +46,7 @@ const USAGE = `usage: rivet <command>
   panes                                 show every running agent side by side
   daemon start|stop|status              run or control the background daemon
   doctor                                check what Rivet needs on this machine
+  login claude|codex                    log an agent's CLI in to its account (its own login)
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
                                         report this session's state (inside an agent)
@@ -461,6 +462,24 @@ async function ensureDaemon(io: CliIo): Promise<void> {
   }
 }
 
+// Logging in is the agent CLI's own: Rivet runs its login in this terminal.
+const LOGIN_ARGS: Record<string, string[]> = { claude: ["auth", "login"], codex: ["login"] };
+
+async function login(args: string[], io: CliIo): Promise<number> {
+  const name = args[0];
+  if (!name || !LOGIN_ARGS[name]) throw new UsageError("login needs claude or codex");
+  const { findClaude, findCodex } = await import("../agents/locate.js");
+  const binary = name === "claude" ? findClaude() : findCodex();
+  const { spawn } = await import("node:child_process");
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const child = spawn(binary, [...LOGIN_ARGS[name]!, ...args.slice(1)], { stdio: "inherit", windowsHide: false });
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  if (code === 0) io.out(`${name} is logged in; check with rivet doctor`);
+  return code === 0 ? 0 : 1;
+}
+
 async function doctorCommand(io: CliIo): Promise<number> {
   const { doctor, realProbes } = await import("./doctor.js");
   let probes = io.doctorProbes;
@@ -491,6 +510,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "check": return await check(io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
+      case "login": return await login(args, io);
       case "spawn": return await startSession(args, io, "worker");
       case "orchestrator": return await startSession(args, io, "orchestrator");
       case "stop": {

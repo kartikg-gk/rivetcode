@@ -74,3 +74,32 @@ describe("doctor", () => {
     expect(out.join("\n")).toMatch(/^FAIL +build/m);
   });
 });
+
+describe("agent logins", () => {
+  it("says who each agent is logged in as, and warns when one is not", async () => {
+    const c = await byName(healthy({
+      run: async (file, args) => {
+        if (file === "git") return "git version 2.53.0";
+        if (args[0] === "--version") return `${file} 1.2.3`;
+        if (file === "/bin/claude") return JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email: "me@example.com" });
+        throw Object.assign(new Error("exit 1"), { stdout: "Not logged in\n", stderr: "" });
+      },
+    }));
+    expect(c.claude).toMatchObject({ level: "ok", message: "/bin/claude 1.2.3 (/bin/claude); logged in with claude.ai as me@example.com" });
+    expect(c.codex).toMatchObject({ level: "warn", message: "/bin/codex 1.2.3 (/bin/codex); not logged in, so its runs will fail: run rivet login codex" });
+  });
+
+  it("reads a logged-in codex", async () => {
+    const c = await byName(healthy({
+      run: async (file, args) => (file === "git" ? "git version 2.53.0" : args[0] === "login" ? "Logged in using ChatGPT" : `${file} 1.2.3`),
+    }));
+    expect(c.codex!.message).toBe("/bin/codex 1.2.3 (/bin/codex); logged in with ChatGPT");
+  });
+
+  it("rivet login refuses an unknown agent", async () => {
+    const out: string[] = [];
+    const io = { env: {}, cwd: data, out: (s: string) => out.push(s), err: (s: string) => out.push(s) };
+    expect(await runCli(["login", "gpt"], io as never)).toBe(2);
+    expect(out.join("\n")).toMatch(/login needs claude or codex/);
+  });
+});

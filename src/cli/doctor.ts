@@ -21,7 +21,10 @@ export type Probes = {
 };
 
 const run = (file: string, args: string[]) => new Promise<string>((resolve, reject) => {
-  execFile(file, args, { windowsHide: true, timeout: 10_000 }, (e, out) => (e ? reject(e) : resolve(String(out).trim())));
+  // A failure keeps what was printed: "not logged in" comes with a non-zero exit.
+  execFile(file, args, { windowsHide: true, timeout: 10_000 }, (e, out, err) =>
+    // Some CLIs print their answer on stderr (codex login status does).
+    (e ? reject(Object.assign(e, { stdout: String(out), stderr: String(err) })) : resolve((String(out).trim() || String(err)).trim())));
 });
 
 export const realProbes = (overrides: Partial<Probes>): Probes => ({
@@ -46,9 +49,32 @@ async function agentCheck(name: string, find: () => string, p: Probes): Promise<
   let binary: string;
   try { binary = find(); } catch (e) { return { level: "warn", name, message: `${(e as Error).message}; runs that use ${name} will be refused` }; }
   const version = await p.run(binary, ["--version"]).catch(() => "");
-  return version
-    ? { level: "ok", name, message: `${version.split(/\r?\n/)[0]} (${binary})` }
-    : { level: "warn", name, message: `${binary} does not answer --version` };
+  if (!version) return { level: "warn", name, message: `${binary} does not answer --version` };
+  const found = `${version.split(/\r?\n/)[0]} (${binary})`;
+  const login = await loginStatus(name, binary, p);
+  if (login === false) return { level: "warn", name, message: `${found}; not logged in, so its runs will fail: run rivet login ${name}` };
+  return { level: "ok", name, message: login ? `${found}; logged in ${login}` : found };
+}
+
+// Who an agent's own CLI is logged in as: a description, false when it is not logged in,
+// or null when the CLI cannot tell (an older version).
+async function loginStatus(name: string, binary: string, p: Probes): Promise<string | false | null> {
+  if (name === "claude") {
+    const out = await p.run(binary, ["auth", "status"]).catch((e: { stdout?: string }) => e.stdout ?? "");
+    try {
+      const s = JSON.parse(out) as { loggedIn?: boolean; authMethod?: string; email?: string };
+      if (typeof s.loggedIn !== "boolean") return null;
+      if (!s.loggedIn) return false;
+      return [s.authMethod && `with ${s.authMethod}`, s.email && `as ${s.email}`].filter(Boolean).join(" ");
+    } catch { return null; }
+  }
+  if (name === "codex") {
+    const out = await p.run(binary, ["login", "status"]).catch((e: { stdout?: string; stderr?: string }) => `${e.stdout ?? ""}${e.stderr ?? ""}`);
+    if (/not logged in/i.test(out)) return false;
+    const how = /logged in using (.+)/i.exec(out)?.[1]?.trim();
+    return how ? `with ${how}` : null;
+  }
+  return null;
 }
 
 // One line per thing Rivet needs: what works, what is degraded, what blocks it.
