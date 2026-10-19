@@ -515,3 +515,45 @@ describe("delegating to a partner", () => {
     await api("POST", `/api/v1/runs/${orch}/stop`, {});
   });
 });
+
+describe("automations", () => {
+  it("are saved with their next time, run by hand without moving it, paused and removed", async () => {
+    await start();
+    const add = await api("POST", "/api/v1/automations", { repo, name: "nightly", cron: "0 2 * * *", zone: "UTC", prompt: JSON.stringify({ files: { "n.txt": "n" }, commit: "n" }), agent: "fake" });
+    expect(add.status).toBe(201);
+    expect(add.json).toMatchObject({ name: "nightly", enabled: true, role: "worker", nextRunAt: expect.stringMatching(/T02:00:00\.000Z$/) });
+    expect((await api("POST", "/api/v1/automations", { repo, name: "nightly", cron: "0 2 * * *", prompt: "x" })).status).toBe(409);
+    expect((await api("POST", "/api/v1/automations", { repo, name: "bad", cron: "0 25 * * *", prompt: "x" })).json.error).toMatch(/out of 0-23/);
+    const ran = await api("POST", "/api/v1/automations/nightly/run");
+    expect((await settled(ran.json.runId)).name).toBe("nightly");
+    const listed = (await api("GET", "/api/v1/automations")).json.automations[0];
+    expect(listed.nextRunAt).toBe(add.json.nextRunAt);
+    expect(listed.runs).toMatchObject([{ runId: ran.json.runId }]);
+    expect((await api("POST", "/api/v1/automations/nightly/pause")).json.enabled).toBe(false);
+    expect((await api("DELETE", "/api/v1/automations/nightly")).status).toBe(204);
+    expect((await api("GET", "/api/v1/automations")).json.automations).toEqual([]);
+  });
+
+  it("starts the run of one that came due while the daemon was down, once", async () => {
+    const { openStore } = await import("../src/store.js");
+    const { realpath } = await import("node:fs/promises");
+    const root = await realpath(repo);
+    const store = openStore(data);
+    store.saveAutomation({
+      id: "a1", project: projectOf(root), repo: root, name: "missed", prompt: JSON.stringify({ commit: "none" }), role: "worker", agent: "fake",
+      cron: "0 2 * * *", zone: "UTC", enabled: true, nextRunAt: "2026-01-01T02:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    store.close();
+    await start();
+    const end = Date.now() + 10_000;
+    let a: { nextRunAt: string; runs: { runId?: string }[] };
+    do {
+      a = (await api("GET", "/api/v1/automations")).json.automations[0];
+      if (a.runs.length) break;
+      await new Promise((r) => setTimeout(r, 50));
+    } while (Date.now() < end);
+    expect(a.runs).toHaveLength(1);
+    expect(Date.parse(a.nextRunAt)).toBeGreaterThan(Date.now());
+    await settled(a.runs[0]!.runId!);
+  });
+});

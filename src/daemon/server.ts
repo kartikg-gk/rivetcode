@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
@@ -9,9 +10,10 @@ import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } fr
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
-import { cleanRun, prepareRun, repoRoot, RunInputError, SetupError } from "../scheduler/runs.js";
+import { cleanRun, prepareRun, repoRoot, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
+import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { runUsage } from "../usage.js";
@@ -58,6 +60,8 @@ export type DaemonOptions = {
   prWatchMs?: number;
   // How often workers' branches are checked for clashes to tell their orchestrators about.
   radarMs?: number;
+  // How often due automations are looked for.
+  automationMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -196,6 +200,38 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     onError: (error) => { opts.onError?.(error); },
   });
 
+  // Creates a run with the project's settings and starts its agent.
+  async function newRun(o: Omit<NewRun, "data" | "defaultAgentFor" | "copyFor" | "setupFor">): Promise<Run> {
+    const run = await prepareRun({
+      ...o, data,
+      defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
+      copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
+      // One command per line, run in order in every new worktree.
+      setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
+    });
+    await write(() => store.saveRun(run));
+    void scheduler.startRun(run.id).catch((e) => opts.onError?.(e));
+    return run;
+  }
+
+  // Automations whose time has come start their run; each is moved to its next time first,
+  // so a failure is recorded once and not retried every tick. A time missed while the
+  // daemon was down runs once.
+  async function runDueAutomations(now = new Date()): Promise<void> {
+    const due = await write(() => store.listAutomations().filter((a) => a.enabled && Date.parse(a.nextRunAt) <= now.getTime()));
+    for (const a of due) {
+      const next = nextRun(parseCron(a.cron), a.zone, now).toISOString();
+      await write(() => store.saveAutomation({ ...a, nextRunAt: next, lastRunAt: now.toISOString() }));
+      try {
+        const run = await newRun({ repo: a.repo, task: a.prompt, role: a.role, name: a.name, ...(a.agent ? { agent: a.agent } : {}) });
+        await write(() => store.recordAutomationRun({ automationId: a.id, scheduledFor: a.nextRunAt, runId: run.id, createdAt: now.toISOString() }));
+      } catch (error) {
+        await write(() => store.recordAutomationRun({ automationId: a.id, scheduledFor: a.nextRunAt, error: (error as Error).message, createdAt: now.toISOString() }));
+        opts.onError?.(error);
+      }
+    }
+  }
+
   const server = createServer((req, res) => {
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) return;
@@ -221,11 +257,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   let markStopped!: () => void;
   const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
   const onSignal = () => { void stop(); };
+  let automationTimer: NodeJS.Timeout | undefined;
   function stop(): Promise<void> {
     if (stopping) return stopping;
     stopping = (async () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      if (automationTimer) clearInterval(automationTimer);
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
@@ -479,23 +517,78 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       let run;
       try {
-        run = await prepareRun({
-          data, repo, task, role, ...(issue ? { issue } : {}),
+        run = await newRun({
+          repo, task, role, ...(issue ? { issue } : {}),
           ...(name !== undefined ? { name } : {}), ...(model !== undefined ? { model } : {}), ...(orchestrator ? { orchestrator } : {}),
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
-          defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
-          copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
-          // One command per line, run in order in every new worktree.
-          setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
         });
       } catch (error) {
         if (error instanceof RunInputError) throw new HttpError(400, error.message);
         if (error instanceof SetupError) throw new HttpError(409, error.message);
         throw error;
       }
-      await write(() => store.saveRun(run));
-      void scheduler.startRun(run.id).catch((e) => opts.onError?.(e));
       reply(res, 201, { runId: run.id });
+      return;
+    }
+    if (path === "/api/v1/automations") {
+      if (req.method === "GET") {
+        const all = await write(() => store.listAutomations().map((a) => ({ ...a, runs: store.automationRuns(a.id).slice(-5) })));
+        reply(res, 200, { automations: all });
+        return;
+      }
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      const repoArg = optionalString(payload.repo, "repo");
+      const prompt = optionalString(payload.prompt, "prompt");
+      const name = optionalString(payload.name, "name")?.trim();
+      const cron = optionalString(payload.cron, "cron");
+      const zone = optionalString(payload.zone, "zone") ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const role = (optionalString(payload.role, "role") ?? "worker") as Role;
+      const agent = optionalString(payload.agent, "agent");
+      if (!repoArg || !prompt?.trim() || !name || !cron) throw new HttpError(400, "repo, name, cron and prompt are required");
+      if (!/^[\w.-]{1,64}$/.test(name)) throw new HttpError(400, "a name is one word of at most 64 characters");
+      if (!ROLES.includes(role)) throw new HttpError(400, `role must be one of ${ROLES.join(", ")}`);
+      if (agent !== undefined && !AGENTS.includes(agent as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
+      let next: string;
+      try {
+        checkZone(zone);
+        next = nextRun(parseCron(cron), zone, new Date()).toISOString();
+      } catch (e) { throw new HttpError(400, (e as Error).message); }
+      let root: string;
+      try { root = await repoRoot(repoArg); } catch (e) { throw new HttpError(400, (e as Error).message); }
+      const project = defaultProjectId(root);
+      if (await write(() => store.listAutomations(project).some((a) => a.name === name))) throw new HttpError(409, `an automation "${name}" exists`);
+      const automation = {
+        id: `a${randomBytes(6).toString("hex")}`, project, repo: root, name, prompt: prompt.trim(), role, cron, zone,
+        enabled: true, nextRunAt: next, createdAt: new Date().toISOString(), ...(agent ? { agent } : {}),
+      };
+      await write(() => store.saveAutomation(automation));
+      reply(res, 201, automation);
+      return;
+    }
+    const automationRoute = /^\/api\/v1\/automations\/([^/]+)(?:\/(pause|resume|run))?$/.exec(path);
+    if (automationRoute) {
+      const [, ref, action] = automationRoute;
+      const found = await write(() => store.listAutomations().find((a) => a.id === ref || a.name === decodeURIComponent(ref!)));
+      if (!found) throw new HttpError(404, `no automation "${decodeURIComponent(ref!)}"`);
+      if (req.method === "DELETE" && !action) {
+        await write(() => store.deleteAutomation(found.id));
+        reply(res, 204);
+        return;
+      }
+      if (req.method !== "POST" || !action) throw new HttpError(405, "method not allowed");
+      if (action === "run") {
+        // Now, once, without moving its schedule.
+        const run = await newRun({ repo: found.repo, task: found.prompt, role: found.role, name: found.name, ...(found.agent ? { agent: found.agent } : {}) });
+        await write(() => store.recordAutomationRun({ automationId: found.id, scheduledFor: new Date().toISOString(), runId: run.id, createdAt: new Date().toISOString() }));
+        reply(res, 201, { runId: run.id });
+        return;
+      }
+      const enabled = action === "resume";
+      // Resuming starts from the next time after now, so missed times are not run.
+      const nextRunAt = enabled ? nextRun(parseCron(found.cron), found.zone, new Date()).toISOString() : found.nextRunAt;
+      await write(() => store.saveAutomation({ ...found, enabled, nextRunAt }));
+      reply(res, 200, { ...found, enabled, nextRunAt });
       return;
     }
     const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review))?$/.exec(path);
@@ -615,6 +708,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
+    automationTimer = setInterval(() => { void runDueAutomations().catch((e) => opts.onError?.(e)); }, opts.automationMs ?? 30_000);
+    automationTimer.unref();
+    void runDueAutomations().catch((e) => opts.onError?.(e));
     scheduler.watchRadar(opts.radarMs ?? 60_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {

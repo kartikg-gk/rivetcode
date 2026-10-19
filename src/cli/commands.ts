@@ -45,6 +45,8 @@ const USAGE = `usage: rivet <command>
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
   cue list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
                                         saved prompts (to a session, or a new worker) and commands (run here)
+  automation list | add <name> --cron "<m h dom mon dow>" [--zone <tz>] [--orchestrator] [--agent <name>] <prompt>
+             | rm|pause|resume|run <name>   prompts run on a schedule by a new worker or orchestrator
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
@@ -407,6 +409,47 @@ async function project(args: string[], io: CliIo): Promise<number> {
   throw new UsageError("project needs get, set <key> <value> or unset <key>");
 }
 
+// Prompts run on a cron schedule, each time by a new worker (or orchestrator).
+async function automation(args: string[], io: CliIo): Promise<number> {
+  const [action, ...more] = args;
+  if (action === "list" || action === undefined) {
+    type A = { name: string; project: string; cron: string; zone: string; enabled: boolean; nextRunAt: string; role: string; prompt: string; runs: { runId?: string; error?: string; createdAt: string }[] };
+    const { automations } = await callDaemon(io.env, "GET", "/api/v1/automations", undefined, COMMAND_TIMEOUT_MS) as { automations: A[] };
+    if (automations.length === 0) io.out("no automations");
+    for (const a of automations) {
+      const last = a.runs.at(-1);
+      io.out(`${a.name.padEnd(20)} ${a.cron.padEnd(16)} ${a.zone.padEnd(18)} ${a.enabled ? `next ${a.nextRunAt}` : "paused"}  ${a.role}  [${a.project}]`);
+      io.out(`  ${a.prompt.split(/\r?\n/)[0]!.slice(0, 100)}${last ? `\n  last: ${last.runId ?? `failed: ${last.error}`} at ${last.createdAt}` : ""}`);
+    }
+    return 0;
+  }
+  if (action === "add") {
+    const { flags, rest } = parseFlags(more, ["cron", "zone", "agent"]);
+    const [name, ...words] = rest;
+    const prompt = words.join(" ").trim();
+    if (!name || !prompt || typeof flags.get("cron") !== "string") throw new UsageError('automation add <name> --cron "<min hour day month weekday>" [--zone <tz>] [--orchestrator] [--agent <name>] "<prompt>"');
+    const repo = await repoTop(io.cwd);
+    const created = await callDaemon(io.env, "POST", "/api/v1/automations", {
+      repo, name, prompt, cron: flags.get("cron"), role: flags.get("orchestrator") === true ? "orchestrator" : "worker",
+      ...(typeof flags.get("zone") === "string" ? { zone: flags.get("zone") } : {}),
+      ...(typeof flags.get("agent") === "string" ? { agent: flags.get("agent") } : {}),
+    }, COMMAND_TIMEOUT_MS) as { nextRunAt: string; zone: string };
+    io.out(`automation ${name} saved; first run ${created.nextRunAt} (${created.zone})`);
+    return 0;
+  }
+  const name = more[0];
+  if (!name || !["rm", "pause", "resume", "run"].includes(action)) throw new UsageError("automation needs list, add, rm <name>, pause <name>, resume <name> or run <name>");
+  const path = `/api/v1/automations/${encodeURIComponent(name)}`;
+  if (action === "rm") {
+    await callDaemon(io.env, "DELETE", path, undefined, COMMAND_TIMEOUT_MS);
+    io.out(`automation ${name} removed`);
+    return 0;
+  }
+  const result = await callDaemon(io.env, "POST", `${path}/${action}`, undefined, RUN_TIMEOUT_MS) as { runId?: string; nextRunAt?: string };
+  io.out(action === "run" ? `automation ${name} started ${result.runId}` : action === "pause" ? `automation ${name} paused` : `automation ${name} resumed; next run ${result.nextRunAt}`);
+  return 0;
+}
+
 // Saved prompts and commands for this repository's project.
 async function cue(args: string[], io: CliIo): Promise<number> {
   const [action, name, ...more] = args;
@@ -552,7 +595,7 @@ async function panes(io: CliIo): Promise<number> {
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["spawn", "review", "cue", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["spawn", "review", "cue", "automation", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -624,6 +667,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);
       case "cue": return await cue(args, io);
+      case "automation": return await automation(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
       case "login": return await login(args, io);

@@ -56,6 +56,11 @@ export type Store = {
   startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
   endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
   reviewsOf(runId: string): Review[];
+  saveAutomation(a: Automation): void;
+  listAutomations(project?: string): Automation[];
+  deleteAutomation(id: string): boolean;
+  recordAutomationRun(r: Omit<AutomationRun, "id">): void;
+  automationRuns(automationId: string): AutomationRun[];
   // A project's cues, by name.
   saveCue(cue: Cue): void;
   listCues(project: string): Cue[];
@@ -91,6 +96,26 @@ export type Cue = {
   text: string;
   updatedAt: string;
 };
+
+// A prompt run on a schedule: each time it comes round, a worker or orchestrator starts.
+export type Automation = {
+  id: string;
+  project: string;
+  repo: string;
+  name: string;
+  prompt: string;
+  role: Role;
+  agent?: string;
+  cron: string;
+  zone: string;
+  enabled: boolean;
+  nextRunAt: string;
+  lastRunAt?: string;
+  createdAt: string;
+};
+
+// One time an automation came round: the run it started, or why it could not.
+export type AutomationRun = { id: number; automationId: string; scheduledFor: string; runId?: string; error?: string; createdAt: string };
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -271,6 +296,34 @@ ALTER TABLE runs ADD COLUMN model TEXT;
 // The issue a run's task came from.
 MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
+` });
+
+// Prompts run on a schedule, and each time they ran.
+MIGRATIONS.push({ version: 12, sql: `
+CREATE TABLE automations (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  name TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN (${oneOf(ROLES)})),
+  agent TEXT,
+  cron TEXT NOT NULL,
+  zone TEXT NOT NULL,
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  next_run_at TEXT NOT NULL,
+  last_run_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (project, name)
+);
+CREATE TABLE automation_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  automation_id TEXT NOT NULL REFERENCES automations(id) ON DELETE CASCADE,
+  scheduled_for TEXT NOT NULL,
+  run_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL
+);
 ` });
 
 // Saved prompts and commands per project.
@@ -517,6 +570,44 @@ export function openStore(data: string): Store {
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+    },
+
+    saveAutomation(a) {
+      db.prepare(`INSERT INTO automations (id, project, repo, name, prompt, role, agent, cron, zone, enabled, next_run_at, last_run_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET prompt = excluded.prompt, role = excluded.role, agent = excluded.agent, cron = excluded.cron,
+          zone = excluded.zone, enabled = excluded.enabled, next_run_at = excluded.next_run_at, last_run_at = excluded.last_run_at`)
+        .run(a.id, a.project, a.repo, a.name, a.prompt, a.role, a.agent ?? null, a.cron, a.zone, a.enabled ? 1 : 0, a.nextRunAt, a.lastRunAt ?? null, a.createdAt);
+    },
+
+    listAutomations(project) {
+      type Row = { id: string; project: string; repo: string; name: string; prompt: string; role: Role; agent: string | null; cron: string;
+        zone: string; enabled: number; next_run_at: string; last_run_at: string | null; created_at: string };
+      const rows = (project === undefined
+        ? db.prepare("SELECT * FROM automations ORDER BY project, name").all()
+        : db.prepare("SELECT * FROM automations WHERE project = ? ORDER BY name").all(project)) as Row[];
+      return rows.map((r) => ({
+        id: r.id, project: r.project, repo: r.repo, name: r.name, prompt: r.prompt, role: r.role, cron: r.cron, zone: r.zone,
+        enabled: r.enabled === 1, nextRunAt: r.next_run_at, createdAt: r.created_at,
+        ...(r.agent !== null ? { agent: r.agent } : {}), ...(r.last_run_at !== null ? { lastRunAt: r.last_run_at } : {}),
+      }));
+    },
+
+    deleteAutomation(id) {
+      return db.prepare("DELETE FROM automations WHERE id = ?").run(id).changes > 0;
+    },
+
+    recordAutomationRun(r) {
+      db.prepare("INSERT INTO automation_runs (automation_id, scheduled_for, run_id, error, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(r.automationId, r.scheduledFor, r.runId ?? null, r.error ?? null, r.createdAt);
+    },
+
+    automationRuns(automationId) {
+      type Row = { id: number; automation_id: string; scheduled_for: string; run_id: string | null; error: string | null; created_at: string };
+      return (db.prepare("SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY id").all(automationId) as Row[]).map((r) => ({
+        id: Number(r.id), automationId: r.automation_id, scheduledFor: r.scheduled_for, createdAt: r.created_at,
+        ...(r.run_id !== null ? { runId: r.run_id } : {}), ...(r.error !== null ? { error: r.error } : {}),
+      }));
     },
 
     saveCue(cue) {
