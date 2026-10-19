@@ -25,6 +25,8 @@ const CONFIG_KEYS = [
   "worker.agent",
   "worker.permission",
   "worker.model",
+  "claude.model",
+  "codex.model",
   "worker.allowedTools",
   "worker.mode",
   "pr",
