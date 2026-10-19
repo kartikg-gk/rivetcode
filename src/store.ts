@@ -20,6 +20,8 @@ export type Run = {
   orchestrator?: string;
   // The model asked for when it was started; otherwise the project's worker.model.
   model?: string;
+  // The issue the task came from, in the run's own repository; its pull request closes it.
+  issue?: number;
   node: Node;
 };
 
@@ -234,6 +236,11 @@ ALTER TABLE runs ADD COLUMN orchestrator TEXT;
 ALTER TABLE runs ADD COLUMN model TEXT;
 ` });
 
+// The issue a run's task came from.
+MIGRATIONS.push({ version: 9, sql: `
+ALTER TABLE runs ADD COLUMN issue INTEGER;
+` });
+
 function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
@@ -258,7 +265,7 @@ function migrate(db: DatabaseSync): void {
 
 type RunRow = {
   id: string; project: string; repo: string; base: string; task: string; created_at: string;
-  role: string; name: string; orchestrator: string | null; model: string | null;
+  role: string; name: string; orchestrator: string | null; model: string | null; issue: number | null;
 };
 type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
@@ -279,10 +286,10 @@ export function openStore(data: string): Store {
   migrate(db);
 
   const upsertRun = db.prepare(`
-    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model, issue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET project = excluded.project, repo = excluded.repo,
       base = excluded.base, task = excluded.task, created_at = excluded.created_at,
-      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model`);
+      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model, issue = excluded.issue`);
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
@@ -340,7 +347,7 @@ export function openStore(data: string): Store {
       }
       db.exec("BEGIN IMMEDIATE");
       try {
-        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null);
+        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null);
         deleteNodes.run(run.id);
         const n = run.node;
         // The position, parent, depth, kind, files and shared columns are left from runs that
@@ -387,6 +394,7 @@ export function openStore(data: string): Store {
         createdAt: r.created_at, role: r.role as Role, name: r.name,
         ...(r.orchestrator !== null ? { orchestrator: r.orchestrator } : {}),
         ...(r.model !== null ? { model: r.model } : {}),
+        ...(r.issue !== null ? { issue: Number(r.issue) } : {}),
         node: nodes[0],
       };
     },

@@ -422,6 +422,7 @@ export function createScheduler(d: SchedulerDeps) {
       "",
       `Done by one agent (${run.node.agent}) in its own worktree on \`${run.node.branch}\`.`,
       ...(files.length ? ["", `Files: ${files.map((f) => `\`${f}\``).join(", ")}`] : []),
+      ...(run.issue ? ["", `Closes #${run.issue}`] : []),
     ].join("\n");
   }
 

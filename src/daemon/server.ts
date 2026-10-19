@@ -3,13 +3,14 @@ import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude, findCodex } from "../agents/locate.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
-import { dataDir, assertId } from "../paths.js";
+import { dataDir, assertId, defaultProjectId } from "../paths.js";
 import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
-import { cleanRun, prepareRun, RunInputError, SetupError } from "../scheduler/runs.js";
+import { cleanRun, prepareRun, repoRoot, RunInputError, SetupError } from "../scheduler/runs.js";
+import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { runUsage } from "../usage.js";
@@ -392,11 +393,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const payload = await body(req);
-      if (typeof payload.repo !== "string" || typeof payload.task !== "string") {
+      const issueRef = optionalString(payload.issue, "issue");
+      if (typeof payload.repo !== "string" || (typeof payload.task !== "string" && issueRef === undefined)) {
         throw new HttpError(400, "repo and task must be strings");
       }
       const agent = optionalString(payload.agent, "agent");
-      const name = optionalString(payload.name, "name");
+      let name = optionalString(payload.name, "name");
+      let task = typeof payload.task === "string" ? payload.task : "";
       const model = optionalString(payload.model, "model");
       const role = (optionalString(payload.role, "role") ?? "worker") as Role;
       if (!ROLES.includes(role)) throw new HttpError(400, `role must be one of ${ROLES.join(", ")}`);
@@ -415,10 +418,25 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           base ??= sender.base;
         }
       }
+      // A task from an issue: the issue is read now, so the worker starts with it.
+      let issue: number | undefined;
+      if (issueRef !== undefined) {
+        try {
+          const root = await repoRoot(repo);
+          const gh = await github({ repo: root, project: defaultProjectId(root) } as Run);
+          const found = await gh.issue(issueNumber(issueRef, gh.repo));
+          issue = found.number;
+          task = issueTask(found, task);
+          name ??= found.title.slice(0, 100);
+        } catch (error) {
+          if (error instanceof RunInputError || error instanceof IssueRefError) throw new HttpError(400, error.message);
+          throw new HttpError(409, `cannot read issue ${issueRef}: ${(error as Error).message}`);
+        }
+      }
       let run;
       try {
         run = await prepareRun({
-          data, repo, task: payload.task as string, role,
+          data, repo, task, role, ...(issue ? { issue } : {}),
           ...(name !== undefined ? { name } : {}), ...(model !== undefined ? { model } : {}), ...(orchestrator ? { orchestrator } : {}),
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
           defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],

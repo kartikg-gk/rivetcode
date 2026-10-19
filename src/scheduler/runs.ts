@@ -25,6 +25,7 @@ export type NewRun = {
   // The orchestrator session that asked for this worker.
   orchestrator?: string;
   model?: string;
+  issue?: number;
   base?: string;
   agent?: string;
   // The project's configured default agent, used when no agent is given.
@@ -40,7 +41,7 @@ const MODEL_FAMILIES = { claude: /^(claude|opus|sonnet|haiku)/i, codex: /^(gpt|o
 
 // The main checkout, also when asked from inside a linked worktree (an agent's own), so
 // a new session never starts from another session's worktree.
-async function repoRoot(dir: string): Promise<string> {
+export async function repoRoot(dir: string): Promise<string> {
   try {
     const common = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], dir)).trim();
     if (basename(common) === ".git") return await realpath(dirname(common));
@@ -93,7 +94,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   }
   return {
     id, project, repo, base, task: o.task.trim(), createdAt: new Date().toISOString(), role, name,
-    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), node,
+    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), ...(o.issue ? { issue: o.issue } : {}), node,
   };
 }
 

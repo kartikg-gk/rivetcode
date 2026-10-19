@@ -49,7 +49,7 @@ export function orchestratorPrompt(run: Run): string {
     "- Never edit files, commit, push or open pull requests here. If asked to, start a worker.",
     "",
     "Commands:",
-    `- rivet spawn --name "<label, at most 100 characters>" [--agent claude|codex] [--model <id>] "<task>"`,
+    `- rivet spawn --name "<label, at most 100 characters>" [--agent claude|codex] [--model <id>] [--issue <number>] "<task>"`,
     "    starts a worker. Leave --model off unless the user named a model: a model name only",
     "    works with its own agent, and each agent has a sensible default.",
     "- rivet status [<run>]   lists sessions, or shows one with its pull request",

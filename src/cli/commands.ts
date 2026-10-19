@@ -30,7 +30,7 @@ export type CliIo = {
 };
 
 const USAGE = `usage: rivet <command>
-  spawn [--name <label>] [--agent <name>] [--model <id>] [--repo <dir>] [--base <branch>] <task>
+  spawn [--name <label>] [--agent <name>] [--model <id>] [--issue <n|owner/repo#n|url>] [--repo <dir>] [--base <branch>] [<task>]
                                         start a worker on a task in its own worktree
   orchestrator [--agent <name>] [--repo <dir>] [<what you want>]
                                         start an agent that splits work and spawns workers
@@ -215,15 +215,15 @@ async function repoTop(dir: string): Promise<string> {
 
 // Starts one session on the daemon: a worker, or an orchestrator that starts workers.
 async function startSession(args: string[], io: CliIo, role: "worker" | "orchestrator"): Promise<number> {
-  const { flags, rest } = parseFlags(args, ["repo", "base", "agent", "name", "model"]);
+  const { flags, rest } = parseFlags(args, ["repo", "base", "agent", "name", "model", "issue"]);
   const task = rest.join(" ").trim();
-  if (role === "worker" && !task) throw new UsageError("spawn needs a task description");
+  if (role === "worker" && !task && typeof flags.get("issue") !== "string") throw new UsageError("spawn needs a task description or --issue");
   const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
   const text = (key: string) => (typeof flags.get(key) === "string" ? { [key]: flags.get(key) as string } : {});
   // Inside an orchestrator's session the new worker reports back to it.
   const from = io.env.RIVET_SESSION_ID?.trim();
   const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
-    repo, task, role, ...text("base"), ...text("agent"), ...text("name"), ...text("model"), ...(from ? { from } : {}),
+    repo, task, role, ...text("base"), ...text("agent"), ...text("name"), ...text("model"), ...text("issue"), ...(from ? { from } : {}),
   }, RUN_TIMEOUT_MS) as { runId: string };
   if (role === "orchestrator") io.out(`orchestrator ${result.runId} started; talk to it with: rivet attach ${result.runId}-agent`);
   else io.out(`worker ${result.runId} started; follow it with: rivet status ${result.runId}`);

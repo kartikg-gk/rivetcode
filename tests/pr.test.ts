@@ -136,6 +136,27 @@ describe("opening the pull request", () => {
   });
 });
 
+describe("a worker from an issue", () => {
+  it("starts with the issue as its task, is named after it, and its pull request closes it", async () => {
+    gh.issues[5] = { title: "Add a.txt", state: "open", body: JSON.stringify({ files: { "a.txt": "a" }, commit: "add a" }), labels: [{ name: "feature" }], assignees: [] };
+    await start({ pr: "auto" });
+    const res = await api("POST", "/api/v1/runs", { repo, issue: "5", agent: "fake" });
+    expect(res.status).toBe(201);
+    const runId = res.json.runId as string;
+    const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
+    expect(run.name).toBe("Add a.txt");
+    expect(run.task).toMatch(/^Resolve issue #5\.[\s\S]*Labels: feature\n\nBody:\n\{"files"/);
+    expect(gh.prs[0]!.title).toBe("Add a.txt");
+    expect(gh.prs[0]!.body).toMatch(/Closes #5$/);
+  });
+
+  it("refuses an issue it cannot read or of another repository", async () => {
+    await start();
+    expect((await api("POST", "/api/v1/runs", { repo, issue: "99", agent: "fake" })).json.error).toMatch(/cannot read issue 99/);
+    expect((await api("POST", "/api/v1/runs", { repo, issue: "x/y#5", agent: "fake" })).json.error).toMatch(/not in this repository/);
+  });
+});
+
 describe("watching the pull request", () => {
   async function opened(): Promise<string> {
     await start({ pr: "auto" });
