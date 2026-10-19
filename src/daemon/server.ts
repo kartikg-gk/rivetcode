@@ -31,6 +31,8 @@ const CONFIG_KEYS = [
   "worker.allowedTools",
   "worker.mode",
   "pr",
+  "review",
+  "review.agent",
   "pr.feedback",
   "github.repo",
   "copy",
@@ -326,6 +328,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (activity) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
+      // A reviewer's hooks have nothing to record: it is not the run's session.
+      if (nodeId === "review") {
+        reply(res, 204);
+        return;
+      }
       const payload = await body(req);
       if (payload.state !== undefined && !ACTIVITY_STATES.includes(payload.state as ActivityState)) {
         throw new HttpError(400, "invalid activity state");
@@ -354,6 +361,21 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (id === null) throw new HttpError(404, "unknown session");
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
+      return;
+    }
+    const submit = /^\/api\/v1\/sessions\/([^/]+)\/review$/.exec(path);
+    if (submit) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId, nodeId } = session(submit[1]);
+      if (nodeId !== "review") throw new HttpError(409, "only a reviewer submits a review");
+      const payload = await body(req);
+      if (payload.verdict !== "approved" && payload.verdict !== "changes_requested") throw new HttpError(400, "verdict must be approved or changes_requested");
+      if (typeof payload.summary !== "string" || !payload.summary.trim()) throw new HttpError(400, "summary is required");
+      const comments = (Array.isArray(payload.comments) ? payload.comments : []) as { path: string; line: number; body: string }[];
+      for (const c of comments) {
+        if (typeof c?.path !== "string" || !Number.isInteger(c?.line) || c.line < 1 || typeof c?.body !== "string") throw new HttpError(400, "each comment needs path, line and body");
+      }
+      reply(res, 200, await scheduler.submitReview(runId, { verdict: payload.verdict, summary: payload.summary.trim(), comments }));
       return;
     }
     const check = /^\/api\/v1\/sessions\/([^/]+)\/check$/.exec(path);
@@ -454,7 +476,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 201, { runId: run.id });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -472,7 +494,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         // Every conversation its agents had (retries and conflict fixes too), from their own files.
         const conversations = await write(() => store.conversations(run.id));
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, now: new Date(at).toISOString() });
+        const reviews = await write(() => store.reviewsOf(run.id));
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {
@@ -488,6 +511,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const payload = await body(req);
         const workers = await scheduler.stopRun(run.id, { keepWorkers: payload.keepWorkers === true });
         reply(res, 200, { workers });
+        return;
+      }
+      if (action === "review") {
+        reply(res, 202, { reviewId: await scheduler.startReview(run.id, "manual") });
         return;
       }
       if (action === "pr") {

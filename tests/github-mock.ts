@@ -22,12 +22,14 @@ export type MockGitHub = {
   reviews: Record<number, { user: { login: string }; state: string }[]>;
   comments: Record<number, { commit_id: string; path: string; line: number | null; body: string }[]>;
   requests: string[];
+  // Reviews posted through the API.
+  posted: { number: number; commit_id: string; event: string; body: string; comments?: { path: string; line: number; body: string }[] }[];
   issues: Record<number, { title: string; state: string; body: string | null; labels: { name: string }[]; assignees: { login: string }[]; pull_request?: object }>;
   close(): Promise<void>;
 };
 
 export async function mockGitHub(repo = "o/r"): Promise<MockGitHub> {
-  const state: Omit<MockGitHub, "api" | "close"> = { prs: [], checks: {}, annotations: {}, reviews: {}, comments: {}, requests: [], issues: {} };
+  const state: Omit<MockGitHub, "api" | "close"> = { prs: [], checks: {}, annotations: {}, reviews: {}, comments: {}, requests: [], issues: {}, posted: [] };
   const server: Server = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -56,6 +58,10 @@ export async function mockGitHub(repo = "o/r"): Promise<MockGitHub> {
       if ((m = /^\/issues\/(\d+)$/.exec(path))) {
         const issue = state.issues[Number(m[1])];
         return issue ? send(200, { ...issue, number: Number(m[1]), html_url: `https://github.com/${repo}/issues/${m[1]}` }) : send(404, { message: "Not Found" });
+      }
+      if (req.method === "POST" && (m = /^\/pulls\/(\d+)\/reviews$/.exec(path))) {
+        state.posted.push({ number: Number(m[1]), ...JSON.parse(body) });
+        return send(200, { id: 900 + state.posted.length });
       }
       if ((m = /^\/pulls\/(\d+)\/reviews$/.exec(path))) return send(200, state.reviews[Number(m[1])] ?? []);
       if ((m = /^\/pulls\/(\d+)\/comments$/.exec(path))) return send(200, state.comments[Number(m[1])] ?? []);

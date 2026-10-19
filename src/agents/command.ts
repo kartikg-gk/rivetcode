@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
 
 // Rivet's own permission levels; each agent adapter maps them to its CLI's flags.
-export const PERMISSIONS = ["default", "accept-edits", "auto", "bypass-permissions"] as const;
+// read-only: the agent may look but not change anything (a reviewer).
+export const PERMISSIONS = ["default", "accept-edits", "auto", "bypass-permissions", "read-only"] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
 // How the first prompt reaches the agent: as a command-line argument, or typed in once it is up.
@@ -70,6 +71,8 @@ const CLAUDE_MODES: Record<Permission, string | null> = {
   "accept-edits": "acceptEdits",
   auto: "auto",
   "bypass-permissions": "bypassPermissions",
+  // Claude in print mode refuses every tool not allowed by name, so the allowed list is the limit.
+  "read-only": null,
 };
 
 export function claudePermissionArgs(permission: Permission): string[] {

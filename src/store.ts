@@ -52,6 +52,10 @@ export type Store = {
   // A run's pull request; "handled" remembers which feedback was already acted on.
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
+  // Review passes over a run's pull request, oldest first.
+  startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
+  endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
+  reviewsOf(runId: string): Review[];
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
   getTerminateOnPrMerge(runId: string): boolean;
   setTerminateOnPrMerge(runId: string, terminate: boolean): void;
@@ -59,6 +63,20 @@ export type Store = {
 };
 
 export type PullRequest = { number: number; url: string; handled?: string };
+
+// One review pass over a worker's pull request at one commit.
+export type Review = {
+  id: number;
+  runId: string;
+  sha: string;
+  // auto: Rivet started it after the pull request opened or changed; manual: rivet review.
+  trigger: "auto" | "manual";
+  status: "running" | "complete" | "failed";
+  verdict?: "approved" | "changes_requested";
+  body?: string;
+  githubReviewId?: number;
+  createdAt: string;
+};
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -239,6 +257,21 @@ ALTER TABLE runs ADD COLUMN model TEXT;
 // The issue a run's task came from.
 MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
+` });
+
+// Review passes by a reviewer agent.
+MIGRATIONS.push({ version: 10, sql: `
+CREATE TABLE reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  sha TEXT NOT NULL,
+  trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'manual')),
+  status TEXT NOT NULL CHECK (status IN ('running', 'complete', 'failed')),
+  verdict TEXT CHECK (verdict IN ('approved', 'changes_requested')),
+  body TEXT,
+  github_review_id INTEGER,
+  created_at TEXT NOT NULL
+);
 ` });
 
 function migrate(db: DatabaseSync): void {
@@ -458,6 +491,26 @@ export function openStore(data: string): Store {
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+    },
+
+    startReview(runId, sha, trigger) {
+      return Number(db.prepare("INSERT INTO reviews (run_id, sha, trigger, status, created_at) VALUES (?, ?, ?, 'running', ?)")
+        .run(runId, sha, trigger, new Date().toISOString()).lastInsertRowid);
+    },
+
+    endReview(id, f) {
+      db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
+        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id);
+    },
+
+    reviewsOf(runId) {
+      type Row = { id: number; run_id: string; sha: string; trigger: Review["trigger"]; status: Review["status"]; verdict: Review["verdict"] | null;
+        body: string | null; github_review_id: number | null; created_at: string };
+      return (db.prepare("SELECT * FROM reviews WHERE run_id = ? ORDER BY id").all(runId) as Row[]).map((r) => ({
+        id: Number(r.id), runId: r.run_id, sha: r.sha, trigger: r.trigger, status: r.status, createdAt: r.created_at,
+        ...(r.verdict !== null ? { verdict: r.verdict } : {}), ...(r.body !== null ? { body: r.body } : {}),
+        ...(r.github_review_id !== null ? { githubReviewId: Number(r.github_review_id) } : {}),
+      }));
     },
 
     getPr(runId) {

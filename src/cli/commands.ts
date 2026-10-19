@@ -38,6 +38,9 @@ const USAGE = `usage: rivet <command>
   stop <run> [--keep-workers]           stop a session; an orchestrator also stops its workers
   resume <run>                          retry what was escalated or interrupted
   pr <run>                              bring in the latest base, push and open the pull request
+  review <run>                          have a reviewer agent review a worker's pull request
+  review submit --verdict approved|changes_requested --summary <text> [--comment "<path>:<line>: <text>" ...]
+                                        submit a review (inside a reviewer)
   clean <run>                           remove a run's worktree (the branch stays)
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
   project get|set <key> <value>|unset <key>
@@ -156,6 +159,42 @@ async function send(args: string[], io: CliIo): Promise<number> {
   io.out(delivery === "turn-end" ? `queued for ${session}: it runs headless and gets the message when its turn ends`
     : delivery === "next-launch" ? `queued for ${session}: it is not running and gets the message when it starts again`
     : `sent to ${session}`);
+  return 0;
+}
+
+// "rivet review <run>" starts a review of a worker's pull request; "rivet review submit",
+// run by the reviewer, hands its review to Rivet. --comment may be given many times.
+async function review(args: string[], io: CliIo): Promise<number> {
+  if (args[0] !== "submit") {
+    const runId = args[0];
+    if (!runId) throw new UsageError("review needs a run id, or submit");
+    await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/review`, undefined, COMMAND_TIMEOUT_MS);
+    io.out(`review of ${runId} started; see it with rivet status ${runId}`);
+    return 0;
+  }
+  const session = io.env.RIVET_SESSION_ID?.trim();
+  if (!session) throw new UsageError("review submit runs inside a reviewer started by Rivet");
+  let verdict: string | undefined;
+  let summary: string | undefined;
+  const comments: { path: string; line: number; body: string }[] = [];
+  const rest = args.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    if (value === undefined || !["--verdict", "--summary", "--comment"].includes(flag!)) throw new UsageError(`unexpected ${flag}`);
+    i++;
+    if (flag === "--verdict") verdict = value;
+    else if (flag === "--summary") summary = value;
+    else {
+      const m = /^(.+?):(\d+):\s*([\s\S]+)$/.exec(value);
+      if (!m) throw new UsageError(`--comment must be "<path>:<line>: <finding>", got "${value}"`);
+      comments.push({ path: m[1]!.trim(), line: Number(m[2]), body: m[3]!.trim() });
+    }
+  }
+  if (verdict !== "approved" && verdict !== "changes_requested") throw new UsageError("review submit needs --verdict approved|changes_requested");
+  if (!summary?.trim()) throw new UsageError("review submit needs --summary");
+  await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/review`, { verdict, summary, comments }, COMMAND_TIMEOUT_MS);
+  io.out(`review submitted: ${verdict}${comments.length ? `, ${comments.length} comments` : ""}`);
   return 0;
 }
 
@@ -439,7 +478,7 @@ async function panes(io: CliIo): Promise<number> {
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["spawn", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["spawn", "review", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -508,6 +547,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "report": return await report(args, io);
       case "send": return await send(args, io);
       case "check": return await check(io);
+      case "review": return await review(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
       case "login": return await login(args, io);

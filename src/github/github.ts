@@ -26,6 +26,9 @@ export type GitHub = {
   createPr(o: { title: string; head: string; base: string; body: string }): Promise<{ number: number; url: string }>;
   facts(number: number): Promise<PrFacts>;
   issue(number: number): Promise<Issue>;
+  // Posts a review as a comment (the pull request's author cannot approve or request
+  // changes on it), with inline comments on lines of its diff. Returns the review's id.
+  postReview(number: number, o: { commitId: string; body: string; comments: { path: string; line: number; body: string }[] }): Promise<number>;
   // Files named by annotations of failing checks.
   failedPaths(number: number): Promise<string[]>;
   // Inline comments on the current head commit.
@@ -114,6 +117,13 @@ export function githubClient(o: { repo: string; token: string; api?: string }): 
     async createPr({ title, head, base, body }) {
       const pr = await call<Pull>("POST", "/pulls", { title, head, base, body });
       return { number: pr.number, url: pr.html_url };
+    },
+
+    async postReview(number, { commitId, body, comments }) {
+      const review = await call<{ id: number }>("POST", `/pulls/${number}/reviews`, {
+        commit_id: commitId, event: "COMMENT", body, ...(comments.length ? { comments: comments.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: c.body })) } : {}),
+      });
+      return review.id;
     },
 
     async issue(number) {

@@ -8,7 +8,7 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
+import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, reviewerPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
 import { cleanRun } from "./runs.js";
 
@@ -308,6 +308,10 @@ export function createScheduler(d: SchedulerDeps) {
     if (d.launches.get(sessionId) !== launchId) return;
     const waiter = exitWaiters.get(launchId);
     const runId = sessionId.slice(0, sessionId.indexOf("-"));
+    if (sessionId === reviewSession(runId)) {
+      await reviewerExited(runId);
+      return;
+    }
     await d.write(() => d.store.setActivity(runId, NODE_ID, "exited"));
     if (waiter) {
       exitWaiters.delete(launchId);
@@ -508,6 +512,9 @@ export function createScheduler(d: SchedulerDeps) {
       return status;
     }
     const key = `${status}:${facts.mergeability}:${facts.headSha}`;
+    if (node.status === "done" && facts.open && (status === "pr_open" || status === "mergeable" || status === "approved" || status === "review_pending")) {
+      await autoReview(run, facts.headSha).catch(report);
+    }
     // Work is already under way, or this exact state was handled before.
     if (pr.handled === key || node.status !== "done") return status;
     // By default the worker is told where the feedback is and reads it itself; "full" has
@@ -570,6 +577,94 @@ export function createScheduler(d: SchedulerDeps) {
   function watchRadar(intervalMs: number): void {
     radarTimer = setInterval(() => { void checkRadar().catch(report); }, intervalMs);
     radarTimer.unref();
+  }
+
+  // --- Reviewer: a second agent reviews a worker's pull request in the worker's worktree,
+  // read-only. Rivet posts its review and sends the changes it requires to the worker.
+
+  const reviewSession = (runId: string) => sessionIdOf(runId, "review");
+  // Commands a reviewer may run: reading the code and its history, and submitting.
+  const REVIEWER_TOOLS = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(rivet review submit:*)"];
+  // Failed automatic passes on one commit before Rivet stops trying it.
+  const REVIEW_TRIES = 3;
+
+  // sha: the pull request's head as GitHub reports it (automatic passes are counted by it);
+  // by hand, the worktree's head.
+  async function startReview(runId: string, trigger: "auto" | "manual", headSha?: string): Promise<number> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker's pull request is reviewed");
+    if (run.node.status !== "done") throw new SchedulerError(409, `run ${runId} is not done (it is ${run.node.status})`);
+    const pr = await d.write(() => d.store.getPr(runId));
+    if (!pr) throw new SchedulerError(409, `run ${runId} has no pull request to review`);
+    const session = reviewSession(runId);
+    if (d.runtime.isAlive(session)) throw new SchedulerError(409, "a review is already running");
+    const sha = headSha ?? await headOf(run.node.worktree);
+    const config = await d.write(() => d.store.getConfig(run.project));
+    const agentName = (config["review.agent"]?.trim() || run.node.agent) as Node["agent"];
+    const agent = d.agents(agentName);
+    const id = await d.write(() => d.store.startReview(runId, sha, trigger));
+    const launchId = newLaunchId();
+    const argv = await agent.launchCommand({
+      sessionId: session, workspace: run.node.worktree, headless: true, permission: "read-only",
+      allowedTools: REVIEWER_TOOLS, prompt: reviewerPrompt(run, pr, sha),
+      ...(modelFor(agentName, config) ? { model: modelFor(agentName, config)! } : {}),
+    });
+    d.launches.set(session, launchId);
+    try {
+      await d.runtime.start({
+        sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
+        env: agentEnv({ runId, nodeId: "review", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
+      });
+    } catch (e) {
+      await d.write(() => d.store.endReview(id, { status: "failed", body: `could not start: ${(e as Error).message}` }));
+      throw e;
+    }
+    return id;
+  }
+
+  // A reviewer that exits without submitting has failed that pass.
+  async function reviewerExited(runId: string): Promise<void> {
+    const running = (await d.write(() => d.store.reviewsOf(runId))).filter((r) => r.status === "running");
+    for (const r of running) {
+      await d.write(() => d.store.endReview(r.id, { status: "failed", body: `the reviewer exited without submitting\n${lastOutput(reviewSession(runId))}` }));
+    }
+  }
+
+  // "rivet review submit" from the reviewer. Required changes go to the worker first, so
+  // the pull request watcher finds it at work and does not act on the same comments.
+  async function submitReview(runId: string, o: { verdict: "approved" | "changes_requested"; summary: string; comments: { path: string; line: number; body: string }[] }): Promise<{ githubReviewId?: number }> {
+    const run = await load(runId);
+    const review = (await d.write(() => d.store.reviewsOf(runId))).filter((r) => r.status === "running").at(-1);
+    if (!review) throw new SchedulerError(409, "no review of this run is running");
+    if (o.verdict === "changes_requested" && o.comments.length === 0) throw new SchedulerError(400, "changes_requested needs at least one --comment");
+    const pr = (await d.write(() => d.store.getPr(runId)))!;
+    const body = [`Review by ${run.node.agent === "fake" ? "a reviewer" : "Rivet's reviewer"}: ${o.verdict === "approved" ? "ready" : "changes requested"}.`, "", o.summary].join("\n");
+    if (o.verdict === "changes_requested" && run.node.status === "done") {
+      await reopen(runId, [
+        `A reviewer asked for changes on pull request #${pr.number}. Make each one:`,
+        ...o.comments.map((c) => `- ${c.path}:${c.line}: ${c.body}`),
+      ].join("\n"));
+    }
+    let githubReviewId: number | undefined;
+    if (d.github) {
+      githubReviewId = await (await d.github(run)).postReview(pr.number, { commitId: review.sha, body, comments: o.comments })
+        .catch((e) => { report(e); return undefined; });
+    }
+    await d.write(() => d.store.endReview(review.id, { status: "complete", verdict: o.verdict, body, ...(githubReviewId ? { githubReviewId } : {}) }));
+    if (o.verdict === "approved") await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""}: its pull request #${pr.number} passed review.`);
+    void stopSession(reviewSession(runId)).catch(report);
+    return githubReviewId ? { githubReviewId } : {};
+  }
+
+  // With review=auto, a worker's pull request is reviewed once per commit, after the
+  // worker is done and while nothing else is asked of it.
+  async function autoReview(run: Run, sha: string): Promise<void> {
+    const config = await d.write(() => d.store.getConfig(run.project));
+    if (config.review !== "auto" || d.runtime.isAlive(reviewSession(run.id))) return;
+    const passes = (await d.write(() => d.store.reviewsOf(run.id))).filter((r) => r.sha === sha);
+    if (passes.some((r) => r.status !== "failed")) return;
+    if (passes.filter((r) => r.trigger === "auto").length >= REVIEW_TRIES) return;
+    await startReview(run.id, "auto", sha);
   }
 
   let watcher: NodeJS.Timeout | undefined;
@@ -653,7 +748,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, agentCheck, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
+  return { launch, startRun, agentCheck, startReview, submitReview, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

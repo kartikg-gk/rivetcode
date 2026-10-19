@@ -3,7 +3,7 @@ import { mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getAgent } from "../src/agents/agent.js";
+import { getAgent, type Agent } from "../src/agents/agent.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import { githubClient } from "../src/github/github.js";
@@ -38,11 +38,26 @@ afterEach(async () => {
 
 let errors: unknown[] = [];
 
+// What the test reviewer does: stays until the test submits for it, unless changed.
+let reviewerScript: object = { stayFor: 60_000 };
+let reviewerLaunches: { prompt?: string; permission?: string; allowedTools?: string[] }[] = [];
+function reviewerAgent(): Agent {
+  const fake = getAgent("fake");
+  return {
+    ...fake,
+    launchCommand: async (cfg) => {
+      reviewerLaunches.push({ ...(cfg.prompt !== undefined ? { prompt: cfg.prompt } : {}), ...(cfg.permission ? { permission: cfg.permission } : {}), ...(cfg.allowedTools ? { allowedTools: cfg.allowedTools } : {}) });
+      return fake.launchCommand({ ...cfg, prompt: JSON.stringify(reviewerScript) });
+    },
+  };
+}
+
 async function start(config: Record<string, string> = {}): Promise<void> {
   errors = [];
   daemon = await startDaemon({
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150, onError: (e) => errors.push(e),
-    agents: () => getAgent("fake"),
+    // "claude" stands for a reviewer here (review.agent): it runs reviewerScript.
+    agents: (name) => (name === "claude" ? reviewerAgent() : getAgent("fake")),
     github: async () => githubClient({ repo: "o/r", token: "t0ken", api: gh.api }),
   });
   const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
@@ -274,5 +289,66 @@ describe("runs saved before a run was one session", () => {
     await start();
     await new Promise((r) => setTimeout(r, 600));
     expect(errors).toEqual([]);
+  });
+});
+
+describe("the reviewer", () => {
+  type Reviewed = { run: Run; reviews: { status: string; verdict?: string; trigger: string; githubReviewId?: number }[] };
+  const reviewsOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as Reviewed;
+  const submit = (runId: string, body: object) => api("POST", `/api/v1/sessions/${runId}-review/review`, body);
+
+  async function reviewed(): Promise<string> {
+    reviewerScript = { stayFor: 60_000 };
+    reviewerLaunches = [];
+    await start({ pr: "auto", review: "auto", "review.agent": "claude" });
+    const runId = await spawn();
+    await until(() => reviewsOf(runId), (r) => r.reviews.some((v) => v.status === "running"));
+    return runId;
+  }
+
+  it("starts once the pull request is open, read-only, and sends required changes to the worker", async () => {
+    const runId = await reviewed();
+    expect(reviewerLaunches[0]).toMatchObject({ permission: "read-only" });
+    expect(reviewerLaunches[0]!.allowedTools).toContain("Bash(rivet review submit:*)");
+    expect(reviewerLaunches[0]!.allowedTools!.some((t) => /Edit|Write/.test(t))).toBe(false);
+    expect((await submit(runId, { verdict: "changes_requested", summary: "one bug", comments: [] })).status).toBe(400);
+    const res = await submit(runId, { verdict: "changes_requested", summary: "Off by one.", comments: [{ path: "a.txt", line: 1, body: "use b" }] });
+    expect(res.json).toEqual({ githubReviewId: 901 });
+    const { run, reviews } = await until(() => reviewsOf(runId), (r) => r.run.node.attempts === 2);
+    expect(run.node.summary ?? "").toMatch(/A reviewer asked for changes on pull request #1\. Make each one:\n- a\.txt:1: use b/);
+    expect(reviews[0]).toMatchObject({ status: "complete", verdict: "changes_requested", githubReviewId: 901 });
+    expect(gh.posted[0]).toMatchObject({ number: 1, event: "COMMENT", commit_id: expect.any(String), comments: [{ path: "a.txt", line: 1, body: "use b" }] });
+  });
+
+  it("an approval is posted and the worker is left alone", async () => {
+    const runId = await reviewed();
+    await submit(runId, { verdict: "approved", summary: "Looks right." });
+    await new Promise((r) => setTimeout(r, 500));
+    const { run, reviews } = await reviewsOf(runId);
+    expect(run.node.attempts).toBe(1);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).toMatchObject({ status: "complete", verdict: "approved" });
+    expect(gh.posted[0]!.body).toMatch(/ready\.\n\nLooks right\.$/);
+  });
+
+  it("a reviewer that exits without submitting fails the pass, and Rivet stops after three tries on one commit", async () => {
+    reviewerScript = {};
+    reviewerLaunches = [];
+    await start({ pr: "auto", review: "auto", "review.agent": "claude" });
+    const runId = await spawn();
+    const { reviews } = await until(() => reviewsOf(runId), (r) => r.reviews.filter((v) => v.status === "failed").length === 3);
+    await new Promise((r) => setTimeout(r, 600));
+    expect((await reviewsOf(runId)).reviews).toHaveLength(3);
+    expect(reviews.every((v) => v.trigger === "auto")).toBe(true);
+  });
+
+  it("rivet review starts one by hand; a second while one runs is refused", async () => {
+    reviewerScript = { stayFor: 60_000 };
+    await start({ pr: "auto", "review.agent": "claude" });
+    const runId = await spawn();
+    await until(() => runOf(runId), (r) => r.pr !== null);
+    expect((await api("POST", `/api/v1/runs/${runId}/review`)).status).toBe(202);
+    expect((await api("POST", `/api/v1/runs/${runId}/review`)).json.error).toMatch(/already running/);
+    expect((await reviewsOf(runId)).reviews[0]).toMatchObject({ trigger: "manual", status: "running" });
   });
 });
