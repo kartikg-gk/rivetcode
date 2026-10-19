@@ -43,6 +43,8 @@ const USAGE = `usage: rivet <command>
                                         submit a review (inside a reviewer)
   clean <run>                           remove a run's worktree (the branch stays)
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
+  cue list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
+                                        saved prompts (to a session, or a new worker) and commands (run here)
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
@@ -405,6 +407,60 @@ async function project(args: string[], io: CliIo): Promise<number> {
   throw new UsageError("project needs get, set <key> <value> or unset <key>");
 }
 
+// Saved prompts and commands for this repository's project.
+async function cue(args: string[], io: CliIo): Promise<number> {
+  const [action, name, ...more] = args;
+  const base = `/api/v1/projects/${encodeURIComponent(await projectOf(io))}/cues`;
+  if (action === "list") {
+    const { cues } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { cues: { name: string; type: string; text: string }[] };
+    if (cues.length === 0) io.out("no cues");
+    for (const c of cues) io.out(`${c.name.padEnd(20)} ${c.type.padEnd(8)} ${c.text.split(/\r?\n/)[0]!.slice(0, 80)}`);
+    return 0;
+  }
+  if (!name) throw new UsageError("cue needs list, add <name>, rm <name> or run <name>");
+  const path = `${base}/${encodeURIComponent(name)}`;
+  if (action === "add") {
+    const { flags } = parseFlags(more, ["prompt", "command"]);
+    const prompt = flags.get("prompt");
+    const command = flags.get("command");
+    if ((typeof prompt === "string") === (typeof command === "string")) throw new UsageError('cue add needs one of --prompt "<text>" or --command "<shell command>"');
+    await callDaemon(io.env, "PUT", path, typeof prompt === "string" ? { type: "agent", text: prompt } : { type: "command", text: command }, COMMAND_TIMEOUT_MS);
+    io.out(`cue ${name} saved`);
+    return 0;
+  }
+  if (action === "rm") {
+    await callDaemon(io.env, "DELETE", path, undefined, COMMAND_TIMEOUT_MS);
+    io.out(`cue ${name} removed`);
+    return 0;
+  }
+  if (action !== "run") throw new UsageError("cue needs list, add <name>, rm <name> or run <name>");
+  const { flags } = parseFlags(more, ["session", "agent"]);
+  const { cues } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { cues: { name: string; type: string; text: string }[] };
+  const found = cues.find((c) => c.name === name);
+  if (!found) throw new UsageError(`no cue "${name}" in this project (see rivet cue list)`);
+  const session = typeof flags.get("session") === "string" ? flags.get("session") as string : undefined;
+  if (found.type === "agent") {
+    // To a running session, or as the task of a new worker.
+    if (session) return send(["--session", session, "--message", found.text], io);
+    const agent = typeof flags.get("agent") === "string" ? ["--agent", flags.get("agent") as string] : [];
+    return startSession(["--name", name, ...agent, found.text], io, "worker");
+  }
+  // A command runs here, in the session's worktree or at the repository's top.
+  let cwd = await repoTop(io.cwd);
+  if (session) {
+    const runId = session.slice(0, session.indexOf("-") > 0 ? session.indexOf("-") : undefined);
+    const { run } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as { run: Run };
+    cwd = run.node.worktree;
+  }
+  const { spawn } = await import("node:child_process");
+  const code = await new Promise<number | null>((done, fail) => {
+    const child = spawn(found.text, { cwd, shell: true, stdio: "inherit" });
+    child.once("error", fail);
+    child.once("close", done);
+  });
+  return code === 0 ? 0 : 1;
+}
+
 const DETACH_KEY = "\u001d"; // Ctrl-]
 
 // Your terminal becomes the session's: its screen streams in, your keys go to it.
@@ -496,7 +552,7 @@ async function panes(io: CliIo): Promise<number> {
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["spawn", "review", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["spawn", "review", "cue", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -567,6 +623,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "check": return await check(io);
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);
+      case "cue": return await cue(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
       case "login": return await login(args, io);

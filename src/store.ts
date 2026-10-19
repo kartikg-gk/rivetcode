@@ -56,6 +56,10 @@ export type Store = {
   startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
   endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
   reviewsOf(runId: string): Review[];
+  // A project's cues, by name.
+  saveCue(cue: Cue): void;
+  listCues(project: string): Cue[];
+  deleteCue(project: string, name: string): boolean;
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
   getTerminateOnPrMerge(runId: string): boolean;
   setTerminateOnPrMerge(runId: string, terminate: boolean): void;
@@ -76,6 +80,16 @@ export type Review = {
   body?: string;
   githubReviewId?: number;
   createdAt: string;
+};
+
+// A saved prompt or command of a project, run by name.
+export type Cue = {
+  project: string;
+  name: string;
+  // agent: a prompt for an agent; command: a shell command run in a terminal.
+  type: "agent" | "command";
+  text: string;
+  updatedAt: string;
 };
 
 export type NodeUpdate = {
@@ -257,6 +271,18 @@ ALTER TABLE runs ADD COLUMN model TEXT;
 // The issue a run's task came from.
 MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
+` });
+
+// Saved prompts and commands per project.
+MIGRATIONS.push({ version: 11, sql: `
+CREATE TABLE cues (
+  project TEXT NOT NULL,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('agent', 'command')),
+  text TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (project, name)
+);
 ` });
 
 // Review passes by a reviewer agent.
@@ -491,6 +517,22 @@ export function openStore(data: string): Store {
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+    },
+
+    saveCue(cue) {
+      db.prepare(`INSERT INTO cues (project, name, type, text, updated_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (project, name) DO UPDATE SET type = excluded.type, text = excluded.text, updated_at = excluded.updated_at`)
+        .run(cue.project, cue.name, cue.type, cue.text, cue.updatedAt);
+    },
+
+    listCues(project) {
+      type Row = { project: string; name: string; type: Cue["type"]; text: string; updated_at: string };
+      return (db.prepare("SELECT * FROM cues WHERE project = ? ORDER BY name").all(project) as Row[])
+        .map((r) => ({ project: r.project, name: r.name, type: r.type, text: r.text, updatedAt: r.updated_at }));
+    },
+
+    deleteCue(project, name) {
+      return db.prepare("DELETE FROM cues WHERE project = ? AND name = ?").run(project, name).changes > 0;
     },
 
     startReview(runId, sha, trigger) {

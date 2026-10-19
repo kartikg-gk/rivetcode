@@ -225,6 +225,29 @@ describe("spawn, status, resume, clean, project", () => {
     }
   }
 
+  it("saves, lists, runs and removes cues", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    const task = JSON.stringify({ files: { "c.txt": "from a cue" }, commit: "c" });
+    expect(await runCli(["cue", "add", "make-c", "--prompt", task], inRepo())).toBe(0);
+    expect(await runCli(["cue", "add", "touch", "--command", "node -e \"require('fs').writeFileSync('ran.txt','x')\""], inRepo())).toBe(0);
+    expect(await runCli(["cue", "add", "bad name", "--prompt", "x"], inRepo())).toBe(1);
+    expect(await runCli(["cue", "add", "both", "--prompt", "x", "--command", "y"], inRepo())).toBe(2);
+    out = [];
+    expect(await runCli(["cue", "list"], inRepo())).toBe(0);
+    expect(out.join("\n")).toMatch(/make-c +agent +\{"files"[\s\S]*touch +command +node -e/);
+    // An agent cue without a session starts a worker named after it.
+    out = [];
+    expect(await runCli(["cue", "run", "make-c", "--agent", "fake"], inRepo())).toBe(0);
+    const runId = /worker (r\w+) started/.exec(out.join("\n"))![1]!;
+    await waitFor(runId, "done");
+    expect(out[0]).toMatch(new RegExp(`^worker ${runId} \\(make-c\\): done`));
+    // A command cue runs here, at the repository's top.
+    expect(await runCli(["cue", "run", "touch"], inRepo())).toBe(0);
+    expect(existsSync(join(repo, "ran.txt"))).toBe(true);
+    expect(await runCli(["cue", "rm", "touch"], inRepo())).toBe(0);
+    expect(await runCli(["cue", "run", "touch"], inRepo())).toBe(2);
+  });
+
   it("spawns a worker end to end, lists it and cleans its worktree", async () => {
     daemon = await startDaemon({ data, runFile, port: 0 });
     const task = JSON.stringify({ files: { "a.txt": "a" }, commit: "a" });

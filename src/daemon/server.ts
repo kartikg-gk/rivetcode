@@ -11,6 +11,7 @@ import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
 import { cleanRun, prepareRun, repoRoot, RunInputError, SetupError } from "../scheduler/runs.js";
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
+import { checkCue } from "../scheduler/cues.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { runUsage } from "../usage.js";
@@ -558,6 +559,29 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const runs = await write(() => store.listRuns(project).map((id) => store.loadRun(id)));
       reply(res, 200, { conflicts: await radar(runs) });
       return;
+    }
+    const cues = /^\/api\/v1\/projects\/([^/]+)\/cues(?:\/([^/]+))?$/.exec(path);
+    if (cues) {
+      const project = decodeURIComponent(cues[1]!);
+      const name = cues[2] === undefined ? undefined : decodeURIComponent(cues[2]);
+      if (req.method === "GET" && name === undefined) {
+        reply(res, 200, { cues: await write(() => store.listCues(project)) });
+        return;
+      }
+      if (req.method === "PUT" && name !== undefined) {
+        const payload = await body(req);
+        let cue;
+        try { cue = checkCue(project, name, payload.type, payload.text); } catch (e) { throw new HttpError(400, (e as Error).message); }
+        await write(() => store.saveCue(cue));
+        reply(res, 200, cue);
+        return;
+      }
+      if (req.method === "DELETE" && name !== undefined) {
+        if (!(await write(() => store.deleteCue(project, name)))) throw new HttpError(404, `no cue "${name}"`);
+        reply(res, 204);
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
     }
     const config = /^\/api\/v1\/projects\/([^/]+)\/config$/.exec(path);
     if (config) {
