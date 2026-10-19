@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
 import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
+import type { TaskSpec } from "./scheduler/tasks.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -22,6 +23,8 @@ export type Run = {
   model?: string;
   // The issue the task came from, in the run's own repository; its pull request closes it.
   issue?: number;
+  // A task file's own definition of done, limits and guardrails for this run.
+  spec?: TaskSpec;
   node: Node;
 };
 
@@ -298,6 +301,11 @@ MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
 ` });
 
+// A task file's definition of done, limits and guardrails, as JSON.
+MIGRATIONS.push({ version: 13, sql: `
+ALTER TABLE runs ADD COLUMN spec TEXT;
+` });
+
 // Prompts run on a schedule, and each time they ran.
 MIGRATIONS.push({ version: 12, sql: `
 CREATE TABLE automations (
@@ -377,7 +385,7 @@ function migrate(db: DatabaseSync): void {
 
 type RunRow = {
   id: string; project: string; repo: string; base: string; task: string; created_at: string;
-  role: string; name: string; orchestrator: string | null; model: string | null; issue: number | null;
+  role: string; name: string; orchestrator: string | null; model: string | null; issue: number | null; spec: string | null;
 };
 type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
@@ -398,10 +406,10 @@ export function openStore(data: string): Store {
   migrate(db);
 
   const upsertRun = db.prepare(`
-    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model, issue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model, issue, spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET project = excluded.project, repo = excluded.repo,
       base = excluded.base, task = excluded.task, created_at = excluded.created_at,
-      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model, issue = excluded.issue`);
+      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model, issue = excluded.issue, spec = excluded.spec`);
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
@@ -459,7 +467,7 @@ export function openStore(data: string): Store {
       }
       db.exec("BEGIN IMMEDIATE");
       try {
-        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null);
+        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null, run.spec ? JSON.stringify(run.spec) : null);
         deleteNodes.run(run.id);
         const n = run.node;
         // The position, parent, depth, kind, files and shared columns are left from runs that
@@ -507,6 +515,7 @@ export function openStore(data: string): Store {
         ...(r.orchestrator !== null ? { orchestrator: r.orchestrator } : {}),
         ...(r.model !== null ? { model: r.model } : {}),
         ...(r.issue !== null ? { issue: Number(r.issue) } : {}),
+        ...(r.spec !== null ? { spec: JSON.parse(r.spec) as TaskSpec } : {}),
         node: nodes[0],
       };
     },

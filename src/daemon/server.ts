@@ -13,6 +13,7 @@ import { radar } from "../scheduler/radar.js";
 import { cleanRun, prepareRun, repoRoot, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
+import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
 import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
@@ -62,6 +63,8 @@ export type DaemonOptions = {
   radarMs?: number;
   // How often due automations are looked for.
   automationMs?: number;
+  // How often workers are checked against their task's time and token limits.
+  limitMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -476,6 +479,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const payload = await body(req);
       const issueRef = optionalString(payload.issue, "issue");
+      let spec: TaskSpec | undefined;
+      try { spec = checkSpec(payload.spec); } catch (e) { throw new HttpError(400, (e as Error).message); }
       if (typeof payload.repo !== "string" || (typeof payload.task !== "string" && issueRef === undefined)) {
         throw new HttpError(400, "repo and task must be strings");
       }
@@ -518,7 +523,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       let run;
       try {
         run = await newRun({
-          repo, task, role, ...(issue ? { issue } : {}),
+          repo, task, role, ...(issue ? { issue } : {}), ...(spec ? { spec } : {}),
           ...(name !== undefined ? { name } : {}), ...(model !== undefined ? { model } : {}), ...(orchestrator ? { orchestrator } : {}),
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
         });
@@ -712,6 +717,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     automationTimer.unref();
     void runDueAutomations().catch((e) => opts.onError?.(e));
     scheduler.watchRadar(opts.radarMs ?? 60_000);
+    scheduler.watchLimits(opts.limitMs ?? 15_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {
       void scheduler.recover(id).catch((e) => opts.onError?.(e));

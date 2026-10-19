@@ -225,6 +225,31 @@ describe("spawn, status, resume, clean, project", () => {
     }
   }
 
+  it("run starts a worker per task in a task file; --dry-run starts nothing", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    const file = join(repo, "tasks.yaml");
+    await writeFile(file, [
+      "tasks:",
+      "  - name: write t1",
+      `    goal: '${JSON.stringify({ files: { "t1.txt": "1" }, commit: "t1" })}'`,
+      "    agent: fake",
+      "    limits: { attempts: 1 }",
+      "  - name: write t2",
+      `    goal: '${JSON.stringify({ files: { "t2.txt": "2" }, commit: "t2" })}'`,
+      "    agent: fake",
+      "    guardrails: { paths: [t2.txt] }",
+    ].join("\n"));
+    out = [];
+    expect(await runCli(["run", "tasks.yaml", "--dry-run"], inRepo())).toBe(0);
+    expect(out.join("\n")).toMatch(/write t1  \(fake, 1 attempts\)\nwrite t2  \(fake, paths t2\.txt\)\n2 tasks; nothing started/);
+    out = [];
+    expect(await runCli(["run", "tasks.yaml"], inRepo())).toBe(0);
+    const ids = [...out.join("\n").matchAll(/^(r\w+) {2}write/gm)].map((m) => m[1]!);
+    expect(ids).toHaveLength(2);
+    for (const id of ids) await waitFor(id, "done");
+    expect(await runCli(["run", "missing.yaml"], inRepo())).toBe(2);
+  });
+
   it("saves, lists, runs and removes cues", async () => {
     daemon = await startDaemon({ data, runFile, port: 0 });
     const task = JSON.stringify({ files: { "c.txt": "from a cue" }, commit: "c" });

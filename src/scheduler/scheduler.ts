@@ -10,6 +10,8 @@ import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
 import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
+import { outsidePaths } from "./tasks.js";
+import { runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
@@ -128,13 +130,13 @@ export function createScheduler(d: SchedulerDeps) {
     const worker = run.role === "worker";
     if (worker) {
       // The agent must be able to run what Rivet will judge its work by.
-      for (const command of [config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
+      for (const command of [run.spec?.doneWhen ?? config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
         for (const rule of commandRules(command)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       }
       // A worker with a pull request may read its feedback itself (see checkPr).
       const pr = config["pr.feedback"] !== "full" ? await d.write(() => d.store.getPr(run.id)) : null;
       if (pr) for (const rule of feedbackRules(pr)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
-      const check = config.check?.trim();
+      const check = (run.spec?.doneWhen ?? config.check)?.trim();
       if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check, config["verify.reuse"] !== "off");
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
@@ -145,6 +147,7 @@ export function createScheduler(d: SchedulerDeps) {
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
       ...(model ? { model } : {}),
       ...(allowedTools.length ? { allowedTools } : {}),
+      ...(run.spec?.denyTools?.length ? { disallowedTools: run.spec.denyTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
     };
     const argv = o.resume
@@ -227,7 +230,9 @@ export function createScheduler(d: SchedulerDeps) {
   // The project's check, then its tests, on a worker's worktree as it is now.
   async function verify(run: Run): Promise<{ ok: true } | { ok: false; why: string }> {
     const config = await d.write(() => d.store.getConfig(run.project));
-    for (const [what, command, timeout] of [["check", config.check, checkTimeout], ["tests", config.test, testTimeout]] as const) {
+    // A task's own definition of done stands in for the project's check.
+    const check = run.spec?.doneWhen ?? config.check;
+    for (const [what, command, timeout] of [[run.spec?.doneWhen ? "done_when" : "check", check, checkTimeout], ["tests", config.test, testTimeout]] as const) {
       if (!command) continue;
       const result = await runCommand(command, run.node.worktree, timeout);
       if (!result.ok) return { ok: false, why: `${what} "${command}" failed on the finished work:\n${result.output}` };
@@ -263,6 +268,14 @@ export function createScheduler(d: SchedulerDeps) {
     // Any failure noted on an earlier attempt is over now.
     await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString(), summary: null }));
     const config = await d.write(() => d.store.getConfig(run.project));
+    // A guardrail on paths: work that changed other files goes back.
+    if (run.spec?.paths?.length) {
+      const outside = outsidePaths(await filesChanged(run), run.spec.paths);
+      if (outside.length) {
+        await workFailed(runId, `it changed files outside the allowed paths (${run.spec.paths.join(", ")}): ${outside.join(", ")}. Undo those changes, or make them inside the allowed paths.`);
+        return;
+      }
+    }
     const reused = config["verify.reuse"] !== "off" && passed.get(runId) === await workingTree(run.node.worktree);
     passed.delete(runId);
     if (!reused) {
@@ -291,7 +304,7 @@ export function createScheduler(d: SchedulerDeps) {
   async function workFailed(runId: string, why: string): Promise<void> {
     const run = await load(runId);
     if (run.node.status !== "running") return;
-    if (run.node.attempts < MAX_ATTEMPTS) {
+    if (run.node.attempts < (run.spec?.attempts ?? MAX_ATTEMPTS)) {
       await transition(runId, "failed", why);
       await runSession(runId, why);
       return;
@@ -388,6 +401,7 @@ export function createScheduler(d: SchedulerDeps) {
     shuttingDown = true;
     if (watcher) clearInterval(watcher);
     if (radarTimer) clearInterval(radarTimer);
+    if (limitTimer) clearInterval(limitTimer);
     await d.runtime.stopAll();
     await idle();
   }
@@ -732,6 +746,32 @@ export function createScheduler(d: SchedulerDeps) {
     if (id !== null) await deliverQueued(runId).catch(report);
   }
 
+  // --- Limits from a task file: a worker past its time or token budget is stopped and
+  // escalated with the reason.
+  async function checkLimits(now = Date.now()): Promise<void> {
+    const runs = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id))
+      .filter((r) => r.role === "worker" && r.node.status === "running" && (r.spec?.minutes || r.spec?.tokens)));
+    for (const run of runs) {
+      let why: string | undefined;
+      if (run.spec!.minutes && run.node.startedAt && now - Date.parse(run.node.startedAt) > run.spec!.minutes * 60_000) {
+        why = `it reached its time limit of ${run.spec!.minutes} minutes`;
+      } else if (run.spec!.tokens) {
+        const used = runUsage(await d.write(() => d.store.conversations(run.id))).inputEquivalent;
+        if (used > run.spec!.tokens) why = `it used ${used} input-equivalent tokens, over its limit of ${run.spec!.tokens}`;
+      }
+      if (!why) continue;
+      await stopSession(sessionOf(run));
+      await transition(run.id, "escalated", `stopped: ${why}`).catch(report);
+      await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} was stopped: ${why}.`);
+    }
+  }
+
+  let limitTimer: NodeJS.Timeout | undefined;
+  function watchLimits(intervalMs: number): void {
+    limitTimer = setInterval(() => { void checkLimits().catch(report); }, intervalMs);
+    limitTimer.unref();
+  }
+
   let watcher: NodeJS.Timeout | undefined;
   // Looks at every open pull request on a timer until shutdown.
   function watchPrs(intervalMs: number): void {
@@ -813,7 +853,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
+  return { launch, startRun, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

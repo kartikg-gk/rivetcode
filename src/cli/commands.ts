@@ -32,6 +32,8 @@ export type CliIo = {
 const USAGE = `usage: rivet <command>
   spawn [--name <label>] [--agent <name>] [--model <id>] [--issue <n|owner/repo#n|url>] [--repo <dir>] [--base <branch>] [<task>]
                                         start a worker on a task in its own worktree
+  run <tasks.yaml|tasks.json> [--dry-run] [--repo <dir>]
+                                        start a worker per task, each with its goal, done_when, limits and guardrails
   orchestrator [--agent <name>] [--repo <dir>] [<what you want>]
                                         start an agent that splits work and spawns workers
   status [<run>]                        list sessions, or show one with its pull request
@@ -450,6 +452,45 @@ async function automation(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
+// A task file: every task in it starts as a worker with its own definition of done,
+// limits and guardrails. --dry-run only checks the file and shows what would start.
+async function runFile(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["repo"]);
+  const file = rest[0];
+  if (!file) throw new UsageError("run needs a task file (YAML or JSON)");
+  const { readFile } = await import("node:fs/promises");
+  const { parseTaskFile, TaskFileError } = await import("../scheduler/tasks.js");
+  let tasks;
+  try {
+    tasks = parseTaskFile(await readFile(resolve(io.cwd, file), "utf8"), file);
+  } catch (e) {
+    if (e instanceof TaskFileError || (e as NodeJS.ErrnoException).code === "ENOENT") throw new UsageError((e as Error).message);
+    throw e;
+  }
+  const describe = (t: (typeof tasks)[number]) => [
+    t.agent ?? "default agent", t.spec.doneWhen ? `done when: ${t.spec.doneWhen}` : "",
+    t.spec.minutes ? `${t.spec.minutes} min` : "", t.spec.tokens ? `${t.spec.tokens} tokens` : "",
+    t.spec.attempts ? `${t.spec.attempts} attempts` : "", t.spec.paths ? `paths ${t.spec.paths.join(" ")}` : "",
+  ].filter(Boolean).join(", ");
+  if (flags.get("dry-run") === true) {
+    for (const t of tasks) io.out(`${t.name}  (${describe(t)})`);
+    io.out(`${tasks.length} tasks; nothing started`);
+    return 0;
+  }
+  await ensureDaemon(io);
+  const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
+  const from = io.env.RIVET_SESSION_ID?.trim();
+  for (const t of tasks) {
+    const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
+      repo, task: t.goal, name: t.name, spec: t.spec, ...(t.agent ? { agent: t.agent } : {}), ...(t.model ? { model: t.model } : {}),
+      ...(t.base ? { base: t.base } : {}), ...(from ? { from } : {}),
+    }, RUN_TIMEOUT_MS) as { runId: string };
+    io.out(`${result.runId}  ${t.name}  (${describe(t)})`);
+  }
+  io.out(`started ${tasks.length} workers; follow them with rivet status`);
+  return 0;
+}
+
 // Saved prompts and commands for this repository's project.
 async function cue(args: string[], io: CliIo): Promise<number> {
   const [action, name, ...more] = args;
@@ -667,6 +708,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);
       case "cue": return await cue(args, io);
+      case "run": return await runFile(args, io);
       case "automation": return await automation(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);

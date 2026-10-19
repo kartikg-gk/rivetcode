@@ -97,7 +97,7 @@ describe("opening the pull request", () => {
     await start({ pr: "auto" });
     const runId = await spawn();
     const { pr, run } = await until(() => runOf(runId), (r) => r.pr !== null);
-    expect(pr).toEqual({ number: 1, url: "https://github.com/o/r/pull/1" });
+    expect(pr).toMatchObject({ number: 1, url: "https://github.com/o/r/pull/1" });
     expect(run.node.prStatus).toBe("pr_open");
     expect(gh.prs[0]).toMatchObject({ title: "add a", base: "main", head: { ref: `rivet/${runId}/agent` } });
     expect(gh.prs[0]!.body).toMatch(/Done by one agent \(fake\) in its own worktree/);

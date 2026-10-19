@@ -1,3 +1,4 @@
+import type { TaskSpec } from "./tasks.js";
 import { existsSync } from "node:fs";
 import { cp, mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -26,6 +27,7 @@ export type NewRun = {
   orchestrator?: string;
   model?: string;
   issue?: number;
+  spec?: TaskSpec;
   base?: string;
   agent?: string;
   // The project's configured default agent, used when no agent is given.
@@ -94,7 +96,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   }
   return {
     id, project, repo, base, task: o.task.trim(), createdAt: new Date().toISOString(), role, name,
-    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), ...(o.issue ? { issue: o.issue } : {}), node,
+    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), ...(o.issue ? { issue: o.issue } : {}), ...(o.spec && Object.keys(o.spec).length ? { spec: o.spec } : {}), node,
   };
 }
 

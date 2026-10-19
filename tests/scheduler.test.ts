@@ -30,7 +30,7 @@ afterEach(async () => {
   await removeRepo(data);
 });
 
-async function start(claude?: Agent, more: { radarMs?: number } = {}): Promise<void> {
+async function start(claude?: Agent, more: { radarMs?: number; limitMs?: number } = {}): Promise<void> {
   daemon = await startDaemon({
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, ...more,
     agents: (name) => (name === "claude" && claude ? claude : getAgent("fake")),
@@ -555,5 +555,34 @@ describe("automations", () => {
     expect(a.runs).toHaveLength(1);
     expect(Date.parse(a.nextRunAt)).toBeGreaterThan(Date.now());
     await settled(a.runs[0]!.runId!);
+  });
+});
+
+describe("a task's own spec", () => {
+  it("done_when replaces the project's check", async () => {
+    await start();
+    await setCfg("check", `node -e "process.exit(1)"`);
+    const runId = await spawn({ files: { "a.txt": "a" }, commit: "a" }, { spec: { doneWhen: `node -e "process.exit(require('fs').existsSync('a.txt') ? 0 : 1)"` } });
+    expect((await settled(runId)).node.status).toBe("done");
+  });
+
+  it("work outside the allowed paths goes back, and attempts sets how often", async () => {
+    await start();
+    const runId = await spawn({ files: { "other.txt": "x" }, commit: "x" }, { spec: { paths: ["src/**"], attempts: 1 } });
+    const run = await settled(runId);
+    expect(run.node.status).toBe("escalated");
+    expect(run.node.summary).toMatch(/gave up after 1 attempts: it changed files outside the allowed paths \(src\/\*\*\): other\.txt/);
+  });
+
+  it("a worker past its time limit is stopped and escalated", async () => {
+    await start(undefined, { limitMs: 100 });
+    const runId = await spawn({ stayFor: 60_000 }, { spec: { minutes: 0.01 } });
+    const run = await settled(runId);
+    expect(run.node).toMatchObject({ status: "escalated", summary: "stopped: it reached its time limit of 0.01 minutes" });
+  });
+
+  it("a bad spec is refused", async () => {
+    await start();
+    expect((await api("POST", "/api/v1/runs", { repo, task: "x", agent: "fake", spec: { minutes: -2 } })).json.error).toMatch(/must be a positive number/);
   });
 });
