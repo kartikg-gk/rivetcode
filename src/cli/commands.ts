@@ -35,7 +35,7 @@ const USAGE = `usage: rivet <command>
   orchestrator [--agent <name>] [--repo <dir>] [<what you want>]
                                         start an agent that splits work and spawns workers
   status [<run>]                        list sessions, or show one with its pull request
-  stop <run>                            stop a session's agent
+  stop <run> [--keep-workers]           stop a session; an orchestrator also stops its workers
   resume <run>                          retry what was escalated or interrupted
   pr <run>                              bring in the latest base, push and open the pull request
   clean <run>                           remove a run's worktree (the branch stays)
@@ -514,10 +514,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "spawn": return await startSession(args, io, "worker");
       case "orchestrator": return await startSession(args, io, "orchestrator");
       case "stop": {
-        const [runId] = args;
+        const { flags, rest } = parseFlags(args, []);
+        const runId = rest[0];
         if (!runId) throw new UsageError("stop needs a run id");
-        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/stop`, undefined, COMMAND_TIMEOUT_MS);
-        io.out(`stopped ${runId}`);
+        const { workers } = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/stop`,
+          { keepWorkers: flags.get("keep-workers") === true }, COMMAND_TIMEOUT_MS) as { workers?: string[] };
+        io.out(`stopped ${runId}${workers?.length ? ` and its workers ${workers.join(", ")}` : ""}`);
         return 0;
       }
       case "attach": return await attach(args, io);

@@ -611,11 +611,23 @@ export function createScheduler(d: SchedulerDeps) {
 
   // The user stops a session for good: a worker waits for resume, an orchestrator is over.
   // Neither comes back on its own when the daemon restarts.
-  async function stopRun(runId: string): Promise<void> {
+  // Stopping an orchestrator also stops the workers it started that are still working,
+  // unless keepWorkers: their work was its plan, and a new orchestrator would not know them.
+  async function stopRun(runId: string, o: { keepWorkers?: boolean } = {}): Promise<string[]> {
     const run = await load(runId);
     await stopSession(sessionOf(run));
-    if (run.node.status !== "running") return;
-    await transition(runId, run.role === "orchestrator" ? "done" : "escalated", "stopped by the user");
+    if (run.node.status === "running") {
+      await transition(runId, run.role === "orchestrator" ? "done" : "escalated", "stopped by the user");
+    }
+    if (run.role !== "orchestrator" || o.keepWorkers) return [];
+    const session = sessionOf(run);
+    const workers = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id))
+      .filter((r) => r.orchestrator === session && r.node.status === "running"));
+    for (const w of workers) {
+      await stopSession(sessionOf(w));
+      await transition(w.id, "escalated", `stopped with its orchestrator ${run.id}`).catch(report);
+    }
+    return workers.map((w) => w.id);
   }
 
   // After a daemon restart (or a resume): finish what was in flight. A session that never

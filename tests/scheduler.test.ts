@@ -219,7 +219,7 @@ describe("resume and recovery", () => {
     await start();
     const runId = await spawn({ stayFor: 60_000 });
     await new Promise((r) => setTimeout(r, 300));
-    expect((await api("POST", `/api/v1/runs/${runId}/stop`)).status).toBe(204);
+    expect((await api("POST", `/api/v1/runs/${runId}/stop`)).status).toBe(200);
     expect((await getRun(runId)).node).toMatchObject({ status: "escalated", attempts: 1, summary: "stopped by the user" });
     await daemon!.stop();
     daemon = undefined;
@@ -416,7 +416,7 @@ describe("an orchestrator after a restart", () => {
     expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(false);
     expect((await api("POST", `/api/v1/runs/${orch}/resume`)).status).toBe(202);
     expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(true);
-    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(200);
     expect((await getRun(orch)).node).toMatchObject({ status: "done", summary: "stopped by the user" });
     expect(errors).toEqual([]);
   });
@@ -446,7 +446,7 @@ describe("an orchestrator's conversation", () => {
     const end = Date.now() + 10_000;
     while (!existsSync(file) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
     expect(await readFile(file, "utf8")).toMatch(/^Rivet was restarted\. Before starting anything, run rivet status/);
-    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(200);
     expect(errors).toEqual([]);
   });
 });
@@ -459,5 +459,26 @@ describe("models", () => {
     expect(modelFor("codex", { "worker.agent": "codex", "worker.model": "o4" })).toBe("o4");
     expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4", "claude.model": "sonnet" })).toBe("sonnet");
     expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4" })).toBeUndefined();
+  });
+});
+
+describe("stopping an orchestrator", () => {
+  it("stops the workers it started that still work, unless asked to keep them", async () => {
+    await start();
+    const orch = async () => (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const first = await orch();
+    const working = await spawn({ stayFor: 60_000 }, { from: `${first}-agent` });
+    const finished = await spawn({ files: { "f.txt": "f" }, commit: "f" }, { from: `${first}-agent` });
+    await settled(finished);
+    const stopped = await api("POST", `/api/v1/runs/${first}/stop`, {});
+    expect(stopped.json).toEqual({ workers: [working] });
+    expect((await getRun(working)).node).toMatchObject({ status: "escalated", summary: `stopped with its orchestrator ${first}` });
+    expect((await getRun(finished)).node.status).toBe("done");
+
+    const second = await orch();
+    const kept = await spawn({ stayFor: 60_000 }, { from: `${second}-agent` });
+    expect((await api("POST", `/api/v1/runs/${second}/stop`, { keepWorkers: true })).json).toEqual({ workers: [] });
+    expect((await getRun(kept)).node.status).toBe("running");
+    await api("POST", `/api/v1/runs/${kept}/stop`, {});
   });
 });

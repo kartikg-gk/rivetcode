@@ -467,8 +467,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       if (action === "stop") {
-        await scheduler.stopRun(run.id);
-        reply(res, 204);
+        const payload = await body(req);
+        const workers = await scheduler.stopRun(run.id, { keepWorkers: payload.keepWorkers === true });
+        reply(res, 200, { workers });
         return;
       }
       if (action === "pr") {
