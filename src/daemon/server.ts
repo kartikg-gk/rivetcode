@@ -14,7 +14,7 @@ import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { runUsage } from "../usage.js";
-import { ACTIVITY_STATES, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
+import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
@@ -329,7 +329,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
       // A reviewer's hooks have nothing to record: it is not the run's session.
-      if (nodeId === "review") {
+      if (nodeId === "review" || nodeId === "partner") {
         reply(res, 204);
         return;
       }
@@ -357,10 +357,31 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const { runId, nodeId } = session(payload.sessionId);
       if (!REPORT_KINDS.includes(payload.kind as ReportKind)) throw new HttpError(400, "invalid report kind");
       const message = optionalString(payload.message, "message");
+      // A partner's report is its result for the worker that delegated to it.
+      if (nodeId === "partner") {
+        scheduler.partnerReport(runId, payload.kind as string, message);
+        reply(res, 201, { id: 0 });
+        return;
+      }
       const id = await write(() => store.createReport(runId, nodeId, payload.kind as ReportKind, message));
       if (id === null) throw new HttpError(404, "unknown session");
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
+      return;
+    }
+    const delegation = /^\/api\/v1\/sessions\/([^/]+)\/delegate$/.exec(path);
+    if (delegation) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId, nodeId } = session(delegation[1]);
+      if (nodeId !== NODE_ID) throw new HttpError(409, "only a worker delegates");
+      const payload = await body(req);
+      const agent = optionalString(payload.agent, "agent");
+      if (agent !== undefined && !AGENTS.includes(agent as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
+      const model = optionalString(payload.model, "model");
+      reply(res, 202, await scheduler.delegate(runId, {
+        task: optionalString(payload.task, "task") ?? "", review: payload.review === true,
+        ...(agent ? { agent: agent as never } : {}), ...(model ? { model } : {}),
+      }));
       return;
     }
     const submit = /^\/api\/v1\/sessions\/([^/]+)\/review$/.exec(path);

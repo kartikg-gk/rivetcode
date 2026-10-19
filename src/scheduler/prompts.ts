@@ -11,7 +11,10 @@ export function workerPrompt(run: Run, retry?: string): string {
     `When the task is finished, run: rivet report --done --note "<one line summary>"`,
     `If you are stuck, run: rivet report --stuck --note "<what blocks you>"`,
     `If you need a decision, run: rivet report --needs-input --note "<question>"`,
-    "Do not use your own subagent or task tools to hand work off; finish it here.",
+    "Do not use your own subagent or task tools to hand work off; finish it here. To hand a",
+    "self-contained part to another agent working in this same worktree, run",
+    'rivet delegate [--agent claude|codex] "<task>"; for a second opinion on your changes so far,',
+    "run rivet delegate --review. Its result arrives here as a message.",
   ];
   // Codex's sandbox does not let it write a linked worktree's git data (it lives in the
   // main repository's .git), so its commits fail; Rivet commits for it.
@@ -134,5 +137,34 @@ export function reviewerPrompt(run: Run, pr: PullRequest, sha: string): string {
     "Every change the worker must make is its own --comment on the most relevant changed line;",
     "the worker treats each as required. Keep optional suggestions in the summary.",
     "Use changes_requested only when at least one --comment is required.",
+  ].join("\n");
+}
+
+// What a partner agent is told: only its task, in a worktree another agent works in too.
+export function partnerPrompt(run: Run, task: string, review: boolean, agent: string): string {
+  if (agent === "fake") return task;
+  const shared = [
+    "Another agent is working in this same worktree at the same time, on the larger task this",
+    "is part of. It asked you for this and will get your result.",
+  ];
+  if (review) {
+    return [
+      "Review the changes made so far in this worktree.",
+      ...(task.trim() ? ["", `What to look at: ${task.trim()}`] : []),
+      "", ...shared, "",
+      `See them with git diff origin/${run.base}...HEAD for what is committed and git diff for what is not.`,
+      "Look for bugs, missing error handling, missing tests and security problems. Change nothing,",
+      "and do not run the project's programs or tests.",
+      "",
+      'When done, run: rivet report --done --note "<one finding per line as path:line: what to change, or: no findings>"',
+    ].join("\n");
+  }
+  return [
+    `Your task: ${task.trim()}`,
+    "", ...shared, "",
+    "- Change only what your task needs, and read a file again right before you edit it.",
+    "- Do not commit, push or switch branches: your changes are committed with the other agent's work.",
+    '- When finished, run: rivet report --done --note "<what you changed, in a few lines>"',
+    '- If you cannot do it, run: rivet report --stuck --note "<why>"',
   ].join("\n");
 }

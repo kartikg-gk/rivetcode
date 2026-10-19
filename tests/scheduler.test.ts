@@ -482,3 +482,36 @@ describe("stopping an orchestrator", () => {
     await api("POST", `/api/v1/runs/${kept}/stop`, {});
   });
 });
+
+describe("delegating to a partner", () => {
+  it("runs the partner in the worker's worktree and hands its result to the worker as a message", async () => {
+    await start();
+    const worker = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 300));
+    const partnerTask = JSON.stringify({ files: { "p.txt": "from the partner" }, stayFor: 300 });
+    const res = await api("POST", `/api/v1/sessions/${worker}-agent/delegate`, { task: partnerTask });
+    expect(res.status).toBe(202);
+    expect(res.json).toEqual({ session: `${worker}-partner`, agent: "fake" });
+    // One partner at a time.
+    expect((await api("POST", `/api/v1/sessions/${worker}-agent/delegate`, { task: partnerTask })).json.error).toMatch(/already has a partner/);
+    const worktree = (await getRun(worker)).node.worktree;
+    const inbox = join(worktree, "inbox.txt");
+    const end = Date.now() + 10_000;
+    while (!(existsSync(inbox) && (await readFile(inbox, "utf8")).includes("Your partner")) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    expect(await readFile(inbox, "utf8")).toContain("Your partner (fake) finished the delegated task:");
+    // The partner's work is in the worktree, left for the worker's commits.
+    expect(await readFile(join(worktree, "p.txt"), "utf8")).toBe("from the partner");
+    expect((await git(["status", "--porcelain"], worktree))).toContain("p.txt");
+    await api("POST", `/api/v1/runs/${worker}/stop`, {});
+  });
+
+  it("is refused for a worker that is not working, and from an orchestrator", async () => {
+    await start();
+    const done = await spawn({ commit: "none" });
+    await settled(done);
+    expect((await api("POST", `/api/v1/sessions/${done}-agent/delegate`, { task: "x" })).json.error).toMatch(/is not working/);
+    const orch = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId;
+    expect((await api("POST", `/api/v1/sessions/${orch}-agent/delegate`, { task: "x" })).json.error).toMatch(/only a worker delegates/);
+    await api("POST", `/api/v1/runs/${orch}/stop`, {});
+  });
+});

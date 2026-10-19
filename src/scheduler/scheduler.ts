@@ -8,7 +8,7 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, reviewerPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
+import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
 import { cleanRun } from "./runs.js";
 
@@ -310,6 +310,10 @@ export function createScheduler(d: SchedulerDeps) {
     const runId = sessionId.slice(0, sessionId.indexOf("-"));
     if (sessionId === reviewSession(runId)) {
       await reviewerExited(runId);
+      return;
+    }
+    if (sessionId === partnerSession(runId)) {
+      await partnerExited(runId, code);
       return;
     }
     await d.write(() => d.store.setActivity(runId, NODE_ID, "exited"));
@@ -667,6 +671,67 @@ export function createScheduler(d: SchedulerDeps) {
     await startReview(run.id, "auto", sha);
   }
 
+  // --- Delegation: a worker hands part of its task (or a review of its changes) to a
+  // partner agent in its own worktree. The partner gets only that task, never commits, and
+  // its result comes back to the worker as a message.
+
+  const partnerSession = (runId: string) => sessionIdOf(runId, "partner");
+  // The partner of each worker while it works: its agent, whether it reviews, its report.
+  const partners = new Map<string, { agent: Node["agent"]; review: boolean; note?: string }>();
+  const PARTNER_REVIEW_TOOLS = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(rivet report:*)"];
+
+  async function delegate(runId: string, o: { task: string; agent?: Node["agent"]; model?: string; review?: boolean }): Promise<{ session: string; agent: Node["agent"] }> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker delegates");
+    if (run.node.status !== "running") throw new SchedulerError(409, `run ${runId} is not working (it is ${run.node.status})`);
+    const session = partnerSession(runId);
+    if (d.runtime.isAlive(session)) throw new SchedulerError(409, "this worker already has a partner at work; wait for its result");
+    if (!o.review && !o.task.trim()) throw new SchedulerError(400, "delegate needs a task");
+    const config = await d.write(() => d.store.getConfig(run.project));
+    const agentName = o.agent ?? run.node.agent;
+    const agent = d.agents(agentName);
+    const model = o.model ?? modelFor(agentName, config);
+    const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    const launchId = newLaunchId();
+    const argv = await agent.launchCommand({
+      sessionId: session, workspace: run.node.worktree, headless: true,
+      permission: o.review ? "read-only" : normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
+      allowedTools: o.review ? PARTNER_REVIEW_TOOLS : allowedTools,
+      prompt: partnerPrompt(run, o.task, !!o.review, agentName),
+      ...(model ? { model } : {}),
+    });
+    partners.set(runId, { agent: agentName, review: !!o.review });
+    d.launches.set(session, launchId);
+    try {
+      await d.runtime.start({
+        sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
+        env: agentEnv({ runId, nodeId: "partner", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
+      });
+    } catch (e) {
+      partners.delete(runId);
+      throw e;
+    }
+    return { session, agent: agentName };
+  }
+
+  // "rivet report" from a partner: its note is its result.
+  function partnerReport(runId: string, kind: string, note?: string): void {
+    const partner = partners.get(runId);
+    if (partner && note) partner.note = `${kind === "done" ? "" : `(${kind}) `}${note}`;
+  }
+
+  // The partner's result goes to the worker that delegated, as a message.
+  async function partnerExited(runId: string, code: number | null): Promise<void> {
+    const partner = partners.get(runId);
+    partners.delete(runId);
+    if (!partner) return;
+    const what = partner.review ? "review of your changes" : "delegated task";
+    const result = partner.note ?? (lastOutput(partnerSession(runId)).trim() || `it exited with code ${code} and reported nothing`);
+    const message = `Your partner (${partner.agent}) finished the ${what}${code === 0 || partner.note ? "" : " with an error"}:\n${result}`;
+    const id = await d.write(() => d.store.queueMessage(runId, NODE_ID, message, partnerSession(runId)));
+    if (id !== null) await deliverQueued(runId).catch(report);
+  }
+
   let watcher: NodeJS.Timeout | undefined;
   // Looks at every open pull request on a timer until shutdown.
   function watchPrs(intervalMs: number): void {
@@ -748,7 +813,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, agentCheck, startReview, submitReview, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
+  return { launch, startRun, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

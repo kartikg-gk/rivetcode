@@ -54,6 +54,8 @@ const USAGE = `usage: rivet <command>
   report --done|--stuck|--needs-input --note <text>
                                         report this session's state (inside an agent)
   check                                 run the project's check and tests on this worktree (inside a worker)
+  delegate [--agent <name>] [--model <id>] [--review] [<task>]
+                                        hand a task or a review to a partner agent in this worktree (inside a worker)
   send --session <id> --message <text>  send a message to a running session`;
 
 class UsageError extends Error {}
@@ -195,6 +197,22 @@ async function review(args: string[], io: CliIo): Promise<number> {
   if (!summary?.trim()) throw new UsageError("review submit needs --summary");
   await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/review`, { verdict, summary, comments }, COMMAND_TIMEOUT_MS);
   io.out(`review submitted: ${verdict}${comments.length ? `, ${comments.length} comments` : ""}`);
+  return 0;
+}
+
+// Run by a worker's agent: hands a task, or a review of its changes, to a partner agent in
+// the same worktree. The partner's result comes back as a message.
+async function delegate(args: string[], io: CliIo): Promise<number> {
+  const session = io.env.RIVET_SESSION_ID?.trim();
+  if (!session) throw new UsageError("delegate runs inside a worker started by Rivet");
+  const { flags, rest } = parseFlags(args, ["agent", "model"]);
+  const task = rest.join(" ").trim();
+  const review = flags.get("review") === true;
+  if (!task && !review) throw new UsageError("delegate needs a task, or --review");
+  const text = (key: string) => (typeof flags.get(key) === "string" ? { [key]: flags.get(key) as string } : {});
+  const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/delegate`,
+    { task, review, ...text("agent"), ...text("model") }, COMMAND_TIMEOUT_MS) as { agent: string };
+  io.out(`${result.agent} is on it; its result will arrive here as a message`);
   return 0;
 }
 
@@ -548,6 +566,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "send": return await send(args, io);
       case "check": return await check(io);
       case "review": return await review(args, io);
+      case "delegate": return await delegate(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
       case "login": return await login(args, io);
