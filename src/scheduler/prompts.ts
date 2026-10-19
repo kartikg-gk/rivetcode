@@ -14,7 +14,8 @@ export function workerPrompt(run: Run, retry?: string): string {
     "Do not use your own subagent or task tools to hand work off; finish it here. To hand a",
     "self-contained part to another agent working in this same worktree, run",
     'rivet delegate [--agent claude|codex] "<task>"; for a second opinion on your changes so far,',
-    "run rivet delegate --review. Its result arrives here as a message.",
+    "run rivet delegate --review. Its result arrives here as a message: do not wait for it or check",
+    "on it; go on with your own part, or end your turn if you have nothing else to do.",
   ];
   // Codex's sandbox does not let it write a linked worktree's git data (it lives in the
   // main repository's .git), so its commits fail; Rivet commits for it.

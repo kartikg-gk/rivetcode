@@ -180,6 +180,19 @@ describe("an orchestrator", () => {
     await api("POST", `/api/v1/runs/${orchestrator}/stop`);
   });
 
+  it("is told once when a worker waits for a permission answer", async () => {
+    await start();
+    const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const worker = await spawn({ stayFor: 60_000 }, { from: `${orchestrator}-agent` });
+    await new Promise((r) => setTimeout(r, 300));
+    for (const state of ["blocked", "blocked"]) await api("POST", `/api/v1/sessions/${worker}-agent/activity`, { state });
+    await new Promise((r) => setTimeout(r, 400));
+    const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
+    expect(inbox.split(/\r?\n/).filter((l) => l.includes("is waiting for a permission answer"))).toHaveLength(1);
+    expect(inbox).toContain(`Answer it with rivet send --session ${worker}-agent --message`);
+    await api("POST", `/api/v1/runs/${orchestrator}/stop`, {});
+  });
+
   it("refuses a model that belongs to the other agent", async () => {
     await start();
     const codex = await api("POST", "/api/v1/runs", { repo, task: "x", agent: "codex", model: "claude-opus-5-5" });
@@ -375,6 +388,18 @@ describe("messages to a headless agent", () => {
       restoreCommand: async (cfg) => [process.execPath, script, "--", JSON.stringify({ files: { "resumed.txt": cfg.prompt ?? "" }, commit: "act on messages" })],
     };
   }
+
+  it("a worker whose turn ends while its partner works goes on with the partner's result", async () => {
+    await start(headless());
+    const res = await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ files: { "w.txt": "w" }, commit: "w", stayFor: 400 }), agent: "claude" });
+    const runId = res.json.runId as string;
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/delegate`, { agent: "fake", task: JSON.stringify({ files: { "p.txt": "p" }, stayFor: 1500 }) })).status).toBe(202);
+    const run = await settled(runId);
+    expect(run.node.status).toBe("done");
+    // Resumed with the result, after the partner had finished: its work is in the commits.
+    expect(await readFile(join(run.node.worktree, "resumed.txt"), "utf8")).toMatch(/Your partner \(fake\) finished the delegated task/);
+    expect(await show(run.node.branch, "p.txt")).toBe("p");
+  });
 
   it("hands queued messages over when its turn ends, before its work is taken", async () => {
     await start(headless());

@@ -388,8 +388,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 204);
         return;
       }
+      const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
+      if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
     }

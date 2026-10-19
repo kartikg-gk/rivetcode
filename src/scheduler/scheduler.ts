@@ -342,6 +342,12 @@ export function createScheduler(d: SchedulerDeps) {
     // An orchestrator's exit ends nothing but its own conversation.
     if (run.role !== "worker") return;
     if (code === 0 || doneReported.has(sessionId)) {
+      // Its partner is still at work: the worker's turn is not its finish. It is resumed
+      // with the partner's result once that comes.
+      if (partners.has(runId) && d.runtime.isAlive(partnerSession(runId))) {
+        awaitingPartner.add(runId);
+        return;
+      }
       if (await messagesAtTurnEnd(run)) return;
       await track(workFinished(runId));
     } else await workFailed(runId, `agent exited with code ${code}\n${lastOutput(sessionId)}`);
@@ -368,6 +374,20 @@ export function createScheduler(d: SchedulerDeps) {
     }
     for (const m of queued) await d.write(() => d.store.markDelivered(m.id));
     return true;
+  }
+
+  // A worker in a terminal stopped at a permission question: its orchestrator is told
+  // once per question, since nothing goes on until someone answers.
+  async function onBlocked(runId: string): Promise<void> {
+    const run = await load(runId);
+    if (run.role !== "worker" || !run.orchestrator) return;
+    const session = sessionOf(run);
+    const shown = (d.runtime.output(session, 12)?.lines ?? []).join("\n").trim();
+    await tellOrchestrator(run, [
+      `Worker ${run.id}${run.name ? ` (${run.name})` : ""} is waiting for a permission answer and does nothing until it gets one.`,
+      ...(shown ? ["Its screen ends with:", shown] : []),
+      `Answer it with rivet send --session ${session} --message "<the choice's number>", or tell the user.`,
+    ].join("\n"));
   }
 
   // Hands a worker's news to the orchestrator that started it, if it has one.
@@ -692,6 +712,8 @@ export function createScheduler(d: SchedulerDeps) {
   const partnerSession = (runId: string) => sessionIdOf(runId, "partner");
   // The partner of each worker while it works: its agent, whether it reviews, its report.
   const partners = new Map<string, { agent: Node["agent"]; review: boolean; note?: string }>();
+  // Workers whose turn ended while their partner worked; they go on when it is done.
+  const awaitingPartner = new Set<string>();
   const PARTNER_REVIEW_TOOLS = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(rivet report:*)"];
 
   async function delegate(runId: string, o: { task: string; agent?: Node["agent"]; model?: string; review?: boolean }): Promise<{ session: string; agent: Node["agent"] }> {
@@ -744,6 +766,12 @@ export function createScheduler(d: SchedulerDeps) {
     const message = `Your partner (${partner.agent}) finished the ${what}${code === 0 || partner.note ? "" : " with an error"}:\n${result}`;
     const id = await d.write(() => d.store.queueMessage(runId, NODE_ID, message, partnerSession(runId)));
     if (id !== null) await deliverQueued(runId).catch(report);
+    if (awaitingPartner.delete(runId)) {
+      const run = await load(runId);
+      if (run.node.status !== "running" || d.runtime.isAlive(sessionOf(run))) return;
+      // Resumed with the result; without a conversation to resume, its work is taken as is.
+      if (!(await messagesAtTurnEnd(run))) await track(workFinished(runId));
+    }
   }
 
   // --- Limits from a task file: a worker past its time or token budget is stopped and
@@ -877,7 +905,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { launch, startRun, onBlocked, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;
