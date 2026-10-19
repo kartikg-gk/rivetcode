@@ -19,7 +19,10 @@ export function workerPrompt(run: Run, retry?: string): string {
 
 // The project's check runs when a worker says it is done and a failure sends the work
 // back, so a worker runs it itself first.
-export function checkNote(check: string): string {
+export function checkNote(check: string, reuse = false): string {
+  if (reuse) {
+    return `\nBefore you report done, run "rivet check" and make it pass: it runs the project's check (${check}) and tests.\nA pass on the files you finish with counts as Rivet's own check; if you change anything after it, Rivet checks again when you report done, and a failure sends the task back to you.`;
+  }
   return `\nBefore you report done, run the project's check and make it pass: ${check}\nRivet runs it again when you report done; if it fails, the task comes back to you.`;
 }
 

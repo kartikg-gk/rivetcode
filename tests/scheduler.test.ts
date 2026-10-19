@@ -303,8 +303,54 @@ describe("what a worker may run", () => {
       "Bash(rivet:*)", "Bash(git:*)", "Bash(node --version)", "Bash(node --version:*)", "Bash(git --version)", "Bash(git --version:*)",
     ]);
     expect(seen[0]!.prompt).toMatch(/^Your task: write a\.txt/);
-    expect(seen[0]!.prompt).toMatch(/Before you report done, run the project's check and make it pass: node --version/);
+    expect(seen[0]!.prompt).toMatch(/Before you report done, run "rivet check" and make it pass: it runs the project's check \(node --version\) and tests\./);
     expect(seen[0]!.model).toBe("haiku");
+    // With reuse off it is told to run the check itself, as before.
+    await setCfg("verify.reuse", "off");
+    await settled((await api("POST", "/api/v1/runs", { repo, task: "write a.txt", agent: "claude" })).json.runId);
+    expect(seen[1]!.prompt).toMatch(/Before you report done, run the project's check and make it pass: node --version/);
+  });
+});
+
+describe("rivet check", () => {
+  // Every run of the check adds a line to a file outside the worktree.
+  async function countingCheck(): Promise<string> {
+    const log = join(data, "checks.log");
+    await setCfg("check", `node -e "require('fs').appendFileSync(process.argv[1], 'x\\n')" "${log}"`);
+    return log;
+  }
+  const runs = async (log: string) => (await readFile(log, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+
+  it("counts as Rivet's own check when the worker finishes on the files it checked", async () => {
+    await start();
+    const log = await countingCheck();
+    const runId = await spawn({ files: { "a.txt": "a" }, stayFor: 1500 });
+    await new Promise((r) => setTimeout(r, 500));
+    // The work is still uncommitted here; Rivet commits it at done, and the pass still counts.
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/check`)).json).toEqual({ ok: true, output: "check and tests passed" });
+    expect((await settled(runId)).node.status).toBe("done");
+    expect(await runs(log)).toBe(1);
+  });
+
+  it("is checked again when the project turned reuse off", async () => {
+    await start();
+    const log = await countingCheck();
+    await setCfg("verify.reuse", "off");
+    const runId = await spawn({ files: { "a.txt": "a" }, stayFor: 1500 });
+    await new Promise((r) => setTimeout(r, 500));
+    await api("POST", `/api/v1/sessions/${runId}-agent/check`);
+    expect((await settled(runId)).node.status).toBe("done");
+    expect(await runs(log)).toBe(2);
+  });
+
+  it("reports a failure with its output and does not count it", async () => {
+    await start();
+    await setCfg("check", `node -e "console.log('lint broke'); process.exit(1)"`);
+    const runId = await spawn({ files: { "a.txt": "a" }, stayFor: 1500 });
+    await new Promise((r) => setTimeout(r, 500));
+    const res = (await api("POST", `/api/v1/sessions/${runId}-agent/check`)).json;
+    expect(res.ok).toBe(false);
+    expect(res.output).toMatch(/lint broke/);
   });
 });
 
