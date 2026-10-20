@@ -403,7 +403,7 @@ describe("status view", () => {
   const t0 = Date.parse("2026-10-13T10:00:00Z");
   const iso = (s: number) => new Date(t0 + s * 1000).toISOString();
   const node = (id: string, over: Partial<Node>): Node => ({
-    id, parentId: "root", depth: 1, kind: "leaf", title: id, prompt: "p", files: [], agent: "claude",
+    id, parentId: "root", depth: 1, kind: "leaf", title: id, prompt: "p", files: [], shared: [], agent: "claude",
     branch: "b", worktree: "w", status: "running", attempts: 1, ...over,
   });
   const run = {

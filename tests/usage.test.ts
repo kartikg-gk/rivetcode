@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { usageLine } from "../src/cli/commands.js";
-import { claudeSessionTokens, codexSessionTokens, NO_TOKENS } from "../src/usage.js";
+import { claudeSessionTokens, codexSessionTokens, inputEquivalent, NO_TOKENS } from "../src/usage.js";
 import { makeDataDir, removeRepo } from "./helpers.js";
 
 let dir: string;
@@ -35,5 +35,19 @@ describe("usage", () => {
   it("prints tokens, not a price", () => {
     expect(usageLine({ conversations: 3, tokens: { input: 1, cacheWrite: 2, cacheRead: 3, output: 4 } }))
       .toBe("usage: 10 tokens over 3 agent conversations (input 1, cache write 2, cache read 3, output 4)");
+  });
+});
+
+describe("price-weighted usage", () => {
+  it("counts cache reads at a tenth and output at the provider's output ratio", () => {
+    const t = { input: 100, cacheWrite: 1000, cacheRead: 10_000, output: 200 };
+    expect(inputEquivalent("claude", t)).toBe(100 + 1250 + 1000 + 1000);
+    expect(inputEquivalent("codex", t)).toBe(100 + 1000 + 1000 + 1600);
+    expect(inputEquivalent("fake", t)).toBe(0);
+  });
+
+  it("shows the weighted figure next to the raw total", () => {
+    expect(usageLine({ conversations: 2, tokens: { input: 1, cacheWrite: 2, cacheRead: 3, output: 4 }, inputEquivalent: 25 }))
+      .toBe("usage: 10 tokens over 2 agent conversations, worth 25 input tokens at list-price ratios (input 1, cache write 2, cache read 3, output 4)");
   });
 });

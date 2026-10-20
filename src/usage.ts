@@ -85,9 +85,35 @@ export function codexSessionTokens(sessionId: string, root = codexSessionsDir())
   };
 }
 
-// Tokens used by every agent conversation of a run, read from the agents' own files.
-// Conversations of an agent Rivet can not read (the test fake) count nothing.
-export function runTokens(conversations: { agent: string; id: string }[]): TokenUse {
-  return conversations.reduce((t, c) => addTokens(t,
-    c.agent === "claude" ? claudeSessionTokens(c.id) : c.agent === "codex" ? codexSessionTokens(c.id) : NO_TOKENS), NO_TOKENS);
+// What each kind of token costs next to a plain input token, from the providers' list
+// prices (the ratios hold across their models). Cached reads are cheap, so a raw total
+// mostly made of them overstates what a run cost.
+const PRICE_RATIOS: Record<string, TokenUse> = {
+  claude: { input: 1, cacheWrite: 1.25, cacheRead: 0.1, output: 5 },
+  codex: { input: 1, cacheWrite: 1, cacheRead: 0.1, output: 8 },
+};
+
+// Tokens weighted by price: what the run cost, counted in plain input tokens.
+export function inputEquivalent(agent: string, t: TokenUse): number {
+  const r = PRICE_RATIOS[agent];
+  if (!r) return 0;
+  return Math.round(t.input * r.input + t.cacheWrite * r.cacheWrite + t.cacheRead * r.cacheRead + t.output * r.output);
+}
+
+function conversationTokens(c: { agent: string; id: string }): TokenUse {
+  return c.agent === "claude" ? claudeSessionTokens(c.id) : c.agent === "codex" ? codexSessionTokens(c.id) : NO_TOKENS;
+}
+
+// Tokens used by every agent conversation of a run, read from the agents' own files, and
+// the same weighted by price. Conversations of an agent Rivet can not read (the test fake)
+// count nothing.
+export function runUsage(conversations: { agent: string; id: string }[]): { tokens: TokenUse; inputEquivalent: number } {
+  let tokens = NO_TOKENS;
+  let weighted = 0;
+  for (const c of conversations) {
+    const t = conversationTokens(c);
+    tokens = addTokens(tokens, t);
+    weighted += inputEquivalent(c.agent, t);
+  }
+  return { tokens, inputEquivalent: weighted };
 }

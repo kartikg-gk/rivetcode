@@ -47,7 +47,7 @@ describe("runBench", () => {
 describe("killRuleVerdict", () => {
   const r = (mode: string, over: Partial<ModeResult>): ModeResult => ({
     mode, runId: "r", rootStatus: "done", passed: true, seconds: 100, leaves: 2, attempts: 2, escalations: 0, conflicts: 0,
-    tokens: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }, ...over,
+    tokens: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }, inputEquivalent: 0, ...over,
   });
   it("keeps the tree only when it passes and is no slower, with no more conflicts", () => {
     expect(killRuleVerdict([r("flat", {}), r("tree", { seconds: 105 })])).toMatch(/tree beats flat/);

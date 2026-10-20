@@ -35,6 +35,8 @@ export type ModeResult = {
   // Merges that needed the parent's agent to resolve a conflict, plus unresolved ones.
   conflicts: number;
   tokens: TokenUse;
+  // The same tokens weighted by price, counted in plain input tokens.
+  inputEquivalent: number;
   error?: string;
 };
 
@@ -67,6 +69,7 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
   let error: string | undefined;
   // Every conversation of the run, retries and conflict fixes included.
   let tokens: TokenUse = NO_TOKENS;
+  let inputEquivalent = 0;
   try {
     const project = repo.split(/[\\/]/).pop()!.toLowerCase().trim().replace(/ /g, "-");
     const settings: Record<string, string | undefined> = {
@@ -86,7 +89,7 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
         await daemon.idle();
         const final = await api("GET", `/api/v1/runs/${runId}`);
         run = final.run as Run;
-        tokens = (final.usage as { tokens: TokenUse }).tokens;
+        ({ tokens, inputEquivalent } = final.usage as { tokens: TokenUse; inputEquivalent: number });
         break;
       }
       if (Date.now() > deadline) { error = `timed out after ${spec.timeoutMinutes ?? 30} minutes`; break; }
@@ -110,6 +113,7 @@ async function runMode(spec: BenchSpec, mode: string, plan: PlanNode, workDir: s
     escalations: nodes.filter((n) => n.status === "escalated").length,
     conflicts: nodes.filter((n) => n.kind === "parent" && (n.activity !== undefined || /conflicts in/.test(n.summary ?? ""))).length,
     tokens,
+    inputEquivalent,
     ...(error ? { error } : {}),
   };
 }
@@ -141,5 +145,5 @@ export async function runBench(spec: BenchSpec, o: { workDir: string; agents?: (
 
 export function formatResult(r: ModeResult): string {
   const tokens = r.tokens.input + r.tokens.cacheWrite + r.tokens.cacheRead + r.tokens.output;
-  return `${r.mode.padEnd(8)} ${r.passed ? "pass" : "FAIL"}  ${String(r.seconds).padStart(7)}s  leaves ${r.leaves}  attempts ${r.attempts}  conflicts ${r.conflicts}  escalated ${r.escalations}  tokens ${tokens} (out ${r.tokens.output})${r.error ? `  error: ${r.error}` : ""}`;
+  return `${r.mode.padEnd(8)} ${r.passed ? "pass" : "FAIL"}  ${String(r.seconds).padStart(7)}s  leaves ${r.leaves}  attempts ${r.attempts}  conflicts ${r.conflicts}  escalated ${r.escalations}  tokens ${tokens} (out ${r.tokens.output}, worth ${r.inputEquivalent} input)${r.error ? `  error: ${r.error}` : ""}`;
 }
