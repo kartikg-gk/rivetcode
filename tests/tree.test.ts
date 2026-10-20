@@ -210,7 +210,7 @@ describe("reopen", () => {
 describe("no signal", () => {
   const t0 = Date.parse("2026-10-13T10:00:00Z");
   const leaf = (over: Partial<Node> = {}): Node => ({
-    id: "root.1", parentId: "root", depth: 1, kind: "leaf", title: "a", prompt: "p", files: [], agent: "claude",
+    id: "root.1", parentId: "root", depth: 1, kind: "leaf", title: "a", prompt: "p", files: [], shared: [], agent: "claude",
     branch: "b", worktree: "w", status: "running", attempts: 1, activity: "idle", activityAt: new Date(t0).toISOString(), ...over,
   });
 
@@ -225,5 +225,23 @@ describe("no signal", () => {
     expect(noSignal(leaf(), later, false, true)).toBe(false);
     expect(noSignal(leaf(), later, true, false)).toBe(false);
     expect(noSignal(leaf({ activity: "active" }), later, true, true)).toBe(false);
+  });
+});
+
+describe("shared files", () => {
+  const leaf = (title: string, files: string[]): PlanNode => ({ title, prompt: "p", files });
+
+  it("lets a parent wire files none of its parts claim, and keeps them on the node", () => {
+    const plan: PlanNode = { title: "root", prompt: "r", shared: ["index.js"], children: [leaf("a", ["src/a.js"]), leaf("b", ["src/b.js"])] };
+    expect(validatePlan(plan)).toEqual([]);
+    const nodes = buildTree({ runId: "r1", project: "p", dataDir: "/d", plan, defaultAgent: "fake" });
+    expect(nodes[0]!.shared).toEqual(["index.js"]);
+    expect(nodes[1]!.shared).toEqual([]);
+  });
+
+  it("refuses a shared file on a leaf, or one that a part below claims", () => {
+    expect(validatePlan({ title: "root", prompt: "r", shared: ["index.js"] })).toEqual(["root is a leaf; only a parent wires shared files"]);
+    expect(validatePlan({ title: "root", prompt: "r", shared: ["src"], children: [leaf("a", ["src/a.js"]), leaf("b", ["b.js"])] }))
+      .toEqual(["root.1 claims src/a.js, which root wires as a shared file"]);
   });
 });

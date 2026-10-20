@@ -478,3 +478,28 @@ describe("messages to a headless agent", () => {
     expect(resumed).not.toMatch(/Note from Rivet/);
   });
 });
+
+describe("shared files", () => {
+  // The root's fake agent is its wiring script; leaves write their own files only.
+  const plan = (wiring: object): PlanNode => ({
+    title: "root", prompt: JSON.stringify(wiring), agent: "fake", shared: ["index.txt"],
+    children: [leaf("a", { files: { "a.txt": "a" }, commit: "a" }), leaf("b", { files: { "b.txt": "b" }, commit: "b" })],
+  });
+
+  it("wires the shared files once every part is merged, without a conflict on the way", async () => {
+    await start();
+    const runId = await runPlan(plan({ files: { "index.txt": "a\nb\n" }, commit: "wire" }));
+    const run = await settled(runId);
+    expect(statuses(run)).toEqual({ root: "done", "root.1": "done", "root.2": "done" });
+    expect((await git(["show", "HEAD:index.txt"], run.nodes[0]!.worktree)).trim()).toBe("a\nb");
+    expect((await git(["log", "--format=%s", "-1"], run.nodes[0]!.worktree)).trim()).toBe("wire");
+  });
+
+  it("undoes wiring that changes anything else and hands the parent to the user", async () => {
+    await start();
+    const runId = await runPlan(plan({ files: { "index.txt": "x", "a.txt": "changed" }, commit: "wire too much" }));
+    const run = await settled(runId);
+    expect(run.nodes[0]).toMatchObject({ status: "escalated", summary: "wiring changed files that are not shared: a.txt" });
+    expect((await git(["show", "HEAD:a.txt"], run.nodes[0]!.worktree)).trim()).toBe("a");
+  });
+});
