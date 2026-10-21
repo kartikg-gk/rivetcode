@@ -25,7 +25,7 @@ async function unmergedFiles(worktree: string): Promise<string[]> {
 
 export type MergeResult = { ok: true } | { ok: false; conflicts: string[] };
 
-// Always a merge commit, so each child's work stays visible in the parent's history.
+// Always a merge commit, so what was merged stays visible in the history.
 export async function mergeBranch(worktree: string, branch: string, message: string): Promise<MergeResult> {
   try {
     await git(["merge", "--no-ff", "--no-edit", "-m", message, branch], worktree);
@@ -51,7 +51,7 @@ const MARKER = /^(<{7}|>{7})( |$)|^={7}$/m;
 export type Resolution = { ok: true } | { ok: false; reason: string };
 
 // After an agent resolved a conflict: every conflicted file is clean, nothing else was
-// touched (a parent only integrates), and the merge is committed.
+// touched (resolving is not feature work), and the merge is committed.
 export async function finishResolution(worktree: string, conflicted: string[]): Promise<Resolution> {
   const allowed = new Set(conflicted);
   const status = await git(["status", "--porcelain", "--untracked-files=all"], worktree);

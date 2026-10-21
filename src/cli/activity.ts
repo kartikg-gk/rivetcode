@@ -1,4 +1,4 @@
-import type { ActivityState } from "../tree.js";
+import type { ActivityState } from "../model.js";
 
 type Payload = Record<string, unknown>;
 

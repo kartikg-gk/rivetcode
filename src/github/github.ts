@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import type { PrStatus } from "../tree.js";
+import type { PrStatus } from "../model.js";
 
 export type CiState = "unknown" | "pending" | "passing" | "failing";
 export type ReviewDecision = "none" | "approved" | "changes_requested" | "review_required";
