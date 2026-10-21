@@ -30,9 +30,9 @@ afterEach(async () => {
   await removeRepo(data);
 });
 
-async function start(claude?: Agent): Promise<void> {
+async function start(claude?: Agent, more: { radarMs?: number } = {}): Promise<void> {
   daemon = await startDaemon({
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
+    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, ...more,
     agents: (name) => (name === "claude" && claude ? claude : getAgent("fake")),
     onError: (e) => errors.push(e),
   });
@@ -145,6 +145,39 @@ describe("an orchestrator", () => {
     // A worker spawned from another worker's session reports to nobody.
     const loner = await spawn({ commit: "none" }, { from: `${worker}-agent` });
     expect((await settled(loner)).orchestrator).toBeUndefined();
+  });
+
+  it("is told once when two of its workers' work would conflict", async () => {
+    await start(undefined, { radarMs: 100 });
+    const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const from = `${orchestrator}-agent`;
+    const one = await spawn({ files: { "shared.txt": "one" }, commit: "one", stayFor: 1500 }, { name: "first", from });
+    const two = await spawn({ files: { "shared.txt": "two" }, commit: "two", stayFor: 1500 }, { name: "second", from });
+    await settled(one);
+    await settled(two);
+    await new Promise((r) => setTimeout(r, 300));
+    const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
+    const warnings = inbox.split(/\r?\n/).filter((l) => l.includes("their work will conflict"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`Workers ${one} (first), working and ${two} (second), working both change shared.txt`);
+    await api("POST", `/api/v1/runs/${orchestrator}/stop`);
+  });
+
+  it("is told when a worker finishes on work that clashes with a finished one, without waiting for the timer", async () => {
+    await start(undefined, { radarMs: 3_600_000 });
+    const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const from = `${orchestrator}-agent`;
+    const one = await spawn({ files: { "shared.txt": "one" }, commit: "one" }, { name: "first", from });
+    await settled(one);
+    const two = await spawn({ files: { "shared.txt": "two" }, commit: "two" }, { name: "second", from });
+    await settled(two);
+    await new Promise((r) => setTimeout(r, 300));
+    const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
+    const warnings = inbox.split(/\r?\n/).filter((l) => l.includes("their work will conflict"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`Workers ${one} (first), done and ${two} (second), done both change shared.txt`);
+    expect(warnings[0]).toContain("Once one is merged, Rivet brings the other up to date");
+    await api("POST", `/api/v1/runs/${orchestrator}/stop`);
   });
 
   it("refuses an unknown role", async () => {
@@ -331,6 +364,35 @@ describe("an orchestrator after a restart", () => {
     expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(true);
     expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
     expect((await getRun(orch)).node).toMatchObject({ status: "done", summary: "stopped by the user" });
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("an orchestrator's conversation", () => {
+  // Starts by staying alive; a resume writes the prompt it was given, then stays alive.
+  function resumable(): Agent {
+    const fake = getAgent("fake");
+    const script = fileURLToPath(new URL("../src/agents/fake-agent.mjs", import.meta.url));
+    return {
+      ...fake,
+      launchCommand: async () => [process.execPath, script, "--", JSON.stringify({ stayFor: 60_000 })],
+      restoreCommand: async (cfg) => [process.execPath, script, "--", JSON.stringify({ files: { "resumed.txt": cfg.prompt ?? "" }, stayFor: 60_000 })],
+    };
+  }
+
+  it("is continued by resume after a restart, told to check status before starting anything", async () => {
+    await start(resumable());
+    const orch = (await api("POST", "/api/v1/runs", { repo, task: "split the work", agent: "claude", role: "orchestrator" })).json.runId as string;
+    await new Promise((r) => setTimeout(r, 300));
+    await daemon!.stop();
+    daemon = undefined;
+    await start(resumable());
+    expect((await api("POST", `/api/v1/runs/${orch}/resume`)).status).toBe(202);
+    const file = join((await getRun(orch)).node.worktree, "resumed.txt");
+    const end = Date.now() + 10_000;
+    while (!existsSync(file) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    expect(await readFile(file, "utf8")).toMatch(/^Rivet was restarted\. Before starting anything, run rivet status/);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
     expect(errors).toEqual([]);
   });
 });

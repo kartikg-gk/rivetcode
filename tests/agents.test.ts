@@ -47,14 +47,20 @@ describe("claude adapter", () => {
     expect((await custom.launchCommand({ sessionId: "r1-root", workspace: ws }))[0]).toBe("C:\\tools\\claude.exe");
   });
 
-  it("can resume from the derived session id", async () => {
-    expect(await claude.restoreCommand({ sessionId: "r1-root.1", workspace: ws })).toEqual([
-      "claude", "--resume", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77",
-    ]);
+  it("resumes a conversation Claude saved, and has none to resume otherwise", async () => {
+    const projects = join(ws, "projects");
+    const agent = claudeAgent("claude", join(ws, ".claude.json"), projects);
+    const derived = "cce53ecb-99f4-55ff-a3cb-693ccbf24d77";
+    expect(await agent.restoreCommand({ sessionId: "r1-root.1", workspace: ws })).toBeNull();
+    await mkdir(join(projects, "some-folder"), { recursive: true });
+    await writeFile(join(projects, "some-folder", `${derived}.jsonl`), "{}\n");
+    expect(await agent.restoreCommand({ sessionId: "r1-root.1", workspace: ws })).toEqual(["claude", "--resume", derived]);
     // In a terminal it must not stop at the browser question either.
-    expect(await claude.restoreCommand({ sessionId: "r1-root.1", workspace: ws, headless: false })).toEqual([
-      "claude", "--resume", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77", "--no-chrome",
+    expect(await agent.restoreCommand({ sessionId: "r1-root.1", workspace: ws, headless: false })).toEqual([
+      "claude", "--resume", derived, "--no-chrome",
     ]);
+    // An id the hooks captured wins over the derived one, if Claude saved it.
+    expect(await agent.restoreCommand({ sessionId: "r1-root.1", workspace: ws, capturedId: "11111111-2222-4333-8444-555555555555" })).toBeNull();
   });
 
   it("installs the ten Claude Code hooks into .claude/settings.local.json", async () => {

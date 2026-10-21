@@ -4,6 +4,7 @@ import { createWriteStream, existsSync, mkdirSync, statSync, type WriteStream } 
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { signalTree } from "../proc.js";
+import { inheritedEnv } from "./env.js";
 
 export class RuntimeError extends Error {
   constructor(message: string) {
@@ -189,7 +190,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
   async function spawnPiped(opts: StartOptions, p: Proc, exited: (code: number | null) => void): Promise<Handle> {
     const child = spawn(opts.argv[0]!, opts.argv.slice(1), {
       cwd: opts.workspace,
-      env: mergeEnv(process.env, opts.env),
+      env: mergeEnv(inheritedEnv(), opts.env),
       stdio: [opts.stdin ?? "pipe", "pipe", "pipe"],
       windowsHide: true,
       // Own process group on POSIX, so stop() reaches the tools the agent started too.
@@ -221,7 +222,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
       cols: opts.terminal!.cols,
       rows: opts.terminal!.rows,
       cwd: opts.workspace,
-      env: mergeEnv(process.env, opts.env),
+      env: mergeEnv(inheritedEnv(), opts.env),
     });
     term.onData((data) => { if (p.alive) record(p, data); });
     term.onExit(({ exitCode }) => exited(exitCode));

@@ -12,6 +12,20 @@ function currentPath(): string {
   return key ? process.env[key] ?? "" : "";
 }
 
+// Set by a Claude Code session for the commands it runs. An agent that inherits them
+// (Rivet started from inside Claude Code) counts itself as that session's child and keeps
+// no transcript, so its conversation could never be resumed.
+const PARENT_SESSION_VARS = ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID"];
+
+// The daemon's own environment, minus what describes the session that started Rivet.
+export function inheritedEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const key of Object.keys(out)) {
+    if (PARENT_SESSION_VARS.includes(key.toUpperCase())) delete out[key];
+  }
+  return out;
+}
+
 // A session is one node of one run. Run ids never contain "-", so the first "-" splits them.
 export function sessionIdOf(runId: string, nodeId: string): string {
   assertId("run", runId);
