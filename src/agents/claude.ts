@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Agent } from "./agent.js";
-import { claudeResumeCommand, claudeSessionId, claudeStartCommand } from "./command.js";
+import { claudeResumeCommand, claudeSessionId, claudeStartCommand, resumeId } from "./command.js";
 import { hooksManager, type HookSpec } from "./hooks.js";
 import { claudeConfigPath, ensureClaudeTrust } from "./trust.js";
 
@@ -84,7 +84,14 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
         ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },
-    restoreCommand: ({ headless, ...cfg }) => claudeResumeCommand({ binary, ...cfg, ...(headless ? { print: true } : {}) }),
+    // Only a conversation Claude actually saved can be resumed; otherwise there is none.
+    restoreCommand: async ({ headless, ...cfg }) => {
+      const id = resumeId(cfg.sessionId, cfg.capturedId);
+      if (id === null || !conversationExists(projectsDir, id)) return null;
+      return claudeResumeCommand({
+        binary, ...cfg, ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+      });
+    },
     installHooks: (workspace) => claudeHooks.install(workspace),
     uninstallHooks: (workspace) => claudeHooks.uninstall(workspace),
     hooksInstalled: (workspace) => claudeHooks.installed(workspace),

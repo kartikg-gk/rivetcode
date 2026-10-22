@@ -4,6 +4,7 @@ import { createWriteStream, existsSync, mkdirSync, statSync, type WriteStream } 
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { signalTree } from "../proc.js";
+import { inheritedEnv } from "./env.js";
 
 export class RuntimeError extends Error {
   constructor(message: string) {
@@ -113,6 +114,12 @@ type Proc = {
 
 // Runs agent CLIs as child processes (no shell), piped or in a pseudo-terminal, one
 // live process per session. Output stays readable after exit so a crash can be diagnosed.
+// Typing into a terminal: pieces of text, a gap between them, and a pause before Enter.
+const TYPE_CHUNK = 512;
+const TYPE_CHUNK_GAP_MS = 15;
+const TYPE_SUBMIT_DELAY_MS = 300;
+const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 export function createRuntime(o: { logDir: string; keepLines?: number; stopGraceMs?: number }): Runtime {
   const keep = o.keepLines ?? 2000;
   const grace = o.stopGraceMs ?? 5000;
@@ -183,7 +190,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
   async function spawnPiped(opts: StartOptions, p: Proc, exited: (code: number | null) => void): Promise<Handle> {
     const child = spawn(opts.argv[0]!, opts.argv.slice(1), {
       cwd: opts.workspace,
-      env: mergeEnv(process.env, opts.env),
+      env: mergeEnv(inheritedEnv(), opts.env),
       stdio: [opts.stdin ?? "pipe", "pipe", "pipe"],
       windowsHide: true,
       // Own process group on POSIX, so stop() reaches the tools the agent started too.
@@ -215,7 +222,7 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
       cols: opts.terminal!.cols,
       rows: opts.terminal!.rows,
       cwd: opts.workspace,
-      env: mergeEnv(process.env, opts.env),
+      env: mergeEnv(inheritedEnv(), opts.env),
     });
     term.onData((data) => { if (p.alive) record(p, data); });
     term.onExit(({ exitCode }) => exited(exitCode));
@@ -260,9 +267,22 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
     async write(sessionId, text) {
       const p = live(sessionId);
       if (!p.handle.takesInput) throw new RuntimeError(`session ${sessionId} does not take input`);
-      // A terminal app submits on carriage return; a piped one reads lines.
-      try { await p.handle.send(text + (p.handle.terminal ? "\r" : "\n")); }
-      catch (e) { throw new RuntimeError(`write to ${sessionId}: ${(e as Error).message}`); }
+      try {
+        if (!p.handle.terminal) {
+          // A piped agent reads lines.
+          await p.handle.send(text + "\n");
+          return;
+        }
+        // A terminal app takes fast input as a paste, and an Enter inside a paste does not
+        // submit it. So the text goes in pieces, settles, and Enter comes on its own.
+        const chars = [...text];
+        for (let i = 0; i < chars.length; i += TYPE_CHUNK) {
+          await p.handle.send(chars.slice(i, i + TYPE_CHUNK).join(""));
+          if (i + TYPE_CHUNK < chars.length) await pause(TYPE_CHUNK_GAP_MS);
+        }
+        if (chars.length > 0) await pause(TYPE_SUBMIT_DELAY_MS);
+        await p.handle.send("\r");
+      } catch (e) { throw new RuntimeError(`write to ${sessionId}: ${(e as Error).message}`); }
     },
     input(sessionId, data) {
       const p = live(sessionId);

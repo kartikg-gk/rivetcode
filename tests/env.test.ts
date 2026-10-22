@@ -30,3 +30,11 @@ describe("agent PATH", () => {
     expect(existsSync(`${rivetBinDir()}/rivet`)).toBe(true);
   });
 });
+
+describe("inherited environment", () => {
+  it("drops the markers of a Claude Code session that started Rivet, keeping the rest", async () => {
+    const { inheritedEnv } = await import("../src/runtime/env.js");
+    const env = inheritedEnv({ CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_SESSION_ID: "abc", CLAUDE_CONFIG_DIR: "/c", HOME: "/h" });
+    expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/c", HOME: "/h" });
+  });
+});

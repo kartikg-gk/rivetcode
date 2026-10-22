@@ -2,9 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude, findCodex } from "../agents/locate.js";
-import { claudePlanner } from "../planner/claude-runner.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
-import { extractReplan, replanPrompt } from "../planner/planner.js";
 import { dataDir, assertId } from "../paths.js";
 import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
@@ -15,12 +13,24 @@ import { cleanRun, prepareRun, RunInputError, SetupError } from "../scheduler/ru
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { runUsage } from "../usage.js";
-import { ACTIVITY_STATES, noSignal, type ActivityState, type Node } from "../tree.js";
+import { ACTIVITY_STATES, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
-// Per-project settings: the check after every merge, the full test at the root, the default agent.
-const CONFIG_KEYS = ["check", "test", "worker.agent", "worker.permission", "worker.model", "worker.allowedTools", "worker.mode", "planner.model", "pr", "github.repo", "copy", "setup"];
+// Per-project settings: the check and the tests a worker's work must pass, the default agent.
+const CONFIG_KEYS = [
+  "check",
+  "test",
+  "worker.agent",
+  "worker.permission",
+  "worker.model",
+  "worker.allowedTools",
+  "worker.mode",
+  "pr",
+  "github.repo",
+  "copy",
+  "setup",
+];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -34,12 +44,12 @@ export type DaemonOptions = {
   agents?: (name: Node["agent"]) => Agent;
   stopGraceMs?: number;
   checkTimeoutMs?: number;
-  // Rewrites a twice-failed leaf's instructions; defaults to a read-only claude planner.
-  replan?(run: Run, node: Node, why: string): Promise<string | null>;
   // GitHub access for a run (tests pass a client for a mock API).
   github?(run: Run): Promise<GitHub>;
   // How often open pull requests are checked.
   prWatchMs?: number;
+  // How often workers' branches are checked for clashes to tell their orchestrators about.
+  radarMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -165,16 +175,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return result;
   }
 
-  const replan = opts.replan ?? (async (run: Run, node: Node, why: string): Promise<string | null> => {
-    // A scripted test agent has nothing to re-plan.
-    if (node.agent === "fake") return null;
-    let binary: string;
-    try { binary = claudeBinary ??= findClaude(); } catch { return null; }
-    const config = await write(() => store.getConfig(run.project));
-    const model = config["planner.model"] ?? config["worker.model"];
-    const planner = claudePlanner({ binary, repo: node.worktree, ...(model ? { model } : {}) });
-    return extractReplan(await planner(replanPrompt(run.task, node, why), { resume: false }));
-  });
   const github = opts.github ?? (async (run: Run): Promise<GitHub> => {
     const remote = (await git(["remote", "get-url", "origin"], run.repo).catch(() => "")).trim();
     const config = await write(() => store.getConfig(run.project));
@@ -183,7 +183,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return githubClient({ repo, token: await githubToken(process.env, remote) });
   });
   const scheduler = createScheduler({
-    data, runFile, store, write, runtime, agents, launches, replan, github,
+    data, runFile, store, write, runtime, agents, launches, github,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
   });
@@ -197,7 +197,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     });
   });
 
-  // Starts a leaf's agent by hand with the given prompt; the tree status is not touched.
+  // Starts a session's agent by hand with the given prompt; its status is not touched.
   async function startSession(runId: string, nodeId: string, prompt?: string): Promise<string> {
     let run;
     try { run = await write(() => store.loadRun(runId)); }
@@ -205,10 +205,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (error instanceof RunStoreError) throw new HttpError(404, "unknown session");
       throw error;
     }
-    const node = run.nodes.find((n) => n.id === nodeId);
-    if (!node) throw new HttpError(404, "unknown session");
-    if (node.kind !== "leaf") throw new HttpError(409, "only leaves run agents");
-    return scheduler.launch(run, node, prompt);
+    if (run.node.id !== nodeId) throw new HttpError(404, "unknown session");
+    return scheduler.launch(run, prompt);
   }
 
   let stopping: Promise<void> | undefined;
@@ -249,18 +247,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       res.end(JSON.stringify({ status: "shutting_down", pid: process.pid }), () => { void stop(); });
       return;
     }
-    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output|attach|input|resize|sync)$/.exec(path);
+    const control = /^\/api\/v1\/sessions\/([^/]+)\/(start|stop|output|attach|input|resize)$/.exec(path);
     if (control) {
       const [, id, action] = control;
       const { runId, nodeId } = session(id);
       const sessionId = sessionIdOf(runId, nodeId);
-      if (action === "sync") {
-        if (req.method !== "POST") throw new HttpError(405, "method not allowed");
-        const payload = await body(req);
-        try { await write(() => store.loadRun(runId)); } catch { throw new HttpError(404, "unknown session"); }
-        reply(res, 200, await scheduler.sync(runId, nodeId, { byAgent: payload.byAgent === true }));
-        return;
-      }
       if (action === "attach") {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         // Streams the terminal: recent output first, then everything new, until exit.
@@ -356,7 +347,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const message = optionalString(payload.message, "message");
       const id = await write(() => store.createReport(runId, nodeId, payload.kind as ReportKind, message));
       if (id === null) throw new HttpError(404, "unknown session");
-      void scheduler.onReport(runId, nodeId, payload.kind as string).catch((e) => opts.onError?.(e));
+      void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
       return;
     }
@@ -372,7 +363,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const target = sessionIdOf(runId, nodeId);
       // Typed in now, handed over when a headless agent ends its turn, or at the next launch.
       const delivery = runtime.takesInput(target) ? "now" : runtime.isAlive(target) ? "turn-end" : "next-launch";
-      if (delivery === "now") await scheduler.deliver(runId, nodeId);
+      if (delivery === "now") await scheduler.deliver(runId);
       reply(res, 202, { id, delivery });
       return;
     }
@@ -380,7 +371,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method === "GET") {
         const runs = await write(() => store.listRuns().map((id) => {
           const r = store.loadRun(id);
-          return { id: r.id, project: r.project, task: r.task, createdAt: r.createdAt, status: r.nodes[0]!.status };
+          return {
+            id: r.id, project: r.project, task: r.task, createdAt: r.createdAt, status: r.node.status, role: r.role, name: r.name,
+            agent: r.node.agent, live: runtime.isAlive(sessionIdOf(r.id, r.node.id)), ...(r.orchestrator ? { orchestrator: r.orchestrator } : {}),
+          };
         }));
         reply(res, 200, { runs });
         return;
@@ -390,13 +384,31 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (typeof payload.repo !== "string" || typeof payload.task !== "string") {
         throw new HttpError(400, "repo and task must be strings");
       }
-      if (!payload.plan || typeof payload.plan !== "object") throw new HttpError(400, "plan must be an object");
-      const base = optionalString(payload.base, "base");
       const agent = optionalString(payload.agent, "agent");
+      const name = optionalString(payload.name, "name");
+      const model = optionalString(payload.model, "model");
+      const role = (optionalString(payload.role, "role") ?? "worker") as Role;
+      if (!ROLES.includes(role)) throw new HttpError(400, `role must be one of ${ROLES.join(", ")}`);
+      // A worker started from inside an orchestrator's session reports back to it.
+      const from = optionalString(payload.from, "from");
+      let orchestrator: string | undefined;
+      let repo = payload.repo;
+      let base = optionalString(payload.base, "base");
+      if (from !== undefined) {
+        const { runId: fromRun } = session(from);
+        const sender = await write(() => store.loadRun(fromRun)).catch(() => null);
+        if (sender?.role === "orchestrator") {
+          orchestrator = sessionIdOf(sender.id, sender.node.id);
+          // Its agent runs in its own worktree; a worker belongs to the project, from its base.
+          repo = sender.repo;
+          base ??= sender.base;
+        }
+      }
       let run;
       try {
         run = await prepareRun({
-          data, repo: payload.repo, task: payload.task, plan: payload.plan as never,
+          data, repo, task: payload.task as string, role,
+          ...(name !== undefined ? { name } : {}), ...(model !== undefined ? { model } : {}), ...(orchestrator ? { orchestrator } : {}),
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
           defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
           copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
@@ -413,7 +425,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 201, { runId: run.id });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|skip|radar|merge-policy))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -423,20 +435,15 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       } catch { throw new HttpError(404, "unknown run"); }
       if (action === undefined) {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
-        const live = Object.fromEntries(run.nodes.map((n) => [n.id, runtime.isAlive(sessionIdOf(run.id, n.id))]));
+        const live = runtime.isAlive(sessionIdOf(run.id, run.node.id));
         const pr = await write(() => store.getPr(run.id));
         const terminateOnPrMerge = await write(() => store.getTerminateOnPrMerge(run.id));
         const at = Date.now();
-        const silent = run.nodes.filter((n) => noSignal(n, at, live[n.id]!, getAgent(n.agent).signals)).map((n) => n.id);
+        const silent = noSignal(run.node, at, live, getAgent(run.node.agent).signals);
         // Every conversation its agents had (retries and conflict fixes too), from their own files.
         const conversations = await write(() => store.conversations(run.id));
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, now: new Date(at).toISOString() });
-        return;
-      }
-      if (action === "radar") {
-        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
-        reply(res, 200, { conflicts: await radar(run) });
         return;
       }
       if (action === "merge-policy") {
@@ -448,10 +455,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
-      if (action === "skip") {
-        const payload = await body(req);
-        if (typeof payload.node !== "string") throw new HttpError(400, "node must be a string");
-        await scheduler.skip(run.id, payload.node);
+      if (action === "stop") {
+        await scheduler.stopRun(run.id);
         reply(res, 204);
         return;
       }
@@ -464,26 +469,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 202, { runId: run.id });
         return;
       }
-      for (const n of run.nodes) await scheduler.stopSession(sessionIdOf(run.id, n.id));
+      await scheduler.stopSession(sessionIdOf(run.id, run.node.id));
       reply(res, 200, await cleanRun(data, run));
       return;
     }
-    const active = /^\/api\/v1\/projects\/([^/]+)\/active-files$/.exec(path);
-    if (active) {
+    const projectRadar = /^\/api\/v1\/projects\/([^/]+)\/radar$/.exec(path);
+    if (projectRadar) {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
-      const project = decodeURIComponent(active[1]!);
+      const project = decodeURIComponent(projectRadar[1]!);
       const runs = await write(() => store.listRuns(project).map((id) => store.loadRun(id)));
-      const files: { file: string; runId: string; nodeId: string }[] = [];
-      for (const r of runs) {
-        const root = r.nodes[0]!;
-        if (["done", "failed", "skipped"].includes(root.status) || r.nodes.every((n) => n.status === "pending")) continue;
-        for (const n of r.nodes.filter((x) => x.kind === "leaf" && x.status !== "skipped")) {
-          const changed = await git(["diff", "--name-only", `${r.base}...${n.branch}`], r.repo)
-            .then((out) => out.split(/\r?\n/).filter(Boolean), () => [] as string[]);
-          for (const file of new Set([...n.files, ...changed])) files.push({ file, runId: r.id, nodeId: n.id });
-        }
-      }
-      reply(res, 200, { files });
+      reply(res, 200, { conflicts: await radar(runs) });
       return;
     }
     const config = /^\/api\/v1\/projects\/([^/]+)\/config$/.exec(path);
@@ -518,6 +513,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
+    scheduler.watchRadar(opts.radarMs ?? 60_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {
       void scheduler.recover(id).catch((e) => opts.onError?.(e));

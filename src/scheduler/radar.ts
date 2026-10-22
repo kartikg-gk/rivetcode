@@ -18,22 +18,27 @@ export function wouldConflict(repo: string, a: string, b: string): Promise<strin
   });
 }
 
-// Live conflict check: each running leaf against its running siblings and against what
-// its parent already merged. Finds clashes while agents still work, not at merge time.
-export async function radar(run: Run): Promise<RadarHit[]> {
+// Work that has yet to land: a worker still working, or done with its work not merged.
+function unlanded(r: Run): boolean {
+  if (r.role !== "worker") return false;
+  return r.node.status === "running" || (r.node.status === "done" && r.node.prStatus !== "merged" && r.node.prStatus !== "terminated");
+}
+
+// Live conflict check between workers of one project: which pairs would clash when both
+// land, found while one of them still works rather than when the second PR merges. With
+// focus, only that worker's pairs, whether or not the other still works (checked the
+// moment it finishes, since workers often commit only at the end).
+export async function radar(runs: Run[], focus?: string): Promise<RadarHit[]> {
   const hits: RadarHit[] = [];
-  const working = run.nodes.filter((n) => n.kind === "leaf" && n.status === "running");
+  const working = runs.filter(unlanded);
   for (let i = 0; i < working.length; i++) {
-    const leaf = working[i]!;
-    const parent = run.nodes.find((n) => n.id === leaf.parentId);
-    if (parent) {
-      const files = await wouldConflict(run.repo, parent.branch, leaf.branch);
-      if (files?.length) hits.push({ a: leaf.id, b: parent.id, files });
-    }
     for (const other of working.slice(i + 1)) {
-      if (other.parentId !== leaf.parentId) continue;
-      const files = await wouldConflict(run.repo, leaf.branch, other.branch);
-      if (files?.length) hits.push({ a: leaf.id, b: other.id, files });
+      const a = working[i]!;
+      if (a.repo !== other.repo) continue;
+      if (focus !== undefined && a.id !== focus && other.id !== focus) continue;
+      if (focus === undefined && a.node.status !== "running" && other.node.status !== "running") continue;
+      const files = await wouldConflict(a.repo, a.node.branch, other.node.branch);
+      if (files?.length) hits.push({ a: a.id, b: other.id, files });
     }
   }
   return hits;

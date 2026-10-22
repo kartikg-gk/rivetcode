@@ -4,9 +4,8 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { readRunFile, writeRunFile } from "../src/runfile.js";
-import { buildTree } from "../src/tree.js";
 import { openStore, type Run } from "../src/store.js";
-import { makeDataDir, removeRepo } from "./helpers.js";
+import { makeDataDir, removeRepo, sessionRun } from "./helpers.js";
 
 let data: string;
 let runFile: string;
@@ -24,15 +23,7 @@ afterEach(async () => {
 });
 
 function run(): Run {
-  const id = "r1";
-  return {
-    id, project: "proj", repo: join(data, "repo"), base: "main", task: "task",
-    createdAt: new Date().toISOString(),
-    nodes: buildTree({
-      runId: id, project: "proj", dataDir: data, defaultAgent: "claude",
-      plan: { title: "root", prompt: "root", children: [{ title: "leaf", prompt: "leaf" }] },
-    }),
-  };
+  return { ...sessionRun(data, { id: "r1", project: "proj", task: "task" }), repo: join(data, "repo") };
 }
 
 function seed(): void {
@@ -117,13 +108,13 @@ describe("daemon ownership and lifecycle", () => {
   it("upgrades a version 1 database on startup", async () => {
     seed();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     await start();
     expect(rows("SELECT version FROM schema_migrations ORDER BY version")).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
     ]);
-    expect(rows("SELECT id FROM nodes WHERE run_id = 'r1'")).toHaveLength(2);
+    expect(rows("SELECT id FROM nodes WHERE run_id = 'r1'")).toHaveLength(1);
   });
 
   it("keeps a successor's run file on stop", async () => {
@@ -160,7 +151,7 @@ describe("daemon routes", () => {
   });
 
   it("saves activity and an agent session id", async () => {
-    const response = await post("/api/v1/sessions/r1-root.1/activity", {
+    const response = await post("/api/v1/sessions/r1-agent/activity", {
       state: "blocked", agentSessionId: "agent-42",
     });
     expect(response.status).toBe(204);
@@ -168,54 +159,54 @@ describe("daemon routes", () => {
     daemon = undefined;
     const store = openStore(data);
     try {
-      expect(store.loadRun("r1").nodes[1]).toMatchObject({ activity: "blocked", agentSessionId: "agent-42" });
+      expect(store.loadRun("r1").node).toMatchObject({ activity: "blocked", agentSessionId: "agent-42" });
     } finally { store.close(); }
   });
 
   it("rejects invalid activity, session ids, and unknown sessions", async () => {
-    expect((await post("/api/v1/sessions/r1-root.1/activity", { state: "asleep" })).status).toBe(400);
+    expect((await post("/api/v1/sessions/r1-agent/activity", { state: "asleep" })).status).toBe(400);
     expect((await post("/api/v1/sessions/bad/activity", { state: "active" })).status).toBe(400);
     expect((await post("/api/v1/sessions/r1-missing/activity", { state: "active" })).status).toBe(404);
   });
 
-  it("stores reports without changing tree status", async () => {
-    const response = await post("/api/v1/reports", { sessionId: "r1-root.1", kind: "done", message: "ready" });
+  it("stores reports without changing the session status", async () => {
+    const response = await post("/api/v1/reports", { sessionId: "r1-agent", kind: "done", message: "ready" });
     expect(response.status).toBe(201);
     expect(await response.json()).toHaveProperty("id");
     await daemon!.stop();
     daemon = undefined;
     expect(rows("SELECT run_id, node_id, kind, message FROM reports")).toEqual([
-      { run_id: "r1", node_id: "root.1", kind: "done", message: "ready" },
+      { run_id: "r1", node_id: "agent", kind: "done", message: "ready" },
     ]);
-    expect(rows("SELECT status FROM nodes WHERE id = 'root.1'")[0]).toEqual({ status: "pending" });
+    expect(rows("SELECT status FROM nodes WHERE id = 'agent'")[0]).toEqual({ status: "pending" });
   });
 
   it("rejects invalid reports and unknown sessions", async () => {
-    expect((await post("/api/v1/reports", { sessionId: "r1-root.1", kind: "other" })).status).toBe(400);
+    expect((await post("/api/v1/reports", { sessionId: "r1-agent", kind: "other" })).status).toBe(400);
     expect((await post("/api/v1/reports", { sessionId: "r1-missing", kind: "done" })).status).toBe(404);
   });
 
   it("queues messages for later delivery", async () => {
-    const response = await post("/api/v1/sessions/r1-root.1/send", { message: "hello", from: "root" });
+    const response = await post("/api/v1/sessions/r1-agent/send", { message: "hello", from: "root" });
     expect(response.status).toBe(202);
     expect(await response.json()).toHaveProperty("id");
     await daemon!.stop();
     daemon = undefined;
     expect(rows("SELECT run_id, node_id, from_session, message, delivered_at FROM outbox")).toEqual([
-      { run_id: "r1", node_id: "root.1", from_session: "root", message: "hello", delivered_at: null },
+      { run_id: "r1", node_id: "agent", from_session: "root", message: "hello", delivered_at: null },
     ]);
   });
 
   it("rejects invalid messages and unknown sessions", async () => {
-    expect((await post("/api/v1/sessions/r1-root.1/send", {})).status).toBe(400);
+    expect((await post("/api/v1/sessions/r1-agent/send", {})).status).toBe(400);
     expect((await post("/api/v1/sessions/r1-missing/send", { message: "hi" })).status).toBe(404);
   });
 
   it("rejects invalid JSON and bodies above 1 MiB", async () => {
     for (const path of [
       "/api/v1/reports",
-      "/api/v1/sessions/r1-root.1/activity",
-      "/api/v1/sessions/r1-root.1/send",
+      "/api/v1/sessions/r1-agent/activity",
+      "/api/v1/sessions/r1-agent/send",
     ]) {
       expect((await post(path, "{broken")).status).toBe(400);
       expect((await post(path, { message: "x".repeat(1024 * 1024) })).status).toBe(413);

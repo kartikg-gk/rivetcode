@@ -8,7 +8,6 @@ import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import { githubClient } from "../src/github/github.js";
 import type { Run } from "../src/store.js";
-import type { PlanNode } from "../src/tree.js";
 import { waitForTrash } from "../src/worktree.js";
 import { mockGitHub, type MockGitHub } from "./github-mock.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
@@ -37,9 +36,12 @@ afterEach(async () => {
   for (const d of [repo, origin, data]) await removeRepo(d);
 });
 
+let errors: unknown[] = [];
+
 async function start(config: Record<string, string> = {}): Promise<void> {
+  errors = [];
   daemon = await startDaemon({
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150,
+    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150, onError: (e) => errors.push(e),
     agents: () => getAgent("fake"),
     github: async () => githubClient({ repo: "o/r", token: "t0ken", api: gh.api }),
   });
@@ -55,12 +57,6 @@ async function api(method: string, path: string, body?: unknown): Promise<{ stat
   return { status: res.status, json: text ? JSON.parse(text) : null };
 }
 
-const leaf = (title: string, spec: object, files?: string[]): PlanNode => ({ title, prompt: JSON.stringify(spec), agent: "fake", ...(files ? { files } : {}) });
-const twoParts = (): PlanNode => ({ title: "root", prompt: "r", children: [
-  leaf("part a", { files: { "a.txt": "a" }, commit: "a" }, ["a.txt"]),
-  leaf("part b", { files: { "b.txt": "b" }, commit: "b" }, ["b.txt"]),
-] });
-
 async function until<T>(get: () => Promise<T>, ok: (v: T) => boolean, ms = 20_000): Promise<T> {
   const end = Date.now() + ms;
   for (;;) {
@@ -71,32 +67,33 @@ async function until<T>(get: () => Promise<T>, ok: (v: T) => boolean, ms = 20_00
   }
 }
 
-const runOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as { run: Run; pr: { number: number; url: string; handled?: string } | null };
+const runOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as { run: Run; pr: { number: number; url: string; handled?: string } | null; terminateOnPrMerge: boolean };
 const onOrigin = (branch: string, file: string) => git(["show", `${branch}:${file}`], origin);
 
-async function startRun(plan: PlanNode): Promise<string> {
-  const res = await api("POST", "/api/v1/runs", { repo, task: "add parts a and b", plan });
+// A worker on the fake agent: its task is the script it runs.
+async function spawn(script: object = { files: { "a.txt": "a" }, commit: "add a" }, more: Record<string, unknown> = {}): Promise<string> {
+  const res = await api("POST", "/api/v1/runs", { repo, task: JSON.stringify(script), agent: "fake", name: "add a", ...more });
   expect(res.status).toBe(201);
   return res.json.runId;
 }
 
 describe("opening the pull request", () => {
-  it("pr=auto pushes the finished root and opens one PR listing every part", async () => {
+  it("pr=auto pushes the finished worker's branch and opens one PR for it", async () => {
     await start({ pr: "auto" });
-    const runId = await startRun(twoParts());
+    const runId = await spawn();
     const { pr, run } = await until(() => runOf(runId), (r) => r.pr !== null);
     expect(pr).toEqual({ number: 1, url: "https://github.com/o/r/pull/1" });
-    expect(run.nodes[0]!.prStatus).toBe("pr_open");
-    expect(gh.prs[0]).toMatchObject({ title: "add parts a and b", base: "main", head: { ref: `rivet/${runId}/root` } });
-    expect(gh.prs[0]!.body).toMatch(/\*\*part a\*\* \(`root\.1`, branch `rivet\/.+\/root\.1`\)/);
-    expect(gh.prs[0]!.body).toMatch(/files: `b\.txt`/);
-    expect(await onOrigin(`rivet/${runId}/root`, "a.txt")).toBe("a");
+    expect(run.node.prStatus).toBe("pr_open");
+    expect(gh.prs[0]).toMatchObject({ title: "add a", base: "main", head: { ref: `rivet/${runId}/agent` } });
+    expect(gh.prs[0]!.body).toMatch(/Done by one agent \(fake\) in its own worktree/);
+    expect(gh.prs[0]!.body).toMatch(/Files: `a\.txt`/);
+    expect((await onOrigin(`rivet/${runId}/agent`, "a.txt")).trim()).toBe("a");
   });
 
   it("opens nothing on its own without pr=auto, and once on request", async () => {
     await start();
-    const runId = await startRun(twoParts());
-    await until(() => runOf(runId), (r) => r.run.nodes[0]!.status === "done");
+    const runId = await spawn();
+    await until(() => runOf(runId), (r) => r.run.node.status === "done");
     await daemon!.idle();
     expect(gh.prs).toHaveLength(0);
     const first = await api("POST", `/api/v1/runs/${runId}/pr`);
@@ -107,64 +104,62 @@ describe("opening the pull request", () => {
 
   it("pulls in a moved base before pushing", async () => {
     await start();
-    const runId = await startRun(twoParts());
-    await until(() => runOf(runId), (r) => r.run.nodes[0]!.status === "done");
+    const runId = await spawn();
+    await until(() => runOf(runId), (r) => r.run.node.status === "done");
     await writeFile(join(repo, "main.txt"), "moved");
     await git(["add", "."], repo);
     await git(["commit", "-q", "-m", "main moved"], repo);
     await git(["push", "-q", "origin", "main"], repo);
     expect((await api("POST", `/api/v1/runs/${runId}/pr`)).status).toBe(200);
-    expect(await onOrigin(`rivet/${runId}/root`, "main.txt")).toBe("moved");
-    expect(await onOrigin(`rivet/${runId}/root`, "a.txt")).toBe("a");
+    expect((await onOrigin(`rivet/${runId}/agent`, "main.txt")).trim()).toBe("moved");
+    expect((await onOrigin(`rivet/${runId}/agent`, "a.txt")).trim()).toBe("a");
   });
 
-  it("refuses a run that is not done", async () => {
+  it("refuses a worker that is not done, and an orchestrator", async () => {
     await start();
-    const runId = await startRun({ title: "root", prompt: "r", children: [leaf("slow", { stayFor: 60_000 })] });
-    expect((await api("POST", `/api/v1/runs/${runId}/pr`)).status).toBe(409);
+    const slow = await spawn({ stayFor: 60_000 });
+    expect((await api("POST", `/api/v1/runs/${slow}/pr`)).status).toBe(409);
+    const orch = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId;
+    expect((await api("POST", `/api/v1/runs/${orch}/pr`)).json.error).toMatch(/only a worker opens a pull request/);
   });
 });
 
 describe("watching the pull request", () => {
   async function opened(): Promise<string> {
     await start({ pr: "auto" });
-    const runId = await startRun(twoParts());
+    const runId = await spawn();
     await until(() => runOf(runId), (r) => r.pr !== null);
     return runId;
   }
 
-  it("sends a CI failure back to the leaf that owns the failing file", async () => {
+  it("sends a CI failure back to the worker, once", async () => {
     const runId = await opened();
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     gh.annotations[9] = [{ path: "a.txt" }];
-    const { run } = await until(() => runOf(runId), (r) => r.run.nodes[1]!.attempts === 2 && r.run.nodes[0]!.status === "done" && (r.pr?.handled ?? "").startsWith("ci_failed"));
-    // Fixed and finished: the CI failure no longer stands on the leaf.
-    expect(run.nodes[1]!.summary ?? null).toBeNull();
-    expect(run.nodes[2]!.attempts).toBe(1);
-    // Fixed once; the same failure is not acted on again.
+    const { run } = await until(() => runOf(runId), (r) => r.run.node.attempts === 2 && r.run.node.status === "done" && (r.pr?.handled ?? "").startsWith("ci_failed"));
+    // Fixed and finished: the CI failure no longer stands on the worker.
+    expect(run.node.summary ?? null).toBeNull();
     await new Promise((r) => setTimeout(r, 600));
-    expect((await runOf(runId)).run.nodes[1]!.attempts).toBe(2);
+    expect((await runOf(runId)).run.node.attempts).toBe(2);
   });
 
-  it("sends review comments to the leaf that owns the file", async () => {
+  it("sends review comments to the worker", async () => {
     const runId = await opened();
-    gh.comments[1] = [{ commit_id: "sha1", path: "b.txt", line: 1, body: "please use lowercase" }];
-    const { run } = await until(() => runOf(runId), (r) => r.run.nodes[2]!.attempts === 2);
-    expect(run.nodes[2]!.summary).toMatch(/b\.txt:1: please use lowercase/);
-    expect(run.nodes[1]!.attempts).toBe(1);
+    gh.comments[1] = [{ commit_id: "sha1", path: "a.txt", line: 1, body: "please use lowercase" }];
+    await until(() => runOf(runId), (r) => r.run.node.attempts === 2);
   });
 
   it("records a merged pull request and stops acting on it", async () => {
     const runId = await opened();
     gh.prs[0]!.merged = true;
     gh.prs[0]!.state = "closed";
-    await until(() => runOf(runId), (r) => r.run.nodes[0]!.prStatus === "merged");
+    await until(() => runOf(runId), (r) => r.run.node.prStatus === "merged");
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     await new Promise((r) => setTimeout(r, 500));
     const { run } = await runOf(runId);
-    expect(run.nodes[0]!.prStatus).toBe("merged");
+    expect(run.node.prStatus).toBe("merged");
     // A run stays after its merge unless it asked to end.
-    expect(run.nodes.every((n) => existsSync(n.worktree))).toBe(true);
+    expect(existsSync(run.node.worktree)).toBe(true);
   });
 });
 
@@ -172,138 +167,61 @@ describe("ending the run after the merge", () => {
   const merge = () => { gh.prs[0]!.merged = true; gh.prs[0]!.state = "closed"; };
   const policy = (runId: string, terminateOnPrMerge: unknown) => api("PATCH", `/api/v1/runs/${runId}/merge-policy`, { terminateOnPrMerge });
 
-  it("terminates a run that asked for it: worktrees go, branches stay", async () => {
+  it("terminates a run that asked for it: the worktree goes, the branch stays", async () => {
     await start({ pr: "auto" });
-    const runId = await startRun(twoParts());
+    const runId = await spawn();
     const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
-    expect((await runOf(runId) as any).terminateOnPrMerge).toBe(false);
+    expect((await runOf(runId)).terminateOnPrMerge).toBe(false);
     expect((await policy(runId, true)).status).toBe(200);
-    expect((await runOf(runId) as any).terminateOnPrMerge).toBe(true);
     merge();
     const after = await until(() => runOf(runId), (r) => r.pr?.handled === "terminated");
-    expect(after.run.nodes[0]!.prStatus).toBe("terminated");
-    expect(run.nodes.some((n) => existsSync(n.worktree))).toBe(false);
-    for (const n of run.nodes) expect((await git(["branch", "--list", n.branch], repo)).trim()).not.toBe("");
+    expect(after.run.node.prStatus).toBe("terminated");
+    expect(existsSync(run.node.worktree)).toBe(false);
+    expect((await git(["branch", "--list", run.node.branch], repo)).trim()).not.toBe("");
   });
 
   it("never forces out a worktree with uncommitted work: it is kept and named, the run still ends", async () => {
     await start({ pr: "auto" });
-    const runId = await startRun(twoParts());
+    const runId = await spawn();
     const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
     await policy(runId, true);
-    const dirty = run.nodes[2]!;
-    await writeFile(join(dirty.worktree, "notes.txt"), "not committed");
+    await writeFile(join(run.node.worktree, "notes.txt"), "not committed");
     merge();
     const after = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("terminated"));
-    expect(after.pr!.handled).toBe(`terminated; kept ${dirty.id}`);
-    expect(after.run.nodes[0]!.prStatus).toBe("terminated");
-    expect(existsSync(join(dirty.worktree, "notes.txt"))).toBe(true);
-    expect(existsSync(run.nodes[1]!.worktree)).toBe(false);
+    expect(after.pr!.handled).toBe("terminated; kept agent");
+    expect(existsSync(join(run.node.worktree, "notes.txt"))).toBe(true);
   });
 
   it("takes only true or false", async () => {
     await start({ pr: "auto" });
-    const runId = await startRun(twoParts());
+    const runId = await spawn();
     expect((await policy(runId, "yes")).status).toBe(400);
     expect((await policy("r999", true)).status).toBe(404);
   });
 });
 
-describe("sync", () => {
-  it("brings a finished sibling's work into a running leaf", async () => {
+describe("radar", () => {
+  it("reports workers of a project that would conflict while both still work", async () => {
     await start();
-    const runId = await startRun({ title: "root", prompt: "r", children: [
-      leaf("fast", { files: { "a.txt": "a" }, commit: "a" }),
-      leaf("slow", { files: { "b.txt": "b" }, commit: "b", stayFor: 60_000 }),
-    ] });
-    const slow = await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
-    const res = await api("POST", `/api/v1/sessions/${runId}-root.2/sync`, {});
-    expect(res.json).toMatchObject({ synced: true, conflicts: [] });
-    expect(await git(["show", "HEAD:a.txt"], slow.run.nodes[2]!.worktree)).toBe("a");
-  });
-
-  it("undoes a conflicting sync for an agent that cannot be told, and leaves it for an agent that asked", async () => {
-    await start();
-    const runId = await startRun({ title: "root", prompt: "r", children: [
-      leaf("one", { files: { "s.txt": "one" }, commit: "one" }),
-      leaf("two", { files: { "s.txt": "two" }, commit: "two", stayFor: 60_000 }),
-    ] });
-    const { run } = await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
-    const tree = run.nodes[2]!.worktree;
-    await until(() => git(["log", "--format=%s", "-1"], tree), (s) => s.trim() === "two");
-    // The fake agent listens on stdin, so it is told; make it one that cannot be.
-    const told = await api("POST", `/api/v1/sessions/${runId}-root.2/sync`, {});
-    expect(told.json).toMatchObject({ synced: false, conflicts: ["s.txt"] });
-    if (/undone/.test(told.json.note)) expect((await git(["status", "--porcelain"], tree)).trim()).toBe("");
-    else await git(["merge", "--abort"], tree);
-    const self = await api("POST", `/api/v1/sessions/${runId}-root.2/sync`, { byAgent: true });
-    expect(self.json).toMatchObject({ synced: false, conflicts: ["s.txt"], note: expect.stringMatching(/resolve/) });
-    expect((await git(["diff", "--name-only", "--diff-filter=U"], tree)).trim()).toBe("s.txt");
+    const one = await spawn({ files: { "s.txt": "one" }, commit: "one", stayFor: 60_000 });
+    const two = await spawn({ files: { "s.txt": "two" }, commit: "two", stayFor: 60_000 });
+    const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
+    const res = await until(async () => (await api("GET", `/api/v1/projects/${encodeURIComponent(project)}/radar`)).json, (j) => j.conflicts.length > 0);
+    expect(res.conflicts).toEqual([{ a: one, b: two, files: ["s.txt"] }]);
   });
 });
 
-describe("ship without a leaf", () => {
-  it("finishes the run without a skipped leaf, then opens a follow-up PR when it finishes", async () => {
-    await start({ pr: "auto" });
-    const runId = await startRun({ title: "root", prompt: "r", children: [
-      leaf("quick", { files: { "a.txt": "a" }, commit: "a" }),
-      leaf("late", { files: { "late.txt": "late" }, commit: "late", listen: true }),
-    ] });
-    await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
-    expect((await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root.2" })).status).toBe(204);
-    const shipped = await until(() => runOf(runId), (r) => r.pr !== null);
-    expect(shipped.run.nodes[0]!.status).toBe("done");
-    expect(shipped.run.nodes[2]).toMatchObject({ status: "skipped" });
-    await expect(onOrigin(`rivet/${runId}/root`, "late.txt")).rejects.toThrow();
-    // The late leaf finishes now.
-    await api("POST", `/api/v1/sessions/${runId}-root.2/send`, { message: "/exit" });
-    const after = await until(() => runOf(runId), (r) => /follow-up pull request/.test(r.run.nodes[2]!.summary ?? ""));
-    expect(after.run.nodes[2]!.summary).toMatch(/pull\/2/);
-    expect(gh.prs[1]).toMatchObject({ title: "Follow-up: late", head: { ref: `rivet/${runId}/root.2` } });
-    expect(await onOrigin(`rivet/${runId}/root.2`, "a.txt")).toBe("a");
-  });
-
-  it("does not end a merged run while a skipped leaf still works toward its follow-up", async () => {
-    await start({ pr: "auto" });
-    const runId = await startRun({ title: "root", prompt: "r", children: [
-      leaf("quick", { files: { "a.txt": "a" }, commit: "a" }),
-      leaf("late", { files: { "late.txt": "late" }, commit: "late", listen: true }),
-    ] });
-    await until(() => runOf(runId), (r) => r.run.nodes[1]!.status === "done");
-    await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root.2" });
-    await until(() => runOf(runId), (r) => r.pr !== null);
-    await api("PATCH", `/api/v1/runs/${runId}/merge-policy`, { terminateOnPrMerge: true });
-    gh.prs[0]!.merged = true;
-    gh.prs[0]!.state = "closed";
-    await until(() => runOf(runId), (r) => r.run.nodes[0]!.prStatus === "merged");
+describe("runs saved before a run was one session", () => {
+  it("are left alone by the watcher and on restart", async () => {
+    const { openStore } = await import("../src/store.js");
+    const { sessionRun } = await import("./helpers.js");
+    const store = openStore(data);
+    const old = sessionRun(data, { id: "rold", project: "p" });
+    store.saveRun({ ...old, repo, node: { ...old.node, id: "root", branch: "rivet/rold/root", status: "done" } });
+    store.setPr("rold", { number: 99, url: "https://github.com/o/r/pull/99" });
+    store.close();
+    await start();
     await new Promise((r) => setTimeout(r, 600));
-    const waiting = await runOf(runId);
-    expect(waiting.run.nodes[0]!.prStatus).toBe("merged");
-    expect((waiting as any).live["root.2"]).toBe(true);
-    // Once the late leaf finishes, its follow-up opens and only then does the run end.
-    await api("POST", `/api/v1/sessions/${runId}-root.2/send`, { message: "/exit" });
-    const after = await until(() => runOf(runId), (r) => r.pr?.handled === "terminated");
-    expect(after.run.nodes[2]!.summary).toMatch(/follow-up pull request/);
-    expect(gh.prs[1]).toMatchObject({ title: "Follow-up: late" });
-  });
-
-  it("only skips leaves that are not finished", async () => {
-    await start();
-    const runId = await startRun(twoParts());
-    await until(() => runOf(runId), (r) => r.run.nodes[0]!.status === "done");
-    expect((await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root.1" })).status).toBe(409);
-    expect((await api("POST", `/api/v1/runs/${runId}/skip`, { node: "root" })).status).toBe(409);
-  });
-});
-
-describe("radar endpoint", () => {
-  it("reports siblings that would conflict while both still work", async () => {
-    await start();
-    const runId = await startRun({ title: "root", prompt: "r", children: [
-      leaf("one", { files: { "s.txt": "one" }, commit: "one", stayFor: 60_000 }),
-      leaf("two", { files: { "s.txt": "two" }, commit: "two", stayFor: 60_000 }),
-    ] });
-    const res = await until(async () => (await api("GET", `/api/v1/runs/${runId}/radar`)).json, (j) => j.conflicts.length > 0);
-    expect(res.conflicts).toEqual([{ a: "root.1", b: "root.2", files: ["s.txt"] }]);
+    expect(errors).toEqual([]);
   });
 });

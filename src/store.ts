@@ -3,8 +3,9 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
-import { ACTIVITY_STATES, AGENTS, KINDS, PR_STATUSES, STATUSES, type ActivityState, type Node } from "./tree.js";
+import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
 
+// One agent session working on one task in its own worktree.
 export type Run = {
   id: string;
   project: string;
@@ -12,7 +13,14 @@ export type Run = {
   base: string;
   task: string;
   createdAt: string;
-  nodes: Node[];
+  role: Role;
+  // A short label for lists ("fix login"); empty when none was given.
+  name: string;
+  // The orchestrator session that started this worker, if any; its reports go there.
+  orchestrator?: string;
+  // The model asked for when it was started; otherwise the project's worker.model.
+  model?: string;
+  node: Node;
 };
 
 export type Store = {
@@ -55,7 +63,7 @@ export type NodeUpdate = {
   attempts?: number;
   summary?: string | null;
   finishedAt?: string | null;
-  // A re-plan replaces a leaf's instructions.
+  // The task the session works on.
   prompt?: string;
   // Where the root's pull request stands.
   prStatus?: Node["prStatus"] | null;
@@ -78,6 +86,11 @@ export function newRunId(now: number = Date.now()): string {
 }
 
 const oneOf = (values: readonly string[]) => values.map((v) => `'${v}'`).join(", ");
+
+// The lists the early migrations were written with. Shipped migrations never change, so
+// these stay as they were even though runs now use fewer of them.
+const KINDS = ["leaf", "parent"] as const;
+const STATUSES = ["pending", "running", "waiting", "integrating", "done", "failed", "escalated", "skipped"] as const;
 
 // Numbered schema changes, applied in order and recorded once each. Never edit a
 // shipped migration; add the next number instead.
@@ -213,6 +226,14 @@ MIGRATIONS.push({ version: 7, sql: `
 ALTER TABLE nodes ADD COLUMN shared TEXT NOT NULL DEFAULT '[]';
 ` });
 
+// A run is one session now: its role, a label, and the orchestrator that started it.
+MIGRATIONS.push({ version: 8, sql: `
+ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'worker' CHECK (role IN (${oneOf(ROLES)}));
+ALTER TABLE runs ADD COLUMN name TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN orchestrator TEXT;
+ALTER TABLE runs ADD COLUMN model TEXT;
+` });
+
 function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
@@ -235,7 +256,10 @@ function migrate(db: DatabaseSync): void {
   }
 }
 
-type RunRow = { id: string; project: string; repo: string; base: string; task: string; created_at: string };
+type RunRow = {
+  id: string; project: string; repo: string; base: string; task: string; created_at: string;
+  role: string; name: string; orchestrator: string | null; model: string | null;
+};
 type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
@@ -255,9 +279,10 @@ export function openStore(data: string): Store {
   migrate(db);
 
   const upsertRun = db.prepare(`
-    INSERT INTO runs (id, project, repo, base, task, created_at) VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET project = excluded.project, repo = excluded.repo,
-      base = excluded.base, task = excluded.task, created_at = excluded.created_at`);
+      base = excluded.base, task = excluded.task, created_at = excluded.created_at,
+      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model`);
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
@@ -299,19 +324,10 @@ export function openStore(data: string): Store {
   function check(run: Run): void {
     assertId("run", run.id);
     assertProjectId(run.project);
-    const ids = new Set<string>();
-    for (const n of run.nodes) {
-      assertId("node", n.id);
-      ids.add(n.id);
-    }
-    for (const n of run.nodes) {
-      // Later steps run git on this branch, so it must be the node's own.
-      if (n.branch !== branchName(run.id, n.id)) {
-        throw new RunStoreError(`run ${run.id} node ${n.id} has unexpected branch ${n.branch}`);
-      }
-      if (n.parentId !== null && !ids.has(n.parentId)) {
-        throw new RunStoreError(`run ${run.id} node ${n.id} has unknown parent ${n.parentId}`);
-      }
+    assertId("node", run.node.id);
+    // Later steps run git on this branch, so it must be the node's own.
+    if (run.node.branch !== branchName(run.id, run.node.id)) {
+      throw new RunStoreError(`run ${run.id} has unexpected branch ${run.node.branch}`);
     }
   }
 
@@ -324,17 +340,18 @@ export function openStore(data: string): Store {
       }
       db.exec("BEGIN IMMEDIATE");
       try {
-        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt);
+        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null);
         deleteNodes.run(run.id);
-        run.nodes.forEach((n, position) => {
-          insertNode.run(
-            run.id, n.id, position, n.parentId, n.depth, n.kind, n.title, n.prompt,
-            JSON.stringify(n.files), n.agent, n.branch, n.worktree, n.status, n.attempts,
-            n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
-            n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
-            JSON.stringify(n.shared ?? []),
-          );
-        });
+        const n = run.node;
+        // The position, parent, depth, kind, files and shared columns are left from runs that
+        // had several nodes; a one-node run fills them with their neutral values.
+        insertNode.run(
+          run.id, n.id, 0, null, 0, "leaf", n.title, n.prompt,
+          "[]", n.agent, n.branch, n.worktree, n.status, n.attempts,
+          n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
+          n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
+          "[]",
+        );
         db.exec("COMMIT");
       } catch (e) {
         db.exec("ROLLBACK");
@@ -345,15 +362,11 @@ export function openStore(data: string): Store {
     loadRun(runId) {
       const r = selectRun.get(runId) as RunRow | undefined;
       if (!r) throw new RunStoreError(`no run ${runId}`);
+      // A run saved with several nodes reads as its first one.
       const nodes = (selectNodes.all(runId) as NodeRow[]).map((n): Node => ({
         id: n.id,
-        parentId: n.parent_id,
-        depth: n.depth,
-        kind: n.kind as Node["kind"],
         title: n.title,
         prompt: n.prompt,
-        files: JSON.parse(n.files) as string[],
-        shared: JSON.parse(n.shared) as string[],
         agent: n.agent as Node["agent"],
         branch: n.branch,
         worktree: n.worktree,
@@ -368,9 +381,13 @@ export function openStore(data: string): Store {
         ...(n.started_at !== null ? { startedAt: n.started_at } : {}),
         ...(n.first_signal_at !== null ? { firstSignalAt: n.first_signal_at } : {}),
       }));
+      if (!nodes[0]) throw new RunStoreError(`run ${runId} has no session`);
       return {
         id: r.id, project: r.project, repo: r.repo, base: r.base, task: r.task,
-        createdAt: r.created_at, nodes,
+        createdAt: r.created_at, role: r.role as Role, name: r.name,
+        ...(r.orchestrator !== null ? { orchestrator: r.orchestrator } : {}),
+        ...(r.model !== null ? { model: r.model } : {}),
+        node: nodes[0],
       };
     },
 
