@@ -40,6 +40,7 @@ const CONFIG_KEYS = [
   "pr.feedback",
   "github.repo",
   "copy",
+  "symlink",
   "setup",
 ];
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
@@ -209,6 +210,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       ...o, data,
       defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
       copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
+      linkFor: (project) => (store.getConfig(project).symlink ?? "").split(",").map((f) => f.trim()).filter(Boolean),
       // One command per line, run in order in every new worktree.
       setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
     });

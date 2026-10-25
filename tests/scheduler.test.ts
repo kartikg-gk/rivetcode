@@ -252,6 +252,27 @@ describe("clean", () => {
   });
 });
 
+describe("symlink list", () => {
+  it("links an ignored folder into each worktree, and cleaning leaves the real one alone", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    await writeFile(join(repo, ".gitignore"), "node_modules/\n");
+    await git(["add", ".gitignore"], repo);
+    await git(["commit", "-q", "-m", "ignore deps"], repo);
+    await mkdir(join(repo, "node_modules", "dep"), { recursive: true });
+    await writeFile(join(repo, "node_modules", "dep", "x.js"), "x");
+    await start();
+    await setCfg("symlink", "node_modules");
+    const runId = await spawn({ files: { "a.txt": "a" }, commit: "a" });
+    const run = await settled(runId);
+    expect(run.node.status).toBe("done");
+    expect(await readFile(join(run.node.worktree, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
+    expect((await api("POST", `/api/v1/runs/${runId}/clean`)).status).toBe(200);
+    await waitForTrash();
+    expect(existsSync(run.node.worktree)).toBe(false);
+    expect(await readFile(join(repo, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
+  });
+});
+
 describe("copy list", () => {
   it("copies listed ignored files into the worktree and never commits them", async () => {
     await writeFile(join(repo, ".gitignore"), ".env\n");

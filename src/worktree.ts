@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, realpath, rename, rm, rmdir } from "node:fs/pr
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { git, GitError } from "./git.js";
 import { samePath } from "./paths.js";
+import { recordedLinks, unlinkAll } from "./links.js";
 
 export type Worktree = {
   path: string;
@@ -153,16 +154,19 @@ async function remove(data: string, repo: string, path: string): Promise<void> {
     await rmdir(full);
     return;
   }
+  // Links into the main checkout come out before any delete, so nothing follows them.
+  const links = await recordedLinks(full);
   // A lock means someone wants the worktree kept: leave it where it is and let git refuse.
-  if (!registered.locked && (await removeThroughTrash(data, repo, full))) return;
+  if (!registered.locked && (await removeThroughTrash(data, repo, full, links))) return;
   if (await isDirty(full)) throw new DirtyWorktreeError(full);
+  await unlinkAll(full, links);
   await git(["worktree", "remove", full], repo);
 }
 
 // Deleting a big worktree is slow, renaming it is instant. So a clean worktree goes into
 // the trash, git forgets it, and the files are deleted in the background.
 // Returns false when this route could not be used and the worktree is back in place.
-async function removeThroughTrash(data: string, repo: string, full: string): Promise<boolean> {
+async function removeThroughTrash(data: string, repo: string, full: string, links: string[] = []): Promise<boolean> {
   const item = await moveToTrash(data, full);
   if (item === null) return false;
 
@@ -184,6 +188,7 @@ async function removeThroughTrash(data: string, repo: string, full: string): Pro
     await item.putBack();
     throw new WorktreeError(`refusing to remove ${full}: git still lists it after pruning`);
   }
+  await unlinkAll(item.path, links);
   item.purge();
   return true;
 }

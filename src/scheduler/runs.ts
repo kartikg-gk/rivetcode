@@ -8,6 +8,7 @@ import { assertProjectId, branchName, defaultProjectId, worktreePath } from "../
 import { newRunId, type Run } from "../store.js";
 import { AGENTS, NODE_ID, ROLES, type Agent, type Role } from "../model.js";
 import { createWorktree, DirtyWorktreeError, removeWorktree } from "../worktree.js";
+import { LinkError, linkListed } from "../links.js";
 
 export class RunInputError extends Error {
   constructor(message: string) {
@@ -34,6 +35,8 @@ export type NewRun = {
   defaultAgentFor?(project: string): string | undefined;
   // Untracked files to copy from the repo into every worktree (e.g. .env).
   copyFor?(project: string): string[];
+  // Ignored folders to link from the main checkout instead of copying (e.g. node_modules).
+  linkFor?(project: string): string[];
   // Shell commands run in every new worktree, in order (e.g. "npm ci").
   setupFor?(project: string): string[];
 };
@@ -86,6 +89,12 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   await createWorktree({ repo, path: node.worktree, branch: node.branch, from: base });
   try {
     await copyListed(repo, node.worktree, o.copyFor?.(project) ?? []);
+    try {
+      await linkListed(repo, node.worktree, o.linkFor?.(project) ?? []);
+    } catch (e) {
+      if (e instanceof LinkError) throw new RunInputError(e.message);
+      throw e;
+    }
     // The worktree is provisioned (e.g. dependencies installed) before its agent starts.
     const steps = o.setupFor?.(project) ?? [];
     if (steps.length > 0) await runSetup(repo, node.worktree, id, steps);
