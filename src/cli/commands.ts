@@ -64,7 +64,11 @@ const USAGE = `usage: rivet <command>
   check                                 run the project's check and tests on this worktree (inside a worker)
   delegate [--agent <name>] [--model <id>] [--review] [<task>]
                                         hand a task or a review to a partner agent in this worktree (inside a worker)
-  send --session <id> --message <text>  send a message to a running session`;
+  send --session <id> --message <text> [--mode steer|queue|interrupt]
+                                        send a message: as soon as it can take it (steer), once idle (queue),
+                                        or stopping its current turn first (interrupt)
+  answer <run> yes|always|no [--note <text>]
+                                        answer the permission question an agent in a terminal waits at`;
 
 class UsageError extends Error {}
 
@@ -131,15 +135,38 @@ async function hooks(args: string[], io: CliIo): Promise<number> {
   const agentSessionId = agentSessionIdOf(payload);
   if (state === null && agentSessionId === undefined) return 0;
   const launchId = io.env.RIVET_LAUNCH_ID?.trim();
+  const request = state === "blocked" || event === "permission-request" ? permissionRequestOf(payload) : undefined;
   try {
     await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/activity`, {
       ...(state ? { state } : {}),
+      ...(request ? { request } : {}),
       ...(agentSessionId ? { agentSessionId } : {}),
       ...(launchId ? { launchId } : {}),
     }, HOOK_TIMEOUT_MS);
   } catch (e) {
     await logHookFailure(io, `${agent} ${event} ${sessionId} ${(e as Error).message}`);
   }
+  return 0;
+}
+
+// What a permission question asks for: the tool, and its command or file.
+function permissionRequestOf(payload: Record<string, unknown>): { tool: string; detail: string } | undefined {
+  const tool = typeof payload.tool_name === "string" ? payload.tool_name : undefined;
+  if (!tool) return undefined;
+  const input = (payload.tool_input ?? {}) as Record<string, unknown>;
+  const detail = [input.command, input.file_path, input.path, input.url].find((v) => typeof v === "string") as string | undefined;
+  return { tool, detail: detail ?? JSON.stringify(input).slice(0, 300) };
+}
+
+// Answers the permission question a terminal agent is waiting at.
+async function answer(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["note"]);
+  const [runId, choice] = rest;
+  if (!runId || !["yes", "always", "no"].includes(choice ?? "")) throw new UsageError("answer needs a run id and yes, always or no");
+  const note = flags.get("note");
+  await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/answer`,
+    { choice, ...(typeof note === "string" ? { note } : {}) }, COMMAND_TIMEOUT_MS);
+  io.out(`answered ${choice}${typeof note === "string" && choice === "no" ? ", and told it what to do instead" : ""}`);
   return 0;
 }
 
@@ -158,16 +185,21 @@ async function report(args: string[], io: CliIo): Promise<number> {
 }
 
 async function send(args: string[], io: CliIo): Promise<number> {
-  const { flags } = parseFlags(args, ["session", "message"]);
+  const { flags } = parseFlags(args, ["session", "message", "mode"]);
   const session = flags.get("session");
   const message = flags.get("message");
   if (typeof session !== "string" || !session) throw new UsageError("send needs --session <id>");
   if (typeof message !== "string" || !message) throw new UsageError("send needs --message <text>");
   const from = io.env.RIVET_SESSION_ID?.trim();
+  const mode = flags.get("mode");
+  if (mode !== undefined && !["steer", "queue", "interrupt"].includes(mode as string)) throw new UsageError("--mode is steer, queue or interrupt");
   const { delivery } = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/send`,
-    { message, ...(from ? { from } : {}) }, COMMAND_TIMEOUT_MS) as { delivery?: string };
+    { message, ...(from ? { from } : {}), ...(typeof mode === "string" ? { mode } : {}) }, COMMAND_TIMEOUT_MS) as { delivery?: string };
   io.out(delivery === "turn-end" ? `queued for ${session}: it runs headless and gets the message when its turn ends`
     : delivery === "next-launch" ? `queued for ${session}: it is not running and gets the message when it starts again`
+    : delivery === "when-idle" ? `queued for ${session}: it gets the message once it is idle`
+    : delivery === "after-answer" ? `queued for ${session}: it waits at a permission question; answer it with rivet answer`
+    : delivery === "interrupted" ? `${session} was interrupted and given the message`
     : `sent to ${session}`);
   return 0;
 }
@@ -706,6 +738,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "hooks": return await hooks(args, io);
       case "report": return await report(args, io);
       case "send": return await send(args, io);
+      case "answer": return await answer(args, io);
       case "check": return await check(io);
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);

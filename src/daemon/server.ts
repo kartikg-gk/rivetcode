@@ -16,7 +16,7 @@ import { checkCue } from "../scheduler/cues.js";
 import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
 import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
-import { openStore, RunStoreError, type Run } from "../store.js";
+import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
 import { runUsage } from "../usage.js";
 import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
@@ -393,7 +393,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
+      // What a permission question asks, when the hook says; forgotten once the agent moves on.
+      if (state === "blocked") {
+        const request = payload.request as { tool?: unknown; detail?: unknown } | undefined;
+        if (request && typeof request.tool === "string") {
+          scheduler.setPending(runId, { tool: request.tool.slice(0, 100), detail: typeof request.detail === "string" ? request.detail.slice(0, 500) : "" });
+        }
+      } else if (state !== null) scheduler.setPending(runId, null);
       if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
+      // An agent that went idle can take what was queued for it.
+      if (state === "idle" || state === "waiting_input") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
     }
@@ -459,13 +468,31 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const payload = await body(req);
       if (typeof payload.message !== "string") throw new HttpError(400, "message must be a string");
       const from = optionalString(payload.from, "from");
-      const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from));
+      const mode = (optionalString(payload.mode, "mode") ?? "steer") as SendMode;
+      if (!SEND_MODES.includes(mode)) throw new HttpError(400, `mode must be one of ${SEND_MODES.join(", ")}`);
+      const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from, mode));
       if (id === null) throw new HttpError(404, "unknown session");
       const target = sessionIdOf(runId, nodeId);
-      // Typed in now, handed over when a headless agent ends its turn, or at the next launch.
-      const delivery = runtime.takesInput(target) ? "now" : runtime.isAlive(target) ? "turn-end" : "next-launch";
-      if (delivery === "now") await scheduler.deliver(runId);
+      let delivery: string;
+      if (runtime.takesInput(target)) {
+        await scheduler.deliver(runId);
+        const left = await write(() => store.undeliveredMessages(runId, nodeId).some((m) => m.id === id));
+        const activity = await write(() => store.loadRun(runId).node.activity);
+        delivery = !left ? (mode === "interrupt" ? "interrupted" : "now") : activity === "blocked" ? "after-answer" : "when-idle";
+      } else if (runtime.isAlive(target)) {
+        delivery = mode === "interrupt" && (await scheduler.interruptHeadless(runId)) ? "interrupted" : "turn-end";
+      } else delivery = "next-launch";
       reply(res, 202, { id, delivery });
+      return;
+    }
+    const answerRoute = /^\/api\/v1\/runs\/([^/]+)\/answer$/.exec(path);
+    if (answerRoute) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      const choice = payload.choice;
+      if (choice !== "yes" && choice !== "always" && choice !== "no") throw new HttpError(400, "choice must be yes, always or no");
+      await scheduler.answer(answerRoute[1]!, choice, optionalString(payload.note, "note"));
+      reply(res, 204);
       return;
     }
     if (path === "/api/v1/runs") {
@@ -619,7 +646,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const conversations = await write(() => store.conversations(run.id));
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         const reviews = await write(() => store.reviewsOf(run.id));
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, now: new Date(at).toISOString() });
+        const pendingRequest = scheduler.pendingRequest(run.id);
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {

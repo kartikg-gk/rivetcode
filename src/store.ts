@@ -42,8 +42,10 @@ export type Store = {
   // Every agent conversation a run's nodes have had.
   conversations(runId: string): { nodeId: string; agent: string; id: string }[];
   createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
-  queueMessage(runId: string, nodeId: string, message: string, from?: string): number | null;
-  undeliveredMessages(runId: string, nodeId: string): { id: number; message: string }[];
+  // mode: steer (typed in as soon as the agent can take it), queue (only once it is idle),
+  // interrupt (its current turn is stopped first).
+  queueMessage(runId: string, nodeId: string, message: string, from?: string, mode?: SendMode): number | null;
+  undeliveredMessages(runId: string, nodeId: string): { id: number; message: string; mode: SendMode }[];
   markDelivered(id: number): void;
   // After a daemon restart no agent is running; returns how many nodes were changed.
   exitStaleSessions(): number;
@@ -119,6 +121,9 @@ export type Automation = {
 
 // One time an automation came round: the run it started, or why it could not.
 export type AutomationRun = { id: number; automationId: string; scheduledFor: string; runId?: string; error?: string; createdAt: string };
+
+export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
+export type SendMode = (typeof SEND_MODES)[number];
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -305,6 +310,11 @@ MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
 ` });
 
+// How a sent message is to be delivered.
+MIGRATIONS.push({ version: 14, sql: `
+ALTER TABLE outbox ADD COLUMN mode TEXT NOT NULL DEFAULT 'steer' CHECK (mode IN ('steer', 'queue', 'interrupt'));
+` });
+
 // A task file's definition of done, limits and guardrails, as JSON.
 MIGRATIONS.push({ version: 13, sql: `
 ALTER TABLE runs ADD COLUMN spec TEXT;
@@ -433,9 +443,9 @@ export function openStore(data: string): Store {
   const sessionExists = db.prepare("SELECT 1 FROM nodes WHERE run_id = ? AND id = ?");
   const insertReport = db.prepare(`INSERT INTO reports (run_id, node_id, kind, message, created_at)
     VALUES (?, ?, ?, ?, ?)`);
-  const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at)
-    VALUES (?, ?, ?, ?, ?)`);
-  const selectUndelivered = db.prepare(`SELECT id, message FROM outbox
+  const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at, mode)
+    VALUES (?, ?, ?, ?, ?, ?)`);
+  const selectUndelivered = db.prepare(`SELECT id, message, mode FROM outbox
     WHERE run_id = ? AND node_id = ? AND delivered_at IS NULL ORDER BY id`);
   const updateDelivered = db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
   const updateSignal = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
@@ -559,14 +569,14 @@ export function openStore(data: string): Store {
       return Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
     },
 
-    queueMessage(runId, nodeId, message, from) {
+    queueMessage(runId, nodeId, message, from, mode = "steer") {
       if (!sessionExists.get(runId, nodeId)) return null;
-      return Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString()).lastInsertRowid);
+      return Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString(), mode).lastInsertRowid);
     },
 
     undeliveredMessages(runId, nodeId) {
-      return (selectUndelivered.all(runId, nodeId) as { id: number; message: string }[])
-        .map((r) => ({ id: Number(r.id), message: r.message }));
+      return (selectUndelivered.all(runId, nodeId) as { id: number; message: string; mode: SendMode }[])
+        .map((r) => ({ id: Number(r.id), message: r.message, mode: r.mode }));
     },
 
     markDelivered(id) {

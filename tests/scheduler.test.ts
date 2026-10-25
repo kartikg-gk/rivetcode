@@ -189,7 +189,7 @@ describe("an orchestrator", () => {
     await new Promise((r) => setTimeout(r, 400));
     const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
     expect(inbox.split(/\r?\n/).filter((l) => l.includes("is waiting for a permission answer"))).toHaveLength(1);
-    expect(inbox).toContain(`Answer it with rivet send --session ${worker}-agent --message`);
+    expect(inbox).toContain(`Answer with: rivet answer ${worker} yes|always|no`);
     await api("POST", `/api/v1/runs/${orchestrator}/stop`, {});
   });
 
@@ -661,5 +661,60 @@ describe("switching a worker's agent", () => {
     const runId = await spawn({ commit: "none" });
     await settled(runId);
     expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "codex" })).json.error).toMatch(/is done/);
+  });
+});
+
+describe("answering a permission question and send modes", () => {
+  // A worker in a terminal that writes every line it gets to inbox.txt.
+  async function terminalWorker(): Promise<{ runId: string; inbox: () => Promise<string> }> {
+    await start();
+    await setCfg("worker.mode", "interactive");
+    const runId = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 400));
+    const worktree = (await getRun(runId)).node.worktree;
+    return { runId, inbox: () => readFile(join(worktree, "inbox.txt"), "utf8").catch(() => "") };
+  }
+  const activity = (runId: string, state: string, request?: object) =>
+    api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state, ...(request ? { request } : {}) });
+  async function inboxHas(inbox: () => Promise<string>, text: string): Promise<string> {
+    const end = Date.now() + 5000;
+    while (!(await inbox()).includes(text) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    return inbox();
+  }
+
+  it("holds messages while the agent is blocked, shows the question, and answers it", async () => {
+    const { runId, inbox } = await terminalWorker();
+    await activity(runId, "blocked", { tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest).toMatchObject({ tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
+    // Typed into the question, a message would answer it: it waits.
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also add docs" })).json.delivery).toBe("after-answer");
+    expect(await inbox()).not.toContain("also add docs");
+    expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "no", note: "use git ls-files instead" })).status).toBe(204);
+    const text = await inboxHas(inbox, "also add docs");
+    expect(text.split(/\r?\n/).filter(Boolean)).toEqual(["n", "use git ls-files instead", "also add docs"]);
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest).toBeUndefined();
+    expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" })).json.error).toMatch(/not waiting for a permission answer/);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("queue waits for the agent to be idle; steer goes in at once", async () => {
+    const { runId, inbox } = await terminalWorker();
+    await activity(runId, "active");
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "later please", mode: "queue" })).json.delivery).toBe("when-idle");
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "after that", mode: "steer" })).json.delivery).toBe("when-idle");
+    expect(await inbox()).toBe("");
+    await activity(runId, "idle");
+    expect((await inboxHas(inbox, "after that")).split(/\r?\n/).filter(Boolean)).toEqual(["later please", "after that"]);
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "now", mode: "bogus" })).status).toBe(400);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("an answer for an agent without a terminal is refused", async () => {
+    await start();
+    const runId = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 300));
+    await activity(runId, "blocked");
+    expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" })).json.error).toMatch(/only an agent in a terminal/);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
   });
 });

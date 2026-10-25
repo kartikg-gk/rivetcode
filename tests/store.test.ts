@@ -130,10 +130,10 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
   });
 
   it("applies migrations 2 and 3 once to a version 1 database", () => {
@@ -144,11 +144,11 @@ describe("schema migrations", () => {
     db.close();
     expect(versions()).toEqual([1]);
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     expect(store.loadRun("r1")).toMatchObject({ role: "worker", name: "", node: { id: "agent" } });
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
   });
 });
 
@@ -157,13 +157,13 @@ describe("outbox and stale sessions", () => {
     store.saveRun(sampleRun());
     store.saveRun(sampleRun("r2"));
     const first = store.queueMessage("r1", "agent", "one")!;
-    const second = store.queueMessage("r1", "agent", "two", "r2-agent")!;
+    const second = store.queueMessage("r1", "agent", "two", "r2-agent", "queue")!;
     store.queueMessage("r2", "agent", "for the other");
     expect(store.undeliveredMessages("r1", "agent")).toEqual([
-      { id: first, message: "one" }, { id: second, message: "two" },
+      { id: first, message: "one", mode: "steer" }, { id: second, message: "two", mode: "queue" },
     ]);
     store.markDelivered(first);
-    expect(store.undeliveredMessages("r1", "agent")).toEqual([{ id: second, message: "two" }]);
+    expect(store.undeliveredMessages("r1", "agent")).toEqual([{ id: second, message: "two", mode: "queue" }]);
   });
 
   it("marks every session that still looks alive as exited", () => {
@@ -184,7 +184,7 @@ describe("migration 3 and project config", () => {
     store.saveRun(run);
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DELETE FROM schema_migrations WHERE version >= 3; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 3; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
     db.exec("CREATE TABLE n2 AS SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes; DROP TABLE nodes; ALTER TABLE n2 RENAME TO nodes;");
     db.close();
     store = openStore(data);
