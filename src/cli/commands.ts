@@ -30,25 +30,40 @@ export type CliIo = {
 };
 
 const USAGE = `usage: rivet <command>
-  spawn [--name <label>] [--agent <name>] [--model <id>] [--repo <dir>] [--base <branch>] <task>
+  spawn [--name <label>] [--agent <name>] [--model <id>] [--issue <n|owner/repo#n|url>] [--repo <dir>] [--base <branch>] [<task>]
                                         start a worker on a task in its own worktree
+  run <tasks.yaml|tasks.json> [--dry-run] [--repo <dir>]
+                                        start a worker per task, each with its goal, done_when, limits and guardrails
   orchestrator [--agent <name>] [--repo <dir>] [<what you want>]
                                         start an agent that splits work and spawns workers
   status [<run>]                        list sessions, or show one with its pull request
-  stop <run>                            stop a session's agent
+  stop <run> [--keep-workers]           stop a session; an orchestrator also stops its workers
   resume <run>                          retry what was escalated or interrupted
   pr <run>                              bring in the latest base, push and open the pull request
+  review <run>                          have a reviewer agent review a worker's pull request
+  review submit --verdict approved|changes_requested --summary <text> [--comment "<path>:<line>: <text>" ...]
+                                        submit a review (inside a reviewer)
   clean <run>                           remove a run's worktree (the branch stays)
+  switch <run> claude|codex [--model <id>]
+                                        hand a worker's task to another agent in the same worktree
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
+  cue list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
+                                        saved prompts (to a session, or a new worker) and commands (run here)
+  automation list | add <name> --cron "<m h dom mon dow>" [--zone <tz>] [--orchestrator] [--agent <name>] <prompt>
+             | rm|pause|resume|run <name>   prompts run on a schedule by a new worker or orchestrator
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
   panes                                 show every running agent side by side
   daemon start|stop|status              run or control the background daemon
   doctor                                check what Rivet needs on this machine
+  login claude|codex                    log an agent's CLI in to its account (its own login)
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
                                         report this session's state (inside an agent)
+  check                                 run the project's check and tests on this worktree (inside a worker)
+  delegate [--agent <name>] [--model <id>] [--review] [<task>]
+                                        hand a task or a review to a partner agent in this worktree (inside a worker)
   send --session <id> --message <text>  send a message to a running session`;
 
 class UsageError extends Error {}
@@ -157,6 +172,67 @@ async function send(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
+// "rivet review <run>" starts a review of a worker's pull request; "rivet review submit",
+// run by the reviewer, hands its review to Rivet. --comment may be given many times.
+async function review(args: string[], io: CliIo): Promise<number> {
+  if (args[0] !== "submit") {
+    const runId = args[0];
+    if (!runId) throw new UsageError("review needs a run id, or submit");
+    await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/review`, undefined, COMMAND_TIMEOUT_MS);
+    io.out(`review of ${runId} started; see it with rivet status ${runId}`);
+    return 0;
+  }
+  const session = io.env.RIVET_SESSION_ID?.trim();
+  if (!session) throw new UsageError("review submit runs inside a reviewer started by Rivet");
+  let verdict: string | undefined;
+  let summary: string | undefined;
+  const comments: { path: string; line: number; body: string }[] = [];
+  const rest = args.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    if (value === undefined || !["--verdict", "--summary", "--comment"].includes(flag!)) throw new UsageError(`unexpected ${flag}`);
+    i++;
+    if (flag === "--verdict") verdict = value;
+    else if (flag === "--summary") summary = value;
+    else {
+      const m = /^(.+?):(\d+):\s*([\s\S]+)$/.exec(value);
+      if (!m) throw new UsageError(`--comment must be "<path>:<line>: <finding>", got "${value}"`);
+      comments.push({ path: m[1]!.trim(), line: Number(m[2]), body: m[3]!.trim() });
+    }
+  }
+  if (verdict !== "approved" && verdict !== "changes_requested") throw new UsageError("review submit needs --verdict approved|changes_requested");
+  if (!summary?.trim()) throw new UsageError("review submit needs --summary");
+  await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/review`, { verdict, summary, comments }, COMMAND_TIMEOUT_MS);
+  io.out(`review submitted: ${verdict}${comments.length ? `, ${comments.length} comments` : ""}`);
+  return 0;
+}
+
+// Run by a worker's agent: hands a task, or a review of its changes, to a partner agent in
+// the same worktree. The partner's result comes back as a message.
+async function delegate(args: string[], io: CliIo): Promise<number> {
+  const session = io.env.RIVET_SESSION_ID?.trim();
+  if (!session) throw new UsageError("delegate runs inside a worker started by Rivet");
+  const { flags, rest } = parseFlags(args, ["agent", "model"]);
+  const task = rest.join(" ").trim();
+  const review = flags.get("review") === true;
+  if (!task && !review) throw new UsageError("delegate needs a task, or --review");
+  const text = (key: string) => (typeof flags.get(key) === "string" ? { [key]: flags.get(key) as string } : {});
+  const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/delegate`,
+    { task, review, ...text("agent"), ...text("model") }, COMMAND_TIMEOUT_MS) as { agent: string };
+  io.out(`${result.agent} is on it; its result will arrive here as a message`);
+  return 0;
+}
+
+// Run by a worker's agent: Rivet runs the project's check and tests on its worktree.
+async function check(io: CliIo): Promise<number> {
+  const session = io.env.RIVET_SESSION_ID?.trim();
+  if (!session) throw new UsageError("check runs inside a worker started by Rivet");
+  const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/check`, {}, RUN_TIMEOUT_MS) as { ok: boolean; output: string };
+  (result.ok ? io.out : io.err)(result.output);
+  return result.ok ? 0 : 1;
+}
+
 async function daemon(args: string[], io: CliIo): Promise<number> {
   const runFile = runFileFrom(io.env);
   switch (args[0]) {
@@ -204,15 +280,15 @@ async function repoTop(dir: string): Promise<string> {
 
 // Starts one session on the daemon: a worker, or an orchestrator that starts workers.
 async function startSession(args: string[], io: CliIo, role: "worker" | "orchestrator"): Promise<number> {
-  const { flags, rest } = parseFlags(args, ["repo", "base", "agent", "name", "model"]);
+  const { flags, rest } = parseFlags(args, ["repo", "base", "agent", "name", "model", "issue"]);
   const task = rest.join(" ").trim();
-  if (role === "worker" && !task) throw new UsageError("spawn needs a task description");
+  if (role === "worker" && !task && typeof flags.get("issue") !== "string") throw new UsageError("spawn needs a task description or --issue");
   const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
   const text = (key: string) => (typeof flags.get(key) === "string" ? { [key]: flags.get(key) as string } : {});
   // Inside an orchestrator's session the new worker reports back to it.
   const from = io.env.RIVET_SESSION_ID?.trim();
   const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
-    repo, task, role, ...text("base"), ...text("agent"), ...text("name"), ...text("model"), ...(from ? { from } : {}),
+    repo, task, role, ...text("base"), ...text("agent"), ...text("name"), ...text("model"), ...text("issue"), ...(from ? { from } : {}),
   }, RUN_TIMEOUT_MS) as { runId: string };
   if (role === "orchestrator") io.out(`orchestrator ${result.runId} started; talk to it with: rivet attach ${result.runId}-agent`);
   else io.out(`worker ${result.runId} started; follow it with: rivet status ${result.runId}`);
@@ -337,6 +413,140 @@ async function project(args: string[], io: CliIo): Promise<number> {
   throw new UsageError("project needs get, set <key> <value> or unset <key>");
 }
 
+// Prompts run on a cron schedule, each time by a new worker (or orchestrator).
+async function automation(args: string[], io: CliIo): Promise<number> {
+  const [action, ...more] = args;
+  if (action === "list" || action === undefined) {
+    type A = { name: string; project: string; cron: string; zone: string; enabled: boolean; nextRunAt: string; role: string; prompt: string; runs: { runId?: string; error?: string; createdAt: string }[] };
+    const { automations } = await callDaemon(io.env, "GET", "/api/v1/automations", undefined, COMMAND_TIMEOUT_MS) as { automations: A[] };
+    if (automations.length === 0) io.out("no automations");
+    for (const a of automations) {
+      const last = a.runs.at(-1);
+      io.out(`${a.name.padEnd(20)} ${a.cron.padEnd(16)} ${a.zone.padEnd(18)} ${a.enabled ? `next ${a.nextRunAt}` : "paused"}  ${a.role}  [${a.project}]`);
+      io.out(`  ${a.prompt.split(/\r?\n/)[0]!.slice(0, 100)}${last ? `\n  last: ${last.runId ?? `failed: ${last.error}`} at ${last.createdAt}` : ""}`);
+    }
+    return 0;
+  }
+  if (action === "add") {
+    const { flags, rest } = parseFlags(more, ["cron", "zone", "agent"]);
+    const [name, ...words] = rest;
+    const prompt = words.join(" ").trim();
+    if (!name || !prompt || typeof flags.get("cron") !== "string") throw new UsageError('automation add <name> --cron "<min hour day month weekday>" [--zone <tz>] [--orchestrator] [--agent <name>] "<prompt>"');
+    const repo = await repoTop(io.cwd);
+    const created = await callDaemon(io.env, "POST", "/api/v1/automations", {
+      repo, name, prompt, cron: flags.get("cron"), role: flags.get("orchestrator") === true ? "orchestrator" : "worker",
+      ...(typeof flags.get("zone") === "string" ? { zone: flags.get("zone") } : {}),
+      ...(typeof flags.get("agent") === "string" ? { agent: flags.get("agent") } : {}),
+    }, COMMAND_TIMEOUT_MS) as { nextRunAt: string; zone: string };
+    io.out(`automation ${name} saved; first run ${created.nextRunAt} (${created.zone})`);
+    return 0;
+  }
+  const name = more[0];
+  if (!name || !["rm", "pause", "resume", "run"].includes(action)) throw new UsageError("automation needs list, add, rm <name>, pause <name>, resume <name> or run <name>");
+  const path = `/api/v1/automations/${encodeURIComponent(name)}`;
+  if (action === "rm") {
+    await callDaemon(io.env, "DELETE", path, undefined, COMMAND_TIMEOUT_MS);
+    io.out(`automation ${name} removed`);
+    return 0;
+  }
+  const result = await callDaemon(io.env, "POST", `${path}/${action}`, undefined, RUN_TIMEOUT_MS) as { runId?: string; nextRunAt?: string };
+  io.out(action === "run" ? `automation ${name} started ${result.runId}` : action === "pause" ? `automation ${name} paused` : `automation ${name} resumed; next run ${result.nextRunAt}`);
+  return 0;
+}
+
+// A task file: every task in it starts as a worker with its own definition of done,
+// limits and guardrails. --dry-run only checks the file and shows what would start.
+async function runFile(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["repo"]);
+  const file = rest[0];
+  if (!file) throw new UsageError("run needs a task file (YAML or JSON)");
+  const { readFile } = await import("node:fs/promises");
+  const { parseTaskFile, TaskFileError } = await import("../scheduler/tasks.js");
+  let tasks;
+  try {
+    tasks = parseTaskFile(await readFile(resolve(io.cwd, file), "utf8"), file);
+  } catch (e) {
+    if (e instanceof TaskFileError || (e as NodeJS.ErrnoException).code === "ENOENT") throw new UsageError((e as Error).message);
+    throw e;
+  }
+  const describe = (t: (typeof tasks)[number]) => [
+    t.agent ?? "default agent", t.spec.doneWhen ? `done when: ${t.spec.doneWhen}` : "",
+    t.spec.minutes ? `${t.spec.minutes} min` : "", t.spec.tokens ? `${t.spec.tokens} tokens` : "",
+    t.spec.attempts ? `${t.spec.attempts} attempts` : "", t.spec.paths ? `paths ${t.spec.paths.join(" ")}` : "",
+  ].filter(Boolean).join(", ");
+  if (flags.get("dry-run") === true) {
+    for (const t of tasks) io.out(`${t.name}  (${describe(t)})`);
+    io.out(`${tasks.length} tasks; nothing started`);
+    return 0;
+  }
+  await ensureDaemon(io);
+  const repo = await repoTop(resolve(io.cwd, typeof flags.get("repo") === "string" ? (flags.get("repo") as string) : "."));
+  const from = io.env.RIVET_SESSION_ID?.trim();
+  for (const t of tasks) {
+    const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
+      repo, task: t.goal, name: t.name, spec: t.spec, ...(t.agent ? { agent: t.agent } : {}), ...(t.model ? { model: t.model } : {}),
+      ...(t.base ? { base: t.base } : {}), ...(from ? { from } : {}),
+    }, RUN_TIMEOUT_MS) as { runId: string };
+    io.out(`${result.runId}  ${t.name}  (${describe(t)})`);
+  }
+  io.out(`started ${tasks.length} workers; follow them with rivet status`);
+  return 0;
+}
+
+// Saved prompts and commands for this repository's project.
+async function cue(args: string[], io: CliIo): Promise<number> {
+  const [action, name, ...more] = args;
+  const base = `/api/v1/projects/${encodeURIComponent(await projectOf(io))}/cues`;
+  if (action === "list") {
+    const { cues } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { cues: { name: string; type: string; text: string }[] };
+    if (cues.length === 0) io.out("no cues");
+    for (const c of cues) io.out(`${c.name.padEnd(20)} ${c.type.padEnd(8)} ${c.text.split(/\r?\n/)[0]!.slice(0, 80)}`);
+    return 0;
+  }
+  if (!name) throw new UsageError("cue needs list, add <name>, rm <name> or run <name>");
+  const path = `${base}/${encodeURIComponent(name)}`;
+  if (action === "add") {
+    const { flags } = parseFlags(more, ["prompt", "command"]);
+    const prompt = flags.get("prompt");
+    const command = flags.get("command");
+    if ((typeof prompt === "string") === (typeof command === "string")) throw new UsageError('cue add needs one of --prompt "<text>" or --command "<shell command>"');
+    await callDaemon(io.env, "PUT", path, typeof prompt === "string" ? { type: "agent", text: prompt } : { type: "command", text: command }, COMMAND_TIMEOUT_MS);
+    io.out(`cue ${name} saved`);
+    return 0;
+  }
+  if (action === "rm") {
+    await callDaemon(io.env, "DELETE", path, undefined, COMMAND_TIMEOUT_MS);
+    io.out(`cue ${name} removed`);
+    return 0;
+  }
+  if (action !== "run") throw new UsageError("cue needs list, add <name>, rm <name> or run <name>");
+  const { flags } = parseFlags(more, ["session", "agent"]);
+  const { cues } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { cues: { name: string; type: string; text: string }[] };
+  const found = cues.find((c) => c.name === name);
+  if (!found) throw new UsageError(`no cue "${name}" in this project (see rivet cue list)`);
+  const session = typeof flags.get("session") === "string" ? flags.get("session") as string : undefined;
+  if (found.type === "agent") {
+    // To a running session, or as the task of a new worker.
+    if (session) return send(["--session", session, "--message", found.text], io);
+    const agent = typeof flags.get("agent") === "string" ? ["--agent", flags.get("agent") as string] : [];
+    return startSession(["--name", name, ...agent, found.text], io, "worker");
+  }
+  // A command runs here, in the session's worktree or at the repository's top.
+  let cwd = await repoTop(io.cwd);
+  if (session) {
+    const runId = session.slice(0, session.indexOf("-") > 0 ? session.indexOf("-") : undefined);
+    const { run } = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as { run: Run };
+    cwd = run.node.worktree;
+  }
+  const { spawn } = await import("node:child_process");
+  const code = await new Promise<number | null>((done, fail) => {
+    const child = spawn(found.text, { cwd, shell: true, stdio: "inherit" });
+    child.once("error", fail);
+    child.once("close", done);
+  });
+  return code === 0 ? 0 : 1;
+}
+
 const DETACH_KEY = "\u001d"; // Ctrl-]
 
 // Your terminal becomes the session's: its screen streams in, your keys go to it.
@@ -428,7 +638,7 @@ async function panes(io: CliIo): Promise<number> {
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["spawn", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -449,6 +659,24 @@ async function ensureDaemon(io: CliIo): Promise<void> {
     if (Date.now() > end) throw new Error(`the daemon did not come up within ${AUTOSTART_WAIT_MS / 1000} s; see ${join(dataDirFrom(io.env), "daemon.log")}`);
     await new Promise((r) => setTimeout(r, 150));
   }
+}
+
+// Logging in is the agent CLI's own: Rivet runs its login in this terminal.
+const LOGIN_ARGS: Record<string, string[]> = { claude: ["auth", "login"], codex: ["login"] };
+
+async function login(args: string[], io: CliIo): Promise<number> {
+  const name = args[0];
+  if (!name || !LOGIN_ARGS[name]) throw new UsageError("login needs claude or codex");
+  const { findClaude, findCodex } = await import("../agents/locate.js");
+  const binary = name === "claude" ? findClaude() : findCodex();
+  const { spawn } = await import("node:child_process");
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const child = spawn(binary, [...LOGIN_ARGS[name]!, ...args.slice(1)], { stdio: "inherit", windowsHide: false });
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  if (code === 0) io.out(`${name} is logged in; check with rivet doctor`);
+  return code === 0 ? 0 : 1;
 }
 
 async function doctorCommand(io: CliIo): Promise<number> {
@@ -478,15 +706,33 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "hooks": return await hooks(args, io);
       case "report": return await report(args, io);
       case "send": return await send(args, io);
+      case "check": return await check(io);
+      case "review": return await review(args, io);
+      case "delegate": return await delegate(args, io);
+      case "cue": return await cue(args, io);
+      case "switch": {
+        const { flags, rest } = parseFlags(args, ["model"]);
+        const [runId, agent] = rest;
+        if (!runId || !agent) throw new UsageError("switch needs a run id and claude or codex");
+        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/switch`,
+          { agent, ...(typeof flags.get("model") === "string" ? { model: flags.get("model") } : {}) }, COMMAND_TIMEOUT_MS);
+        io.out(`${runId} now runs ${agent}, picking up from where the work stands`);
+        return 0;
+      }
+      case "run": return await runFile(args, io);
+      case "automation": return await automation(args, io);
       case "daemon": return await daemon(args, io);
       case "doctor": return await doctorCommand(io);
+      case "login": return await login(args, io);
       case "spawn": return await startSession(args, io, "worker");
       case "orchestrator": return await startSession(args, io, "orchestrator");
       case "stop": {
-        const [runId] = args;
+        const { flags, rest } = parseFlags(args, []);
+        const runId = rest[0];
         if (!runId) throw new UsageError("stop needs a run id");
-        await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/stop`, undefined, COMMAND_TIMEOUT_MS);
-        io.out(`stopped ${runId}`);
+        const { workers } = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/stop`,
+          { keepWorkers: flags.get("keep-workers") === true }, COMMAND_TIMEOUT_MS) as { workers?: string[] };
+        io.out(`stopped ${runId}${workers?.length ? ` and its workers ${workers.join(", ")}` : ""}`);
         return 0;
       }
       case "attach": return await attach(args, io);

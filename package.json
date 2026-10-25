@@ -21,6 +21,7 @@
     "rivet": "dist/cli/main.js"
   },
   "dependencies": {
-    "node-pty": "^1.1.0"
+    "node-pty": "^1.1.0",
+    "yaml": "^2.8.1"
   }
 }

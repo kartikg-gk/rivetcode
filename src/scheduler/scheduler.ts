@@ -1,15 +1,17 @@
 import { existsSync } from "node:fs";
 import { git } from "../git.js";
 import type { Agent } from "../agents/agent.js";
-import { abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand } from "../merge.js";
+import { abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand, workingTree } from "../merge.js";
 import { normalizePermission } from "../agents/command.js";
 import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
-import { checkNote, conflictPrompt, orchestratorPrompt, workerPrompt } from "./prompts.js";
+import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
+import { outsidePaths } from "./tasks.js";
+import { conversationFile, runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
@@ -36,6 +38,14 @@ export function commandRules(command: string): string[] {
     else if (!runner && !INTERPRETERS.has(words[0]!)) rules.add(`Bash(${words[0]}:*)`);
   }
   return [...rules];
+}
+
+// A model name only means something to its own agent: "claude.model" and "codex.model"
+// set each, and "worker.model" applies to the project's default agent only.
+export function modelFor(agent: Node["agent"], config: Record<string, string>): string | undefined {
+  const own = config[`${agent}.model`]?.trim();
+  if (own) return own;
+  return agent === (config["worker.agent"]?.trim() || "claude") ? config["worker.model"]?.trim() || undefined : undefined;
 }
 
 // What an orchestrator brought back by resume is told before anything else.
@@ -115,16 +125,19 @@ export function createScheduler(d: SchedulerDeps) {
     const agent = d.agents(node.agent);
     const launchId = newLaunchId();
     const config = await d.write(() => d.store.getConfig(run.project));
-    const model = run.model ?? config["worker.model"]?.trim();
+    const model = run.model ?? modelFor(node.agent, config);
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
     const worker = run.role === "worker";
     if (worker) {
       // The agent must be able to run what Rivet will judge its work by.
-      for (const command of [config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
+      for (const command of [run.spec?.doneWhen ?? config.check, config.test].map((c) => c?.trim()).filter((c): c is string => !!c)) {
         for (const rule of commandRules(command)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       }
-      const check = config.check?.trim();
-      if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check);
+      // A worker with a pull request may read its feedback itself (see checkPr).
+      const pr = config["pr.feedback"] !== "full" ? await d.write(() => d.store.getPr(run.id)) : null;
+      if (pr) for (const rule of feedbackRules(pr)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
+      const check = (run.spec?.doneWhen ?? config.check)?.trim();
+      if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check, config["verify.reuse"] !== "off");
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
@@ -134,6 +147,7 @@ export function createScheduler(d: SchedulerDeps) {
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
       ...(model ? { model } : {}),
       ...(allowedTools.length ? { allowedTools } : {}),
+      ...(run.spec?.denyTools?.length ? { disallowedTools: run.spec.denyTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
     };
     const argv = o.resume
@@ -213,8 +227,40 @@ export function createScheduler(d: SchedulerDeps) {
     });
   }
 
+  // The project's check, then its tests, on a worker's worktree as it is now.
+  async function verify(run: Run): Promise<{ ok: true } | { ok: false; why: string }> {
+    const config = await d.write(() => d.store.getConfig(run.project));
+    // A task's own definition of done stands in for the project's check.
+    const check = run.spec?.doneWhen ?? config.check;
+    for (const [what, command, timeout] of [[run.spec?.doneWhen ? "done_when" : "check", check, checkTimeout], ["tests", config.test, testTimeout]] as const) {
+      if (!command) continue;
+      const result = await runCommand(command, run.node.worktree, timeout);
+      if (!result.ok) return { ok: false, why: `${what} "${command}" failed on the finished work:\n${result.output}` };
+    }
+    return { ok: true };
+  }
+
+  // Worktree states whose check and tests a worker got to pass with "rivet check".
+  const passed = new Map<string, string>();
+
+  // "rivet check" from a worker: Rivet runs the check and tests for it and remembers a
+  // pass, so the same files are not checked again when it reports done.
+  async function agentCheck(runId: string): Promise<{ ok: boolean; output: string }> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker runs the check");
+    const tree = await workingTree(run.node.worktree);
+    const result = await verify(run);
+    if (!result.ok) {
+      passed.delete(runId);
+      return { ok: false, output: result.why };
+    }
+    passed.set(runId, tree);
+    return { ok: true, output: "check and tests passed" };
+  }
+
   // A worker says it is done: its leftovers are committed, the check and the tests
-  // decide, and a pass opens or updates its pull request.
+  // decide, and a pass opens or updates its pull request. A pass the worker already got
+  // from "rivet check" on these exact files counts, unless the project turned that off.
   async function workFinished(runId: string): Promise<void> {
     const run = await load(runId);
     if (run.node.status !== "running" || run.node.finishedAt) return;
@@ -222,13 +268,28 @@ export function createScheduler(d: SchedulerDeps) {
     // Any failure noted on an earlier attempt is over now.
     await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString(), summary: null }));
     const config = await d.write(() => d.store.getConfig(run.project));
-    for (const [what, command, timeout] of [["check", config.check, checkTimeout], ["tests", config.test, testTimeout]] as const) {
-      if (!command) continue;
-      const result = await runCommand(command, run.node.worktree, timeout);
-      if (!result.ok) {
-        await workFailed(runId, `${what} "${command}" failed on the finished work:\n${result.output}`);
+    // A guardrail on paths: work that changed other files goes back.
+    if (run.spec?.paths?.length) {
+      const outside = outsidePaths(await filesChanged(run), run.spec.paths);
+      if (outside.length) {
+        await workFailed(runId, `it changed files outside the allowed paths (${run.spec.paths.join(", ")}): ${outside.join(", ")}. Undo those changes, or make them inside the allowed paths.`);
         return;
       }
+    }
+    const reused = config["verify.reuse"] !== "off" && passed.get(runId) === await workingTree(run.node.worktree);
+    passed.delete(runId);
+    if (!reused) {
+      const result = await verify(run);
+      if (!result.ok) {
+        await workFailed(runId, result.why);
+        return;
+      }
+    }
+    // Work that changed nothing (the base already had it) is done, with no pull request to open.
+    if (!(await hasChanges(run))) {
+      await transition(runId, "done", `no changes: ${run.base} already has what the task asks for`);
+      await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} finished with no changes: ${run.base} already has what it was asked for.`);
+      return;
     }
     await transition(runId, "done");
     // Checked now as well as on the timer: its work may only now be committed.
@@ -243,7 +304,7 @@ export function createScheduler(d: SchedulerDeps) {
   async function workFailed(runId: string, why: string): Promise<void> {
     const run = await load(runId);
     if (run.node.status !== "running") return;
-    if (run.node.attempts < MAX_ATTEMPTS) {
+    if (run.node.attempts < (run.spec?.attempts ?? MAX_ATTEMPTS)) {
       await transition(runId, "failed", why);
       await runSession(runId, why);
       return;
@@ -260,6 +321,14 @@ export function createScheduler(d: SchedulerDeps) {
     if (d.launches.get(sessionId) !== launchId) return;
     const waiter = exitWaiters.get(launchId);
     const runId = sessionId.slice(0, sessionId.indexOf("-"));
+    if (sessionId === reviewSession(runId)) {
+      await reviewerExited(runId);
+      return;
+    }
+    if (sessionId === partnerSession(runId)) {
+      await partnerExited(runId, code);
+      return;
+    }
     await d.write(() => d.store.setActivity(runId, NODE_ID, "exited"));
     if (waiter) {
       exitWaiters.delete(launchId);
@@ -273,6 +342,12 @@ export function createScheduler(d: SchedulerDeps) {
     // An orchestrator's exit ends nothing but its own conversation.
     if (run.role !== "worker") return;
     if (code === 0 || doneReported.has(sessionId)) {
+      // Its partner is still at work: the worker's turn is not its finish. It is resumed
+      // with the partner's result once that comes.
+      if (partners.has(runId) && d.runtime.isAlive(partnerSession(runId))) {
+        awaitingPartner.add(runId);
+        return;
+      }
       if (await messagesAtTurnEnd(run)) return;
       await track(workFinished(runId));
     } else await workFailed(runId, `agent exited with code ${code}\n${lastOutput(sessionId)}`);
@@ -299,6 +374,20 @@ export function createScheduler(d: SchedulerDeps) {
     }
     for (const m of queued) await d.write(() => d.store.markDelivered(m.id));
     return true;
+  }
+
+  // A worker in a terminal stopped at a permission question: its orchestrator is told
+  // once per question, since nothing goes on until someone answers.
+  async function onBlocked(runId: string): Promise<void> {
+    const run = await load(runId);
+    if (run.role !== "worker" || !run.orchestrator) return;
+    const session = sessionOf(run);
+    const shown = (d.runtime.output(session, 12)?.lines ?? []).join("\n").trim();
+    await tellOrchestrator(run, [
+      `Worker ${run.id}${run.name ? ` (${run.name})` : ""} is waiting for a permission answer and does nothing until it gets one.`,
+      ...(shown ? ["Its screen ends with:", shown] : []),
+      `Answer it with rivet send --session ${session} --message "<the choice's number>", or tell the user.`,
+    ].join("\n"));
   }
 
   // Hands a worker's news to the orchestrator that started it, if it has one.
@@ -332,6 +421,7 @@ export function createScheduler(d: SchedulerDeps) {
     shuttingDown = true;
     if (watcher) clearInterval(watcher);
     if (radarTimer) clearInterval(radarTimer);
+    if (limitTimer) clearInterval(limitTimer);
     await d.runtime.stopAll();
     await idle();
   }
@@ -356,6 +446,12 @@ export function createScheduler(d: SchedulerDeps) {
     return result.ok ? { ok: true, reason: "" } : { ok: false, reason: result.reason };
   }
 
+  // Whether the worker's branch has commits its base does not.
+  async function hasChanges(run: Run): Promise<boolean> {
+    const count = await git(["rev-list", "--count", `${run.base}..HEAD`], run.node.worktree).catch(() => "1");
+    return Number(count.trim()) > 0;
+  }
+
   async function filesChanged(run: Run): Promise<string[]> {
     const out = await git(["diff", "--name-only", `${run.base}...${run.node.branch}`], run.repo).catch(() => "");
     return out.split(/\r?\n/).filter(Boolean);
@@ -368,6 +464,7 @@ export function createScheduler(d: SchedulerDeps) {
       "",
       `Done by one agent (${run.node.agent}) in its own worktree on \`${run.node.branch}\`.`,
       ...(files.length ? ["", `Files: ${files.map((f) => `\`${f}\``).join(", ")}`] : []),
+      ...(run.issue ? ["", `Closes #${run.issue}`] : []),
     ].join("\n");
   }
 
@@ -379,6 +476,7 @@ export function createScheduler(d: SchedulerDeps) {
     const node = run.node;
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker opens a pull request");
     if (node.status !== "done") throw new SchedulerError(409, `run ${runId} is not done (it is ${node.status})`);
+    if (!(await hasChanges(run))) throw new SchedulerError(409, `run ${runId} changed nothing, so there is no pull request to open`);
     const before = await headOf(node.worktree);
     try {
       await git(["fetch", "-q", "origin", run.base], node.worktree);
@@ -452,15 +550,18 @@ export function createScheduler(d: SchedulerDeps) {
       return status;
     }
     const key = `${status}:${facts.mergeability}:${facts.headSha}`;
+    if (node.status === "done" && facts.open && (status === "pr_open" || status === "mergeable" || status === "approved" || status === "review_pending")) {
+      await autoReview(run, facts.headSha).catch(report);
+    }
     // Work is already under way, or this exact state was handled before.
     if (pr.handled === key || node.status !== "done") return status;
+    // By default the worker is told where the feedback is and reads it itself; "full" has
+    // Rivet fetch it and hand it over.
+    const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
     if (status === "ci_failed") {
-      const paths = await github.failedPaths(pr.number);
-      await reopen(runId, `CI failed on the pull request${paths.length ? ` in: ${paths.join(", ")}` : ""}. Fix it.`);
+      await reopen(runId, ciFeedback(pr, full ? await github.failedPaths(pr.number) : undefined));
     } else if (status === "changes_requested") {
-      const comments = await github.reviewComments(pr.number);
-      const text = comments.map((c) => `${c.path}${c.line ? `:${c.line}` : ""}: ${c.body}`).join("\n");
-      await reopen(runId, `Review comments on the pull request:\n${text}\nAddress them.`);
+      await reopen(runId, reviewFeedback(pr, full ? await github.reviewComments(pr.number) : undefined));
     } else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") {
       await publish(runId).catch(report);
     }
@@ -516,6 +617,213 @@ export function createScheduler(d: SchedulerDeps) {
     radarTimer.unref();
   }
 
+  // --- Reviewer: a second agent reviews a worker's pull request in the worker's worktree,
+  // read-only. Rivet posts its review and sends the changes it requires to the worker.
+
+  const reviewSession = (runId: string) => sessionIdOf(runId, "review");
+  // Commands a reviewer may run: reading the code and its history, and submitting.
+  const REVIEWER_TOOLS = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(rivet review submit:*)"];
+  // Failed automatic passes on one commit before Rivet stops trying it.
+  const REVIEW_TRIES = 3;
+
+  // sha: the pull request's head as GitHub reports it (automatic passes are counted by it);
+  // by hand, the worktree's head.
+  async function startReview(runId: string, trigger: "auto" | "manual", headSha?: string): Promise<number> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker's pull request is reviewed");
+    if (run.node.status !== "done") throw new SchedulerError(409, `run ${runId} is not done (it is ${run.node.status})`);
+    const pr = await d.write(() => d.store.getPr(runId));
+    if (!pr) throw new SchedulerError(409, `run ${runId} has no pull request to review`);
+    const session = reviewSession(runId);
+    if (d.runtime.isAlive(session)) throw new SchedulerError(409, "a review is already running");
+    const sha = headSha ?? await headOf(run.node.worktree);
+    const config = await d.write(() => d.store.getConfig(run.project));
+    const agentName = (config["review.agent"]?.trim() || run.node.agent) as Node["agent"];
+    const agent = d.agents(agentName);
+    const id = await d.write(() => d.store.startReview(runId, sha, trigger));
+    const launchId = newLaunchId();
+    const argv = await agent.launchCommand({
+      sessionId: session, workspace: run.node.worktree, headless: true, permission: "read-only",
+      allowedTools: REVIEWER_TOOLS, prompt: reviewerPrompt(run, pr, sha),
+      ...(modelFor(agentName, config) ? { model: modelFor(agentName, config)! } : {}),
+    });
+    d.launches.set(session, launchId);
+    try {
+      await d.runtime.start({
+        sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
+        env: agentEnv({ runId, nodeId: "review", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
+      });
+    } catch (e) {
+      await d.write(() => d.store.endReview(id, { status: "failed", body: `could not start: ${(e as Error).message}` }));
+      throw e;
+    }
+    return id;
+  }
+
+  // A reviewer that exits without submitting has failed that pass.
+  async function reviewerExited(runId: string): Promise<void> {
+    const running = (await d.write(() => d.store.reviewsOf(runId))).filter((r) => r.status === "running");
+    for (const r of running) {
+      await d.write(() => d.store.endReview(r.id, { status: "failed", body: `the reviewer exited without submitting\n${lastOutput(reviewSession(runId))}` }));
+    }
+  }
+
+  // "rivet review submit" from the reviewer. Required changes go to the worker first, so
+  // the pull request watcher finds it at work and does not act on the same comments.
+  async function submitReview(runId: string, o: { verdict: "approved" | "changes_requested"; summary: string; comments: { path: string; line: number; body: string }[] }): Promise<{ githubReviewId?: number }> {
+    const run = await load(runId);
+    const review = (await d.write(() => d.store.reviewsOf(runId))).filter((r) => r.status === "running").at(-1);
+    if (!review) throw new SchedulerError(409, "no review of this run is running");
+    if (o.verdict === "changes_requested" && o.comments.length === 0) throw new SchedulerError(400, "changes_requested needs at least one --comment");
+    const pr = (await d.write(() => d.store.getPr(runId)))!;
+    const body = [`Review by ${run.node.agent === "fake" ? "a reviewer" : "Rivet's reviewer"}: ${o.verdict === "approved" ? "ready" : "changes requested"}.`, "", o.summary].join("\n");
+    if (o.verdict === "changes_requested" && run.node.status === "done") {
+      await reopen(runId, [
+        `A reviewer asked for changes on pull request #${pr.number}. Make each one:`,
+        ...o.comments.map((c) => `- ${c.path}:${c.line}: ${c.body}`),
+      ].join("\n"));
+    }
+    let githubReviewId: number | undefined;
+    if (d.github) {
+      githubReviewId = await (await d.github(run)).postReview(pr.number, { commitId: review.sha, body, comments: o.comments })
+        .catch((e) => { report(e); return undefined; });
+    }
+    await d.write(() => d.store.endReview(review.id, { status: "complete", verdict: o.verdict, body, ...(githubReviewId ? { githubReviewId } : {}) }));
+    if (o.verdict === "approved") await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""}: its pull request #${pr.number} passed review.`);
+    void stopSession(reviewSession(runId)).catch(report);
+    return githubReviewId ? { githubReviewId } : {};
+  }
+
+  // With review=auto, a worker's pull request is reviewed once per commit, after the
+  // worker is done and while nothing else is asked of it.
+  async function autoReview(run: Run, sha: string): Promise<void> {
+    const config = await d.write(() => d.store.getConfig(run.project));
+    if (config.review !== "auto" || d.runtime.isAlive(reviewSession(run.id))) return;
+    const passes = (await d.write(() => d.store.reviewsOf(run.id))).filter((r) => r.sha === sha);
+    if (passes.some((r) => r.status !== "failed")) return;
+    if (passes.filter((r) => r.trigger === "auto").length >= REVIEW_TRIES) return;
+    await startReview(run.id, "auto", sha);
+  }
+
+  // --- Delegation: a worker hands part of its task (or a review of its changes) to a
+  // partner agent in its own worktree. The partner gets only that task, never commits, and
+  // its result comes back to the worker as a message.
+
+  const partnerSession = (runId: string) => sessionIdOf(runId, "partner");
+  // The partner of each worker while it works: its agent, whether it reviews, its report.
+  const partners = new Map<string, { agent: Node["agent"]; review: boolean; note?: string }>();
+  // Workers whose turn ended while their partner worked; they go on when it is done.
+  const awaitingPartner = new Set<string>();
+  const PARTNER_REVIEW_TOOLS = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(rivet report:*)"];
+
+  async function delegate(runId: string, o: { task: string; agent?: Node["agent"]; model?: string; review?: boolean }): Promise<{ session: string; agent: Node["agent"] }> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker delegates");
+    if (run.node.status !== "running") throw new SchedulerError(409, `run ${runId} is not working (it is ${run.node.status})`);
+    const session = partnerSession(runId);
+    if (d.runtime.isAlive(session)) throw new SchedulerError(409, "this worker already has a partner at work; wait for its result");
+    if (!o.review && !o.task.trim()) throw new SchedulerError(400, "delegate needs a task");
+    const config = await d.write(() => d.store.getConfig(run.project));
+    const agentName = o.agent ?? run.node.agent;
+    const agent = d.agents(agentName);
+    const model = o.model ?? modelFor(agentName, config);
+    const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    const launchId = newLaunchId();
+    const argv = await agent.launchCommand({
+      sessionId: session, workspace: run.node.worktree, headless: true,
+      permission: o.review ? "read-only" : normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
+      allowedTools: o.review ? PARTNER_REVIEW_TOOLS : allowedTools,
+      prompt: partnerPrompt(run, o.task, !!o.review, agentName),
+      ...(model ? { model } : {}),
+    });
+    partners.set(runId, { agent: agentName, review: !!o.review });
+    d.launches.set(session, launchId);
+    try {
+      await d.runtime.start({
+        sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
+        env: agentEnv({ runId, nodeId: "partner", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
+      });
+    } catch (e) {
+      partners.delete(runId);
+      throw e;
+    }
+    return { session, agent: agentName };
+  }
+
+  // "rivet report" from a partner: its note is its result.
+  function partnerReport(runId: string, kind: string, note?: string): void {
+    const partner = partners.get(runId);
+    if (partner && note) partner.note = `${kind === "done" ? "" : `(${kind}) `}${note}`;
+  }
+
+  // The partner's result goes to the worker that delegated, as a message.
+  async function partnerExited(runId: string, code: number | null): Promise<void> {
+    const partner = partners.get(runId);
+    partners.delete(runId);
+    if (!partner) return;
+    const what = partner.review ? "review of your changes" : "delegated task";
+    const result = partner.note ?? (lastOutput(partnerSession(runId)).trim() || `it exited with code ${code} and reported nothing`);
+    const message = `Your partner (${partner.agent}) finished the ${what}${code === 0 || partner.note ? "" : " with an error"}:\n${result}`;
+    const id = await d.write(() => d.store.queueMessage(runId, NODE_ID, message, partnerSession(runId)));
+    if (id !== null) await deliverQueued(runId).catch(report);
+    if (awaitingPartner.delete(runId)) {
+      const run = await load(runId);
+      if (run.node.status !== "running" || d.runtime.isAlive(sessionOf(run))) return;
+      // Resumed with the result; without a conversation to resume, its work is taken as is.
+      if (!(await messagesAtTurnEnd(run))) await track(workFinished(runId));
+    }
+  }
+
+  // --- Limits from a task file: a worker past its time or token budget is stopped and
+  // escalated with the reason.
+  async function checkLimits(now = Date.now()): Promise<void> {
+    const runs = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id))
+      .filter((r) => r.role === "worker" && r.node.status === "running" && (r.spec?.minutes || r.spec?.tokens)));
+    for (const run of runs) {
+      let why: string | undefined;
+      if (run.spec!.minutes && run.node.startedAt && now - Date.parse(run.node.startedAt) > run.spec!.minutes * 60_000) {
+        why = `it reached its time limit of ${run.spec!.minutes} minutes`;
+      } else if (run.spec!.tokens) {
+        const used = runUsage(await d.write(() => d.store.conversations(run.id))).inputEquivalent;
+        if (used > run.spec!.tokens) why = `it used ${used} input-equivalent tokens, over its limit of ${run.spec!.tokens}`;
+      }
+      if (!why) continue;
+      await stopSession(sessionOf(run));
+      await transition(run.id, "escalated", `stopped: ${why}`).catch(report);
+      await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} was stopped: ${why}.`);
+    }
+  }
+
+  let limitTimer: NodeJS.Timeout | undefined;
+  function watchLimits(intervalMs: number): void {
+    limitTimer = setInterval(() => { void checkLimits().catch(report); }, intervalMs);
+    limitTimer.unref();
+  }
+
+  // --- Switching a worker to another agent: the running one stops, the new one starts in
+  // the same worktree, branch and pull request with a handoff of where things are.
+  async function switchAgent(runId: string, to: Node["agent"], model?: string): Promise<void> {
+    const run = await load(runId);
+    if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
+    if (run.node.status === "done" || run.node.status === "pending") throw new SchedulerError(409, `run ${runId} is ${run.node.status}; switch a worker that is working, failed or escalated`);
+    if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
+    const from = run.node.agent;
+    const conversation = run.node.agentSessionId ? conversationFile(from, run.node.agentSessionId) : null;
+    await stopSession(sessionOf(run));
+    const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
+    const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
+    await d.write(() => {
+      d.store.updateNode(runId, NODE_ID, { agent: to, agentSessionId: null });
+      const fresh = d.store.loadRun(runId);
+      const { model: _old, ...rest } = fresh;
+      d.store.saveRun(model ? { ...rest, model } : rest);
+    });
+    if (run.node.status !== "running") await transition(runId, "running");
+    const switched = await load(runId);
+    await launch(switched, switchPrompt(switched, { agent: from, conversation, log, status }));
+    await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
+  }
+
   let watcher: NodeJS.Timeout | undefined;
   // Looks at every open pull request on a timer until shutdown.
   function watchPrs(intervalMs: number): void {
@@ -556,11 +864,23 @@ export function createScheduler(d: SchedulerDeps) {
 
   // The user stops a session for good: a worker waits for resume, an orchestrator is over.
   // Neither comes back on its own when the daemon restarts.
-  async function stopRun(runId: string): Promise<void> {
+  // Stopping an orchestrator also stops the workers it started that are still working,
+  // unless keepWorkers: their work was its plan, and a new orchestrator would not know them.
+  async function stopRun(runId: string, o: { keepWorkers?: boolean } = {}): Promise<string[]> {
     const run = await load(runId);
     await stopSession(sessionOf(run));
-    if (run.node.status !== "running") return;
-    await transition(runId, run.role === "orchestrator" ? "done" : "escalated", "stopped by the user");
+    if (run.node.status === "running") {
+      await transition(runId, run.role === "orchestrator" ? "done" : "escalated", "stopped by the user");
+    }
+    if (run.role !== "orchestrator" || o.keepWorkers) return [];
+    const session = sessionOf(run);
+    const workers = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id))
+      .filter((r) => r.orchestrator === session && r.node.status === "running"));
+    for (const w of workers) {
+      await stopSession(sessionOf(w));
+      await transition(w.id, "escalated", `stopped with its orchestrator ${run.id}`).catch(report);
+    }
+    return workers.map((w) => w.id);
   }
 
   // After a daemon restart (or a resume): finish what was in flight. A session that never
@@ -585,7 +905,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar };
+  return { launch, startRun, onBlocked, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

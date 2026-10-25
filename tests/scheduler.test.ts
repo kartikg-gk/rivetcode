@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getAgent, type Agent } from "../src/agents/agent.js";
-import { commandRules } from "../src/scheduler/scheduler.js";
+import { commandRules, modelFor } from "../src/scheduler/scheduler.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import type { Run } from "../src/store.js";
@@ -30,7 +30,7 @@ afterEach(async () => {
   await removeRepo(data);
 });
 
-async function start(claude?: Agent, more: { radarMs?: number } = {}): Promise<void> {
+async function start(claude?: Agent, more: { radarMs?: number; limitMs?: number } = {}): Promise<void> {
   daemon = await startDaemon({
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, ...more,
     agents: (name) => (name === "claude" && claude ? claude : getAgent("fake")),
@@ -180,6 +180,27 @@ describe("an orchestrator", () => {
     await api("POST", `/api/v1/runs/${orchestrator}/stop`);
   });
 
+  it("is told once when a worker waits for a permission answer", async () => {
+    await start();
+    const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const worker = await spawn({ stayFor: 60_000 }, { from: `${orchestrator}-agent` });
+    await new Promise((r) => setTimeout(r, 300));
+    for (const state of ["blocked", "blocked"]) await api("POST", `/api/v1/sessions/${worker}-agent/activity`, { state });
+    await new Promise((r) => setTimeout(r, 400));
+    const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
+    expect(inbox.split(/\r?\n/).filter((l) => l.includes("is waiting for a permission answer"))).toHaveLength(1);
+    expect(inbox).toContain(`Answer it with rivet send --session ${worker}-agent --message`);
+    await api("POST", `/api/v1/runs/${orchestrator}/stop`, {});
+  });
+
+  it("refuses a model that belongs to the other agent", async () => {
+    await start();
+    const codex = await api("POST", "/api/v1/runs", { repo, task: "x", agent: "codex", model: "claude-opus-5-5" });
+    expect(codex.status).toBe(400);
+    expect(codex.json.error).toMatch(/model "claude-opus-5-5" is not a codex model; leave --model off/);
+    expect((await api("POST", "/api/v1/runs", { repo, task: "x", agent: "claude", model: "gpt-5-codex" })).status).toBe(400);
+  });
+
   it("refuses an unknown role", async () => {
     await start();
     expect((await api("POST", "/api/v1/runs", { repo, task: "t", role: "boss" })).status).toBe(400);
@@ -211,7 +232,7 @@ describe("resume and recovery", () => {
     await start();
     const runId = await spawn({ stayFor: 60_000 });
     await new Promise((r) => setTimeout(r, 300));
-    expect((await api("POST", `/api/v1/runs/${runId}/stop`)).status).toBe(204);
+    expect((await api("POST", `/api/v1/runs/${runId}/stop`)).status).toBe(200);
     expect((await getRun(runId)).node).toMatchObject({ status: "escalated", attempts: 1, summary: "stopped by the user" });
     await daemon!.stop();
     daemon = undefined;
@@ -303,8 +324,54 @@ describe("what a worker may run", () => {
       "Bash(rivet:*)", "Bash(git:*)", "Bash(node --version)", "Bash(node --version:*)", "Bash(git --version)", "Bash(git --version:*)",
     ]);
     expect(seen[0]!.prompt).toMatch(/^Your task: write a\.txt/);
-    expect(seen[0]!.prompt).toMatch(/Before you report done, run the project's check and make it pass: node --version/);
+    expect(seen[0]!.prompt).toMatch(/Before you report done, run "rivet check" and make it pass: it runs the project's check \(node --version\) and tests\./);
     expect(seen[0]!.model).toBe("haiku");
+    // With reuse off it is told to run the check itself, as before.
+    await setCfg("verify.reuse", "off");
+    await settled((await api("POST", "/api/v1/runs", { repo, task: "write a.txt", agent: "claude" })).json.runId);
+    expect(seen[1]!.prompt).toMatch(/Before you report done, run the project's check and make it pass: node --version/);
+  });
+});
+
+describe("rivet check", () => {
+  // Every run of the check adds a line to a file outside the worktree.
+  async function countingCheck(): Promise<string> {
+    const log = join(data, "checks.log");
+    await setCfg("check", `node -e "require('fs').appendFileSync(process.argv[1], 'x\\n')" "${log}"`);
+    return log;
+  }
+  const runs = async (log: string) => (await readFile(log, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+
+  it("counts as Rivet's own check when the worker finishes on the files it checked", async () => {
+    await start();
+    const log = await countingCheck();
+    const runId = await spawn({ files: { "a.txt": "a" }, stayFor: 1500 });
+    await new Promise((r) => setTimeout(r, 500));
+    // The work is still uncommitted here; Rivet commits it at done, and the pass still counts.
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/check`)).json).toEqual({ ok: true, output: "check and tests passed" });
+    expect((await settled(runId)).node.status).toBe("done");
+    expect(await runs(log)).toBe(1);
+  });
+
+  it("is checked again when the project turned reuse off", async () => {
+    await start();
+    const log = await countingCheck();
+    await setCfg("verify.reuse", "off");
+    const runId = await spawn({ files: { "a.txt": "a" }, stayFor: 1500 });
+    await new Promise((r) => setTimeout(r, 500));
+    await api("POST", `/api/v1/sessions/${runId}-agent/check`);
+    expect((await settled(runId)).node.status).toBe("done");
+    expect(await runs(log)).toBe(2);
+  });
+
+  it("reports a failure with its output and does not count it", async () => {
+    await start();
+    await setCfg("check", `node -e "console.log('lint broke'); process.exit(1)"`);
+    const runId = await spawn({ files: { "a.txt": "a" }, stayFor: 1500 });
+    await new Promise((r) => setTimeout(r, 500));
+    const res = (await api("POST", `/api/v1/sessions/${runId}-agent/check`)).json;
+    expect(res.ok).toBe(false);
+    expect(res.output).toMatch(/lint broke/);
   });
 });
 
@@ -321,6 +388,18 @@ describe("messages to a headless agent", () => {
       restoreCommand: async (cfg) => [process.execPath, script, "--", JSON.stringify({ files: { "resumed.txt": cfg.prompt ?? "" }, commit: "act on messages" })],
     };
   }
+
+  it("a worker whose turn ends while its partner works goes on with the partner's result", async () => {
+    await start(headless());
+    const res = await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ files: { "w.txt": "w" }, commit: "w", stayFor: 400 }), agent: "claude" });
+    const runId = res.json.runId as string;
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/delegate`, { agent: "fake", task: JSON.stringify({ files: { "p.txt": "p" }, stayFor: 1500 }) })).status).toBe(202);
+    const run = await settled(runId);
+    expect(run.node.status).toBe("done");
+    // Resumed with the result, after the partner had finished: its work is in the commits.
+    expect(await readFile(join(run.node.worktree, "resumed.txt"), "utf8")).toMatch(/Your partner \(fake\) finished the delegated task/);
+    expect(await show(run.node.branch, "p.txt")).toBe("p");
+  });
 
   it("hands queued messages over when its turn ends, before its work is taken", async () => {
     await start(headless());
@@ -362,7 +441,7 @@ describe("an orchestrator after a restart", () => {
     expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(false);
     expect((await api("POST", `/api/v1/runs/${orch}/resume`)).status).toBe(202);
     expect((await api("GET", `/api/v1/runs/${orch}`)).json.live).toBe(true);
-    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(200);
     expect((await getRun(orch)).node).toMatchObject({ status: "done", summary: "stopped by the user" });
     expect(errors).toEqual([]);
   });
@@ -392,7 +471,174 @@ describe("an orchestrator's conversation", () => {
     const end = Date.now() + 10_000;
     while (!existsSync(file) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
     expect(await readFile(file, "utf8")).toMatch(/^Rivet was restarted\. Before starting anything, run rivet status/);
-    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(204);
+    expect((await api("POST", `/api/v1/runs/${orch}/stop`)).status).toBe(200);
     expect(errors).toEqual([]);
+  });
+});
+
+describe("models", () => {
+  it("gives each agent only a model meant for it", () => {
+    expect(modelFor("claude", { "worker.model": "haiku" })).toBe("haiku");
+    expect(modelFor("codex", { "worker.model": "haiku" })).toBeUndefined();
+    expect(modelFor("codex", { "worker.model": "haiku", "codex.model": "gpt-5-codex" })).toBe("gpt-5-codex");
+    expect(modelFor("codex", { "worker.agent": "codex", "worker.model": "o4" })).toBe("o4");
+    expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4", "claude.model": "sonnet" })).toBe("sonnet");
+    expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4" })).toBeUndefined();
+  });
+});
+
+describe("stopping an orchestrator", () => {
+  it("stops the workers it started that still work, unless asked to keep them", async () => {
+    await start();
+    const orch = async () => (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId as string;
+    const first = await orch();
+    const working = await spawn({ stayFor: 60_000 }, { from: `${first}-agent` });
+    const finished = await spawn({ files: { "f.txt": "f" }, commit: "f" }, { from: `${first}-agent` });
+    await settled(finished);
+    const stopped = await api("POST", `/api/v1/runs/${first}/stop`, {});
+    expect(stopped.json).toEqual({ workers: [working] });
+    expect((await getRun(working)).node).toMatchObject({ status: "escalated", summary: `stopped with its orchestrator ${first}` });
+    expect((await getRun(finished)).node.status).toBe("done");
+
+    const second = await orch();
+    const kept = await spawn({ stayFor: 60_000 }, { from: `${second}-agent` });
+    expect((await api("POST", `/api/v1/runs/${second}/stop`, { keepWorkers: true })).json).toEqual({ workers: [] });
+    expect((await getRun(kept)).node.status).toBe("running");
+    await api("POST", `/api/v1/runs/${kept}/stop`, {});
+  });
+});
+
+describe("delegating to a partner", () => {
+  it("runs the partner in the worker's worktree and hands its result to the worker as a message", async () => {
+    await start();
+    const worker = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 300));
+    const partnerTask = JSON.stringify({ files: { "p.txt": "from the partner" }, stayFor: 300 });
+    const res = await api("POST", `/api/v1/sessions/${worker}-agent/delegate`, { task: partnerTask });
+    expect(res.status).toBe(202);
+    expect(res.json).toEqual({ session: `${worker}-partner`, agent: "fake" });
+    // One partner at a time.
+    expect((await api("POST", `/api/v1/sessions/${worker}-agent/delegate`, { task: partnerTask })).json.error).toMatch(/already has a partner/);
+    const worktree = (await getRun(worker)).node.worktree;
+    const inbox = join(worktree, "inbox.txt");
+    const end = Date.now() + 10_000;
+    while (!(existsSync(inbox) && (await readFile(inbox, "utf8")).includes("Your partner")) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    expect(await readFile(inbox, "utf8")).toContain("Your partner (fake) finished the delegated task:");
+    // The partner's work is in the worktree, left for the worker's commits.
+    expect(await readFile(join(worktree, "p.txt"), "utf8")).toBe("from the partner");
+    expect((await git(["status", "--porcelain"], worktree))).toContain("p.txt");
+    await api("POST", `/api/v1/runs/${worker}/stop`, {});
+  });
+
+  it("is refused for a worker that is not working, and from an orchestrator", async () => {
+    await start();
+    const done = await spawn({ commit: "none" });
+    await settled(done);
+    expect((await api("POST", `/api/v1/sessions/${done}-agent/delegate`, { task: "x" })).json.error).toMatch(/is not working/);
+    const orch = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId;
+    expect((await api("POST", `/api/v1/sessions/${orch}-agent/delegate`, { task: "x" })).json.error).toMatch(/only a worker delegates/);
+    await api("POST", `/api/v1/runs/${orch}/stop`, {});
+  });
+});
+
+describe("automations", () => {
+  it("are saved with their next time, run by hand without moving it, paused and removed", async () => {
+    await start();
+    const add = await api("POST", "/api/v1/automations", { repo, name: "nightly", cron: "0 2 * * *", zone: "UTC", prompt: JSON.stringify({ files: { "n.txt": "n" }, commit: "n" }), agent: "fake" });
+    expect(add.status).toBe(201);
+    expect(add.json).toMatchObject({ name: "nightly", enabled: true, role: "worker", nextRunAt: expect.stringMatching(/T02:00:00\.000Z$/) });
+    expect((await api("POST", "/api/v1/automations", { repo, name: "nightly", cron: "0 2 * * *", prompt: "x" })).status).toBe(409);
+    expect((await api("POST", "/api/v1/automations", { repo, name: "bad", cron: "0 25 * * *", prompt: "x" })).json.error).toMatch(/out of 0-23/);
+    const ran = await api("POST", "/api/v1/automations/nightly/run");
+    expect((await settled(ran.json.runId)).name).toBe("nightly");
+    const listed = (await api("GET", "/api/v1/automations")).json.automations[0];
+    expect(listed.nextRunAt).toBe(add.json.nextRunAt);
+    expect(listed.runs).toMatchObject([{ runId: ran.json.runId }]);
+    expect((await api("POST", "/api/v1/automations/nightly/pause")).json.enabled).toBe(false);
+    expect((await api("DELETE", "/api/v1/automations/nightly")).status).toBe(204);
+    expect((await api("GET", "/api/v1/automations")).json.automations).toEqual([]);
+  });
+
+  it("starts the run of one that came due while the daemon was down, once", async () => {
+    const { openStore } = await import("../src/store.js");
+    const { realpath } = await import("node:fs/promises");
+    const root = await realpath(repo);
+    const store = openStore(data);
+    store.saveAutomation({
+      id: "a1", project: projectOf(root), repo: root, name: "missed", prompt: JSON.stringify({ commit: "none" }), role: "worker", agent: "fake",
+      cron: "0 2 * * *", zone: "UTC", enabled: true, nextRunAt: "2026-01-01T02:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    store.close();
+    await start();
+    const end = Date.now() + 10_000;
+    let a: { nextRunAt: string; runs: { runId?: string }[] };
+    do {
+      a = (await api("GET", "/api/v1/automations")).json.automations[0];
+      if (a.runs.length) break;
+      await new Promise((r) => setTimeout(r, 50));
+    } while (Date.now() < end);
+    expect(a.runs).toHaveLength(1);
+    expect(Date.parse(a.nextRunAt)).toBeGreaterThan(Date.now());
+    await settled(a.runs[0]!.runId!);
+  });
+});
+
+describe("a task's own spec", () => {
+  it("done_when replaces the project's check", async () => {
+    await start();
+    await setCfg("check", `node -e "process.exit(1)"`);
+    const runId = await spawn({ files: { "a.txt": "a" }, commit: "a" }, { spec: { doneWhen: `node -e "process.exit(require('fs').existsSync('a.txt') ? 0 : 1)"` } });
+    expect((await settled(runId)).node.status).toBe("done");
+  });
+
+  it("work outside the allowed paths goes back, and attempts sets how often", async () => {
+    await start();
+    const runId = await spawn({ files: { "other.txt": "x" }, commit: "x" }, { spec: { paths: ["src/**"], attempts: 1 } });
+    const run = await settled(runId);
+    expect(run.node.status).toBe("escalated");
+    expect(run.node.summary).toMatch(/gave up after 1 attempts: it changed files outside the allowed paths \(src\/\*\*\): other\.txt/);
+  });
+
+  it("a worker past its time limit is stopped and escalated", async () => {
+    await start(undefined, { limitMs: 100 });
+    const runId = await spawn({ stayFor: 60_000 }, { spec: { minutes: 0.01 } });
+    const run = await settled(runId);
+    expect(run.node).toMatchObject({ status: "escalated", summary: "stopped: it reached its time limit of 0.01 minutes" });
+  });
+
+  it("a bad spec is refused", async () => {
+    await start();
+    expect((await api("POST", "/api/v1/runs", { repo, task: "x", agent: "fake", spec: { minutes: -2 } })).json.error).toMatch(/must be a positive number/);
+  });
+});
+
+describe("switching a worker's agent", () => {
+  it("stops the running agent and starts the other in the same worktree with a handoff", async () => {
+    const seen: string[] = [];
+    const fake = getAgent("fake");
+    const recording: Agent = {
+      ...fake,
+      launchCommand: async (cfg) => { seen.push(cfg.prompt ?? ""); return fake.launchCommand({ ...cfg, prompt: JSON.stringify({ stayFor: 60_000 }) }); },
+    };
+    await start(recording);
+    const runId = await spawn({ files: { "w.txt": "w" }, commit: "half done", stayFor: 60_000 });
+    await new Promise((r) => setTimeout(r, 500));
+    const before = (await getRun(runId)).node.worktree;
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude", model: "gpt-5" })).json.error).toMatch(/not a claude model/);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).status).toBe(202);
+    const run = await getRun(runId);
+    expect(run.node).toMatchObject({ agent: "claude", status: "running", worktree: before });
+    expect(seen[0]).toContain("You take over this task from another agent (fake), in the same worktree, branch and pull request.");
+    expect(seen[0]).toMatch(/Commits since the base:\n\w+ half done/);
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.live).toBe(true);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).json.error).toMatch(/already runs claude/);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("refuses a finished worker", async () => {
+    await start();
+    const runId = await spawn({ commit: "none" });
+    await settled(runId);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "codex" })).json.error).toMatch(/is done/);
   });
 });

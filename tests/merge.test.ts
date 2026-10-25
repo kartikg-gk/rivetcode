@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import {
-  abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand,
+  abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand, workingTree,
 } from "../src/merge.js";
 import { isDirty } from "../src/worktree.js";
 import { makeRepo, removeRepo } from "./helpers.js";
@@ -125,5 +125,21 @@ describe("runCommand", () => {
       .toMatchObject({ ok: false, output: expect.stringContaining("broken") });
     expect(await runCommand(`node -e "setTimeout(() => {}, 10000)"`, repo, 300))
       .toMatchObject({ ok: false, output: expect.stringContaining("timed out") });
+  });
+});
+
+describe("workingTree", () => {
+  it("names the files as they are: the same before and after a commit, new after a change", async () => {
+    const clean = await workingTree(repo);
+    expect(clean).toBe((await git(["rev-parse", "HEAD^{tree}"], repo)).trim());
+    await writeFile(join(repo, "new.txt"), "n");
+    const edited = await workingTree(repo);
+    expect(edited).not.toBe(clean);
+    // It leaves the real index alone.
+    expect((await git(["status", "--porcelain"], repo)).trim()).toBe("?? new.txt");
+    await commitLeftovers(repo, "save");
+    expect(await workingTree(repo)).toBe(edited);
+    await writeFile(join(repo, "new.txt"), "changed");
+    expect(await workingTree(repo)).not.toBe(edited);
   });
 });

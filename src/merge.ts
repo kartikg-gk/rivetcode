@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { git, GitError } from "./git.js";
 import { signalTree } from "./proc.js";
@@ -86,6 +88,20 @@ export async function finishResolution(worktree: string, conflicted: string[]): 
 export async function resetTo(worktree: string, commit: string): Promise<void> {
   if (await isDirty(worktree)) throw new Error(`not resetting ${worktree}: it has uncommitted work`);
   await git(["reset", "-q", "--hard", commit], worktree);
+}
+
+// The tree the worktree's files make right now, committed or not: the same files give the
+// same id, so a check that passed on them still holds after they are committed.
+export async function workingTree(dir: string): Promise<string> {
+  const index = join(tmpdir(), `rivet-index-${randomBytes(6).toString("hex")}`);
+  const env = { GIT_INDEX_FILE: index };
+  try {
+    await git(["read-tree", "HEAD"], dir, env);
+    await git(["add", "-A"], dir, env);
+    return (await git(["write-tree"], dir, env)).trim();
+  } finally {
+    await rm(index, { force: true }).catch(() => {});
+  }
 }
 
 export type CommandResult = { ok: boolean; output: string };
