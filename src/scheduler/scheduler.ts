@@ -10,7 +10,7 @@ import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
 import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
-import { fromCodexJson, readableOutput, type TimelineEntry } from "../timeline.js";
+import { fromStream, readableOutput, type TimelineEntry } from "../timeline.js";
 import { outsidePaths } from "./tasks.js";
 import { conversationFile, runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
@@ -104,13 +104,21 @@ export function createScheduler(d: SchedulerDeps) {
   // A session's timeline. Codex run headless reports its work as JSON lines, read as they come.
   const note = (runId: string, session: string, entries: TimelineEntry[]) =>
     d.write(() => d.store.addTimeline(runId, session, entries)).catch(report);
+  // Sessions whose JSON stream Rivet reads: their hooks add only prompts, or every call
+  // and reply would be there twice.
+  const streamed = new Set<string>();
   function followStream(runId: string, session: string, sessionId: string, agentName: string, headless: boolean): void {
-    if (!headless || agentName !== "codex") return;
+    if (!headless || (agentName !== "codex" && agentName !== "claude")) {
+      streamed.delete(sessionId);
+      return;
+    }
+    streamed.add(sessionId);
     let partial = "";
+    const toolNames = new Map<string, string>();
     d.runtime.attach(sessionId, (chunk) => {
       const parts = (partial + chunk).split(/\r?\n/);
       partial = parts.pop() ?? "";
-      const entries = parts.flatMap((line) => fromCodexJson(line) ?? []);
+      const entries = parts.flatMap((line) => fromStream(line, toolNames) ?? []);
       if (entries.length) void note(runId, session, entries);
     });
   }
@@ -998,7 +1006,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { launch, streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

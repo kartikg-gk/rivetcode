@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fromCodexJson, fromHook, readableOutput } from "../src/timeline.js";
+import { fromClaudeStream, fromCodexJson, fromHook, fromStream, readableOutput } from "../src/timeline.js";
 
 describe("timeline from hooks", () => {
   it("reads Claude's prompt, tool calls, results and last reply, with the fields seen live", () => {
@@ -14,6 +14,29 @@ describe("timeline from hooks", () => {
     expect(fromHook("claude-code", "stop", { last_assistant_message: "Done: tests pass." })).toEqual([{ kind: "assistant", text: "Done: tests pass." }]);
     expect(fromHook("claude-code", "stop", {})).toEqual([]);
     expect(fromHook("claude-code", "session-start", { prompt: "x" })).toEqual([]);
+  });
+});
+
+describe("timeline from Claude's stream-json", () => {
+  it("reads every reply, tool call and result, naming a result after its call (shapes seen live)", () => {
+    const names = new Map<string, string>();
+    const assistant = JSON.stringify({ type: "assistant", message: { content: [
+      { type: "thinking", thinking: "hmm" },
+      { type: "text", text: "Checking the tests first." },
+      { type: "tool_use", id: "tu_1", name: "Bash", input: { command: "npm test", description: "run tests" } },
+    ] } });
+    expect(fromClaudeStream(assistant, names)).toEqual([
+      { kind: "assistant", text: "Checking the tests first." }, { kind: "tool", tool: "Bash", text: "npm test" },
+    ]);
+    const user = JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: [{ type: "text", text: "3 passing" }] }] } });
+    expect(fromClaudeStream(user, names)).toEqual([{ kind: "result", tool: "Bash", text: "3 passing" }]);
+    expect(fromClaudeStream(JSON.stringify({ type: "system", subtype: "init" }))).toEqual([]);
+    expect(fromClaudeStream(JSON.stringify({ type: "result", subtype: "success", result: "done" }))).toEqual([]);
+    expect(fromClaudeStream("not json")).toBeNull();
+    // Either agent's line is told apart.
+    expect(fromStream(assistant)).toHaveLength(2);
+    expect(fromStream('{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}')).toEqual([{ kind: "assistant", text: "hi" }]);
+    expect(readableOutput([assistant, "error: boom"])).toEqual(["Checking the tests first.", "$ npm test", "error: boom"]);
   });
 });
 

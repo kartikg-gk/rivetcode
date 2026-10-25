@@ -383,7 +383,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const { runId, nodeId } = session(activity[1]);
       const payload = await body(req);
       // What the hook saw goes on the session's timeline (reviewers and partners too).
-      const entries = checkEntries(payload.timeline);
+      // A session whose JSON stream Rivet reads gets only prompts from its hooks.
+      const entries = checkEntries(payload.timeline)
+        .filter((e) => e.kind === "prompt" || !scheduler.streamsTimeline(sessionIdOf(runId, nodeId)));
       if (entries.length) await write(() => store.addTimeline(runId, nodeId, entries)).catch(() => {});
       // A reviewer's or partner's activity is not the run's session state.
       if (nodeId === "review" || nodeId === "partner") {

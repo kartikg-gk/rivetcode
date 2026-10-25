@@ -744,6 +744,29 @@ describe("reading a session's timeline", () => {
     await api("POST", `/api/v1/runs/${runId}/stop`, {});
   });
 
+  it("keeps a headless Claude worker's every reply and call from stream-json, and its hooks add no duplicates", async () => {
+    const events = [
+      { type: "system", subtype: "init" },
+      { type: "assistant", message: { content: [{ type: "text", text: "Reading the code." }, { type: "tool_use", id: "t1", name: "Read", input: { file_path: "a.ts" } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "export {}" }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "Nothing to change." }] } },
+    ];
+    const script = `setTimeout(() => { for (const e of ${JSON.stringify(events)}) console.log(JSON.stringify(e)); }, 600);`;
+    const fake = getAgent("fake");
+    const claudeLike: Agent = { ...fake, name: "claude", launchCommand: async () => [process.execPath, "-e", script] };
+    await start(claudeLike);
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "look at a.ts", agent: "claude" })).json.runId as string;
+    await new Promise((r) => setTimeout(r, 200));
+    // Its hooks report the same call: dropped, as the stream has it.
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active", timeline: [{ kind: "tool", tool: "Read", text: "a.ts" }] });
+    await settled(runId);
+    const items = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity`)).json.items as { kind: string; tool?: string; text: string }[];
+    expect(items.filter((i) => i.kind !== "event").map((i) => [i.kind, i.tool ?? "", i.text])).toEqual([
+      ["prompt", "", expect.stringMatching(/^Your task: look at a\.ts/)],
+      ["assistant", "", "Reading the code."], ["tool", "Read", "a.ts"], ["result", "Read", "export {}"], ["assistant", "", "Nothing to change."],
+    ]);
+  });
+
   it("keeps a headless Codex worker's replies and commands from its --json events, as they come", async () => {
     const script = "for (const e of [" +
       "{type:'item.completed',item:{type:'agent_message',text:'Looking at the tests.'}}," +

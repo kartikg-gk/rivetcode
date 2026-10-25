@@ -65,6 +65,8 @@ export function fromCodexJson(line: string): TimelineEntry[] | null {
   let e: { type?: string; item?: Record<string, unknown> };
   try { e = JSON.parse(line); } catch { return null; }
   if (!e || typeof e !== "object" || typeof e.type !== "string") return null;
+  // Codex events are dotted (item.completed, turn.started); anything else is not one.
+  if (!e.type.includes(".") && e.type !== "error") return null;
   const item = e.item ?? {};
   if (e.type === "item.started" && item.type === "command_execution") {
     return [{ kind: "tool", tool: "shell", text: text(item.command) }];
@@ -82,11 +84,43 @@ export function fromCodexJson(line: string): TimelineEntry[] | null {
   return [];
 }
 
-// What a headless Codex printed, as text a person (or a retry prompt) can read.
+// One line of Claude's `--output-format stream-json` (checked live): assistant events carry
+// text and tool_use parts, user events tool_result parts. toolNames maps a tool_use id to
+// its tool, so a result is named after the call it answers.
+export function fromClaudeStream(line: string, toolNames: Map<string, string> = new Map()): TimelineEntry[] | null {
+  let e: { type?: string; message?: { content?: unknown } };
+  try { e = JSON.parse(line); } catch { return null; }
+  if (!e || typeof e !== "object" || typeof e.type !== "string") return null;
+  if (e.type !== "assistant" && e.type !== "user") return [];
+  const parts = Array.isArray(e.message?.content) ? (e.message!.content as Record<string, unknown>[]) : [];
+  const out: TimelineEntry[] = [];
+  for (const p of parts) {
+    if (e.type === "assistant" && p.type === "text" && typeof p.text === "string" && p.text.trim()) {
+      out.push({ kind: "assistant", text: cut(p.text, ENTRY_LIMIT) });
+    } else if (e.type === "assistant" && p.type === "tool_use" && typeof p.name === "string") {
+      if (typeof p.id === "string") toolNames.set(p.id, p.name);
+      out.push({ kind: "tool", tool: p.name, text: describeTool(p.input) });
+    } else if (e.type === "user" && p.type === "tool_result") {
+      const content = Array.isArray(p.content)
+        ? (p.content as { type?: string; text?: string }[]).filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n")
+        : text(p.content);
+      const tool = typeof p.tool_use_id === "string" ? toolNames.get(p.tool_use_id) : undefined;
+      if (content.trim()) out.push({ kind: "result", text: cut(content.trim(), RESULT_LIMIT), ...(tool ? { tool } : {}) });
+    }
+  }
+  return out;
+}
+
+// A line of either agent's JSON stream, or null when it is not one.
+export function fromStream(line: string, toolNames?: Map<string, string>): TimelineEntry[] | null {
+  return fromCodexJson(line) ?? fromClaudeStream(line, toolNames);
+}
+
+// What a headless agent printed as JSON events, as text a person (or a retry prompt) can read.
 export function readableOutput(lines: string[]): string[] {
   const out: string[] = [];
   for (const line of lines) {
-    const entries = fromCodexJson(line);
+    const entries = fromStream(line);
     if (entries === null) out.push(line);
     else for (const e of entries) out.push(e.kind === "tool" ? `$ ${e.text}` : e.text);
   }
