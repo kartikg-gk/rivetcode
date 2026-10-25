@@ -3,7 +3,7 @@ import { mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getAgent } from "../src/agents/agent.js";
+import { getAgent, type Agent } from "../src/agents/agent.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import { githubClient } from "../src/github/github.js";
@@ -38,11 +38,26 @@ afterEach(async () => {
 
 let errors: unknown[] = [];
 
+// What the test reviewer does: stays until the test submits for it, unless changed.
+let reviewerScript: object = { stayFor: 60_000 };
+let reviewerLaunches: { prompt?: string; permission?: string; allowedTools?: string[] }[] = [];
+function reviewerAgent(): Agent {
+  const fake = getAgent("fake");
+  return {
+    ...fake,
+    launchCommand: async (cfg) => {
+      reviewerLaunches.push({ ...(cfg.prompt !== undefined ? { prompt: cfg.prompt } : {}), ...(cfg.permission ? { permission: cfg.permission } : {}), ...(cfg.allowedTools ? { allowedTools: cfg.allowedTools } : {}) });
+      return fake.launchCommand({ ...cfg, prompt: JSON.stringify(reviewerScript) });
+    },
+  };
+}
+
 async function start(config: Record<string, string> = {}): Promise<void> {
   errors = [];
   daemon = await startDaemon({
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150, onError: (e) => errors.push(e),
-    agents: () => getAgent("fake"),
+    // "claude" stands for a reviewer here (review.agent): it runs reviewerScript.
+    agents: (name) => (name === "claude" ? reviewerAgent() : getAgent("fake")),
     github: async () => githubClient({ repo: "o/r", token: "t0ken", api: gh.api }),
   });
   const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
@@ -82,7 +97,7 @@ describe("opening the pull request", () => {
     await start({ pr: "auto" });
     const runId = await spawn();
     const { pr, run } = await until(() => runOf(runId), (r) => r.pr !== null);
-    expect(pr).toEqual({ number: 1, url: "https://github.com/o/r/pull/1" });
+    expect(pr).toMatchObject({ number: 1, url: "https://github.com/o/r/pull/1" });
     expect(run.node.prStatus).toBe("pr_open");
     expect(gh.prs[0]).toMatchObject({ title: "add a", base: "main", head: { ref: `rivet/${runId}/agent` } });
     expect(gh.prs[0]!.body).toMatch(/Done by one agent \(fake\) in its own worktree/);
@@ -115,12 +130,45 @@ describe("opening the pull request", () => {
     expect((await onOrigin(`rivet/${runId}/agent`, "a.txt")).trim()).toBe("a");
   });
 
+  it("opens no pull request for work that changed nothing", async () => {
+    await start({ pr: "auto" });
+    const runId = await spawn({ stayFor: 100 });
+    const { run, pr } = await until(() => runOf(runId), (r) => r.run.node.status === "done");
+    await daemon!.idle();
+    expect(pr).toBeNull();
+    expect(run.node.summary).toBe("no changes: main already has what the task asks for");
+    expect(gh.prs).toHaveLength(0);
+    expect((await api("POST", `/api/v1/runs/${runId}/pr`)).json.error).toMatch(/changed nothing/);
+    expect(errors).toEqual([]);
+  });
+
   it("refuses a worker that is not done, and an orchestrator", async () => {
     await start();
     const slow = await spawn({ stayFor: 60_000 });
     expect((await api("POST", `/api/v1/runs/${slow}/pr`)).status).toBe(409);
     const orch = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ stayFor: 60_000 }), agent: "fake", role: "orchestrator" })).json.runId;
     expect((await api("POST", `/api/v1/runs/${orch}/pr`)).json.error).toMatch(/only a worker opens a pull request/);
+  });
+});
+
+describe("a worker from an issue", () => {
+  it("starts with the issue as its task, is named after it, and its pull request closes it", async () => {
+    gh.issues[5] = { title: "Add a.txt", state: "open", body: JSON.stringify({ files: { "a.txt": "a" }, commit: "add a" }), labels: [{ name: "feature" }], assignees: [] };
+    await start({ pr: "auto" });
+    const res = await api("POST", "/api/v1/runs", { repo, issue: "5", agent: "fake" });
+    expect(res.status).toBe(201);
+    const runId = res.json.runId as string;
+    const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
+    expect(run.name).toBe("Add a.txt");
+    expect(run.task).toMatch(/^Resolve issue #5\.[\s\S]*Labels: feature\n\nBody:\n\{"files"/);
+    expect(gh.prs[0]!.title).toBe("Add a.txt");
+    expect(gh.prs[0]!.body).toMatch(/Closes #5$/);
+  });
+
+  it("refuses an issue it cannot read or of another repository", async () => {
+    await start();
+    expect((await api("POST", "/api/v1/runs", { repo, issue: "99", agent: "fake" })).json.error).toMatch(/cannot read issue 99/);
+    expect((await api("POST", "/api/v1/runs", { repo, issue: "x/y#5", agent: "fake" })).json.error).toMatch(/not in this repository/);
   });
 });
 
@@ -141,6 +189,24 @@ describe("watching the pull request", () => {
     expect(run.node.summary ?? null).toBeNull();
     await new Promise((r) => setTimeout(r, 600));
     expect((await runOf(runId)).run.node.attempts).toBe(2);
+  });
+
+  it("leaves reading the failure to the worker unless the project asks Rivet to fetch it", async () => {
+    const runId = await opened();
+    gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
+    gh.annotations[9] = [{ path: "a.txt" }];
+    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("ci_failed"));
+    expect(gh.requests.some((r) => r.includes("/annotations"))).toBe(false);
+  });
+
+  it("fetches the failing paths itself when pr.feedback is full", async () => {
+    await start({ pr: "auto", "pr.feedback": "full" });
+    const runId = await spawn();
+    await until(() => runOf(runId), (r) => r.pr !== null);
+    gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
+    gh.annotations[9] = [{ path: "a.txt" }];
+    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("ci_failed"));
+    expect(gh.requests.some((r) => r.includes("/check-runs/9/annotations"))).toBe(true);
   });
 
   it("sends review comments to the worker", async () => {
@@ -223,5 +289,66 @@ describe("runs saved before a run was one session", () => {
     await start();
     await new Promise((r) => setTimeout(r, 600));
     expect(errors).toEqual([]);
+  });
+});
+
+describe("the reviewer", () => {
+  type Reviewed = { run: Run; reviews: { status: string; verdict?: string; trigger: string; githubReviewId?: number }[] };
+  const reviewsOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as Reviewed;
+  const submit = (runId: string, body: object) => api("POST", `/api/v1/sessions/${runId}-review/review`, body);
+
+  async function reviewed(): Promise<string> {
+    reviewerScript = { stayFor: 60_000 };
+    reviewerLaunches = [];
+    await start({ pr: "auto", review: "auto", "review.agent": "claude" });
+    const runId = await spawn();
+    await until(() => reviewsOf(runId), (r) => r.reviews.some((v) => v.status === "running"));
+    return runId;
+  }
+
+  it("starts once the pull request is open, read-only, and sends required changes to the worker", async () => {
+    const runId = await reviewed();
+    expect(reviewerLaunches[0]).toMatchObject({ permission: "read-only" });
+    expect(reviewerLaunches[0]!.allowedTools).toContain("Bash(rivet review submit:*)");
+    expect(reviewerLaunches[0]!.allowedTools!.some((t) => /Edit|Write/.test(t))).toBe(false);
+    expect((await submit(runId, { verdict: "changes_requested", summary: "one bug", comments: [] })).status).toBe(400);
+    const res = await submit(runId, { verdict: "changes_requested", summary: "Off by one.", comments: [{ path: "a.txt", line: 1, body: "use b" }] });
+    expect(res.json).toEqual({ githubReviewId: 901 });
+    const { run, reviews } = await until(() => reviewsOf(runId), (r) => r.run.node.attempts === 2);
+    expect(run.node.summary ?? "").toMatch(/A reviewer asked for changes on pull request #1\. Make each one:\n- a\.txt:1: use b/);
+    expect(reviews[0]).toMatchObject({ status: "complete", verdict: "changes_requested", githubReviewId: 901 });
+    expect(gh.posted[0]).toMatchObject({ number: 1, event: "COMMENT", commit_id: expect.any(String), comments: [{ path: "a.txt", line: 1, body: "use b" }] });
+  });
+
+  it("an approval is posted and the worker is left alone", async () => {
+    const runId = await reviewed();
+    await submit(runId, { verdict: "approved", summary: "Looks right." });
+    await new Promise((r) => setTimeout(r, 500));
+    const { run, reviews } = await reviewsOf(runId);
+    expect(run.node.attempts).toBe(1);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).toMatchObject({ status: "complete", verdict: "approved" });
+    expect(gh.posted[0]!.body).toMatch(/ready\.\n\nLooks right\.$/);
+  });
+
+  it("a reviewer that exits without submitting fails the pass, and Rivet stops after three tries on one commit", async () => {
+    reviewerScript = {};
+    reviewerLaunches = [];
+    await start({ pr: "auto", review: "auto", "review.agent": "claude" });
+    const runId = await spawn();
+    const { reviews } = await until(() => reviewsOf(runId), (r) => r.reviews.filter((v) => v.status === "failed").length === 3);
+    await new Promise((r) => setTimeout(r, 600));
+    expect((await reviewsOf(runId)).reviews).toHaveLength(3);
+    expect(reviews.every((v) => v.trigger === "auto")).toBe(true);
+  });
+
+  it("rivet review starts one by hand; a second while one runs is refused", async () => {
+    reviewerScript = { stayFor: 60_000 };
+    await start({ pr: "auto", "review.agent": "claude" });
+    const runId = await spawn();
+    await until(() => runOf(runId), (r) => r.pr !== null);
+    expect((await api("POST", `/api/v1/runs/${runId}/review`)).status).toBe(202);
+    expect((await api("POST", `/api/v1/runs/${runId}/review`)).json.error).toMatch(/already running/);
+    expect((await reviewsOf(runId)).reviews[0]).toMatchObject({ trigger: "manual", status: "running" });
   });
 });

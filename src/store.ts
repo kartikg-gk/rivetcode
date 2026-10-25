@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
 import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
+import type { TaskSpec } from "./scheduler/tasks.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -20,6 +21,10 @@ export type Run = {
   orchestrator?: string;
   // The model asked for when it was started; otherwise the project's worker.model.
   model?: string;
+  // The issue the task came from, in the run's own repository; its pull request closes it.
+  issue?: number;
+  // A task file's own definition of done, limits and guardrails for this run.
+  spec?: TaskSpec;
   node: Node;
 };
 
@@ -50,6 +55,19 @@ export type Store = {
   // A run's pull request; "handled" remembers which feedback was already acted on.
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
+  // Review passes over a run's pull request, oldest first.
+  startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
+  endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
+  reviewsOf(runId: string): Review[];
+  saveAutomation(a: Automation): void;
+  listAutomations(project?: string): Automation[];
+  deleteAutomation(id: string): boolean;
+  recordAutomationRun(r: Omit<AutomationRun, "id">): void;
+  automationRuns(automationId: string): AutomationRun[];
+  // A project's cues, by name.
+  saveCue(cue: Cue): void;
+  listCues(project: string): Cue[];
+  deleteCue(project: string, name: string): boolean;
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
   getTerminateOnPrMerge(runId: string): boolean;
   setTerminateOnPrMerge(runId: string, terminate: boolean): void;
@@ -57,6 +75,50 @@ export type Store = {
 };
 
 export type PullRequest = { number: number; url: string; handled?: string };
+
+// One review pass over a worker's pull request at one commit.
+export type Review = {
+  id: number;
+  runId: string;
+  sha: string;
+  // auto: Rivet started it after the pull request opened or changed; manual: rivet review.
+  trigger: "auto" | "manual";
+  status: "running" | "complete" | "failed";
+  verdict?: "approved" | "changes_requested";
+  body?: string;
+  githubReviewId?: number;
+  createdAt: string;
+};
+
+// A saved prompt or command of a project, run by name.
+export type Cue = {
+  project: string;
+  name: string;
+  // agent: a prompt for an agent; command: a shell command run in a terminal.
+  type: "agent" | "command";
+  text: string;
+  updatedAt: string;
+};
+
+// A prompt run on a schedule: each time it comes round, a worker or orchestrator starts.
+export type Automation = {
+  id: string;
+  project: string;
+  repo: string;
+  name: string;
+  prompt: string;
+  role: Role;
+  agent?: string;
+  cron: string;
+  zone: string;
+  enabled: boolean;
+  nextRunAt: string;
+  lastRunAt?: string;
+  createdAt: string;
+};
+
+// One time an automation came round: the run it started, or why it could not.
+export type AutomationRun = { id: number; automationId: string; scheduledFor: string; runId?: string; error?: string; createdAt: string };
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -67,10 +129,14 @@ export type NodeUpdate = {
   prompt?: string;
   // Where the root's pull request stands.
   prStatus?: Node["prStatus"] | null;
+  // The agent running the session (changed by a switch), and its own conversation id.
+  agent?: Node["agent"];
+  agentSessionId?: string | null;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
   status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt", prStatus: "pr_status",
+  agent: "agent", agentSessionId: "agent_session_id",
 };
 
 export class RunStoreError extends Error {
@@ -234,6 +300,71 @@ ALTER TABLE runs ADD COLUMN orchestrator TEXT;
 ALTER TABLE runs ADD COLUMN model TEXT;
 ` });
 
+// The issue a run's task came from.
+MIGRATIONS.push({ version: 9, sql: `
+ALTER TABLE runs ADD COLUMN issue INTEGER;
+` });
+
+// A task file's definition of done, limits and guardrails, as JSON.
+MIGRATIONS.push({ version: 13, sql: `
+ALTER TABLE runs ADD COLUMN spec TEXT;
+` });
+
+// Prompts run on a schedule, and each time they ran.
+MIGRATIONS.push({ version: 12, sql: `
+CREATE TABLE automations (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  name TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN (${oneOf(ROLES)})),
+  agent TEXT,
+  cron TEXT NOT NULL,
+  zone TEXT NOT NULL,
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  next_run_at TEXT NOT NULL,
+  last_run_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (project, name)
+);
+CREATE TABLE automation_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  automation_id TEXT NOT NULL REFERENCES automations(id) ON DELETE CASCADE,
+  scheduled_for TEXT NOT NULL,
+  run_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+` });
+
+// Saved prompts and commands per project.
+MIGRATIONS.push({ version: 11, sql: `
+CREATE TABLE cues (
+  project TEXT NOT NULL,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('agent', 'command')),
+  text TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (project, name)
+);
+` });
+
+// Review passes by a reviewer agent.
+MIGRATIONS.push({ version: 10, sql: `
+CREATE TABLE reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  sha TEXT NOT NULL,
+  trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'manual')),
+  status TEXT NOT NULL CHECK (status IN ('running', 'complete', 'failed')),
+  verdict TEXT CHECK (verdict IN ('approved', 'changes_requested')),
+  body TEXT,
+  github_review_id INTEGER,
+  created_at TEXT NOT NULL
+);
+` });
+
 function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
@@ -258,7 +389,7 @@ function migrate(db: DatabaseSync): void {
 
 type RunRow = {
   id: string; project: string; repo: string; base: string; task: string; created_at: string;
-  role: string; name: string; orchestrator: string | null; model: string | null;
+  role: string; name: string; orchestrator: string | null; model: string | null; issue: number | null; spec: string | null;
 };
 type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
@@ -279,10 +410,10 @@ export function openStore(data: string): Store {
   migrate(db);
 
   const upsertRun = db.prepare(`
-    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model, issue, spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET project = excluded.project, repo = excluded.repo,
       base = excluded.base, task = excluded.task, created_at = excluded.created_at,
-      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model`);
+      role = excluded.role, name = excluded.name, orchestrator = excluded.orchestrator, model = excluded.model, issue = excluded.issue, spec = excluded.spec`);
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
@@ -340,7 +471,7 @@ export function openStore(data: string): Store {
       }
       db.exec("BEGIN IMMEDIATE");
       try {
-        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null);
+        upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null, run.spec ? JSON.stringify(run.spec) : null);
         deleteNodes.run(run.id);
         const n = run.node;
         // The position, parent, depth, kind, files and shared columns are left from runs that
@@ -387,6 +518,8 @@ export function openStore(data: string): Store {
         createdAt: r.created_at, role: r.role as Role, name: r.name,
         ...(r.orchestrator !== null ? { orchestrator: r.orchestrator } : {}),
         ...(r.model !== null ? { model: r.model } : {}),
+        ...(r.issue !== null ? { issue: Number(r.issue) } : {}),
+        ...(r.spec !== null ? { spec: JSON.parse(r.spec) as TaskSpec } : {}),
         node: nodes[0],
       };
     },
@@ -450,6 +583,80 @@ export function openStore(data: string): Store {
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+    },
+
+    saveAutomation(a) {
+      db.prepare(`INSERT INTO automations (id, project, repo, name, prompt, role, agent, cron, zone, enabled, next_run_at, last_run_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET prompt = excluded.prompt, role = excluded.role, agent = excluded.agent, cron = excluded.cron,
+          zone = excluded.zone, enabled = excluded.enabled, next_run_at = excluded.next_run_at, last_run_at = excluded.last_run_at`)
+        .run(a.id, a.project, a.repo, a.name, a.prompt, a.role, a.agent ?? null, a.cron, a.zone, a.enabled ? 1 : 0, a.nextRunAt, a.lastRunAt ?? null, a.createdAt);
+    },
+
+    listAutomations(project) {
+      type Row = { id: string; project: string; repo: string; name: string; prompt: string; role: Role; agent: string | null; cron: string;
+        zone: string; enabled: number; next_run_at: string; last_run_at: string | null; created_at: string };
+      const rows = (project === undefined
+        ? db.prepare("SELECT * FROM automations ORDER BY project, name").all()
+        : db.prepare("SELECT * FROM automations WHERE project = ? ORDER BY name").all(project)) as Row[];
+      return rows.map((r) => ({
+        id: r.id, project: r.project, repo: r.repo, name: r.name, prompt: r.prompt, role: r.role, cron: r.cron, zone: r.zone,
+        enabled: r.enabled === 1, nextRunAt: r.next_run_at, createdAt: r.created_at,
+        ...(r.agent !== null ? { agent: r.agent } : {}), ...(r.last_run_at !== null ? { lastRunAt: r.last_run_at } : {}),
+      }));
+    },
+
+    deleteAutomation(id) {
+      return db.prepare("DELETE FROM automations WHERE id = ?").run(id).changes > 0;
+    },
+
+    recordAutomationRun(r) {
+      db.prepare("INSERT INTO automation_runs (automation_id, scheduled_for, run_id, error, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(r.automationId, r.scheduledFor, r.runId ?? null, r.error ?? null, r.createdAt);
+    },
+
+    automationRuns(automationId) {
+      type Row = { id: number; automation_id: string; scheduled_for: string; run_id: string | null; error: string | null; created_at: string };
+      return (db.prepare("SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY id").all(automationId) as Row[]).map((r) => ({
+        id: Number(r.id), automationId: r.automation_id, scheduledFor: r.scheduled_for, createdAt: r.created_at,
+        ...(r.run_id !== null ? { runId: r.run_id } : {}), ...(r.error !== null ? { error: r.error } : {}),
+      }));
+    },
+
+    saveCue(cue) {
+      db.prepare(`INSERT INTO cues (project, name, type, text, updated_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (project, name) DO UPDATE SET type = excluded.type, text = excluded.text, updated_at = excluded.updated_at`)
+        .run(cue.project, cue.name, cue.type, cue.text, cue.updatedAt);
+    },
+
+    listCues(project) {
+      type Row = { project: string; name: string; type: Cue["type"]; text: string; updated_at: string };
+      return (db.prepare("SELECT * FROM cues WHERE project = ? ORDER BY name").all(project) as Row[])
+        .map((r) => ({ project: r.project, name: r.name, type: r.type, text: r.text, updatedAt: r.updated_at }));
+    },
+
+    deleteCue(project, name) {
+      return db.prepare("DELETE FROM cues WHERE project = ? AND name = ?").run(project, name).changes > 0;
+    },
+
+    startReview(runId, sha, trigger) {
+      return Number(db.prepare("INSERT INTO reviews (run_id, sha, trigger, status, created_at) VALUES (?, ?, ?, 'running', ?)")
+        .run(runId, sha, trigger, new Date().toISOString()).lastInsertRowid);
+    },
+
+    endReview(id, f) {
+      db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
+        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id);
+    },
+
+    reviewsOf(runId) {
+      type Row = { id: number; run_id: string; sha: string; trigger: Review["trigger"]; status: Review["status"]; verdict: Review["verdict"] | null;
+        body: string | null; github_review_id: number | null; created_at: string };
+      return (db.prepare("SELECT * FROM reviews WHERE run_id = ? ORDER BY id").all(runId) as Row[]).map((r) => ({
+        id: Number(r.id), runId: r.run_id, sha: r.sha, trigger: r.trigger, status: r.status, createdAt: r.created_at,
+        ...(r.verdict !== null ? { verdict: r.verdict } : {}), ...(r.body !== null ? { body: r.body } : {}),
+        ...(r.github_review_id !== null ? { githubReviewId: Number(r.github_review_id) } : {}),
+      }));
     },
 
     getPr(runId) {

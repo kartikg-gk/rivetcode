@@ -1,3 +1,4 @@
+import type { TaskSpec } from "./tasks.js";
 import { existsSync } from "node:fs";
 import { cp, mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -25,6 +26,8 @@ export type NewRun = {
   // The orchestrator session that asked for this worker.
   orchestrator?: string;
   model?: string;
+  issue?: number;
+  spec?: TaskSpec;
   base?: string;
   agent?: string;
   // The project's configured default agent, used when no agent is given.
@@ -35,9 +38,12 @@ export type NewRun = {
   setupFor?(project: string): string[];
 };
 
+// Model names that plainly belong to one agent, so the other is never started with them.
+export const MODEL_FAMILIES: Record<string, RegExp> = { claude: /^(claude|opus|sonnet|haiku)/i, codex: /^(gpt|o\d|codex)/i };
+
 // The main checkout, also when asked from inside a linked worktree (an agent's own), so
 // a new session never starts from another session's worktree.
-async function repoRoot(dir: string): Promise<string> {
+export async function repoRoot(dir: string): Promise<string> {
   try {
     const common = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], dir)).trim();
     if (basename(common) === ".git") return await realpath(dirname(common));
@@ -64,6 +70,10 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   if (!AGENTS.includes(agent)) throw new RunInputError(`unknown agent "${o.agent}"`);
   const role = o.role ?? "worker";
   if (!ROLES.includes(role)) throw new RunInputError(`unknown role "${String(role)}"`);
+  const otherFamily = MODEL_FAMILIES[agent === "claude" ? "codex" : "claude"];
+  if (o.model && agent !== "fake" && otherFamily.test(o.model.trim())) {
+    throw new RunInputError(`model "${o.model.trim()}" is not a ${agent} model; leave --model off to use ${agent}'s default`);
+  }
   const name = (o.name ?? "").trim();
   if (name.length > 100) throw new RunInputError(`name is ${name.length} characters; at most 100`);
 
@@ -86,7 +96,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   }
   return {
     id, project, repo, base, task: o.task.trim(), createdAt: new Date().toISOString(), role, name,
-    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), node,
+    ...(o.orchestrator ? { orchestrator: o.orchestrator } : {}), ...(o.model?.trim() ? { model: o.model.trim() } : {}), ...(o.issue ? { issue: o.issue } : {}), ...(o.spec && Object.keys(o.spec).length ? { spec: o.spec } : {}), node,
   };
 }
 

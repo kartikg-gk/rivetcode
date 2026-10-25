@@ -130,25 +130,25 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
   });
 
   it("applies migrations 2 and 3 once to a version 1 database", () => {
     store.saveRun(sampleRun());
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     expect(versions()).toEqual([1]);
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     expect(store.loadRun("r1")).toMatchObject({ role: "worker", name: "", node: { id: "agent" } });
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
   });
 });
 
@@ -184,7 +184,7 @@ describe("migration 3 and project config", () => {
     store.saveRun(run);
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DELETE FROM schema_migrations WHERE version >= 3; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 3; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
     db.exec("CREATE TABLE n2 AS SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes; DROP TABLE nodes; ALTER TABLE n2 RENAME TO nodes;");
     db.close();
     store = openStore(data);

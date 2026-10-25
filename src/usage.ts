@@ -85,6 +85,21 @@ export function codexSessionTokens(sessionId: string, root = codexSessionsDir())
   };
 }
 
+// Where an agent keeps a conversation, if it saved one.
+export function conversationFile(agent: string, id: string): string | null {
+  if (agent === "claude") {
+    const root = claudeProjectsDir();
+    if (!existsSync(root)) return null;
+    for (const folder of readdirSync(root)) {
+      const file = join(root, folder, `${id}.jsonl`);
+      if (existsSync(file)) return file;
+    }
+    return null;
+  }
+  if (agent === "codex") return findFile(codexSessionsDir(), (name) => name.startsWith("rollout-") && name.endsWith(`-${id}.jsonl`));
+  return null;
+}
+
 // What each kind of token costs next to a plain input token, from the providers' list
 // prices (the ratios hold across their models). Cached reads are cheap, so a raw total
 // mostly made of them overstates what a run cost.

@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getAgent } from "../src/agents/agent.js";
-import { CLAUDE_HOOKS, claudeAgent } from "../src/agents/claude.js";
+import { CLAUDE_HOOKS, claudeAgent, shellRules } from "../src/agents/claude.js";
 import { git } from "../src/git.js";
 import { worktreePath } from "../src/paths.js";
 import { createWorktree, removeWorktree, waitForTrash } from "../src/worktree.js";
@@ -179,7 +179,8 @@ describe("fake agent", () => {
 describe("headless launches", () => {
   it("claude runs in print mode and then takes no typed input; the fake always listens", async () => {
     const claude = getAgent("claude");
-    expect(await claude.launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: true, permission: "accept-edits", model: "haiku", allowedTools: ["Bash(rivet:*)"] }))
+    const linux = claudeAgent("claude", undefined, undefined, "linux");
+    expect(await linux.launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: true, permission: "accept-edits", model: "haiku", allowedTools: ["Bash(rivet:*)"] }))
       .toEqual(["claude", "--session-id", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77", "-p", "--model", "haiku", "--permission-mode", "acceptEdits", "--allowedTools", "Bash(rivet:*)", "--", "go"]);
     expect(claude.acceptsInput({ headless: true })).toBe(false);
     expect(claude.acceptsInput({ headless: false })).toBe(true);
@@ -214,5 +215,17 @@ describe("claude hooks from older installs", () => {
     expect(commands.filter((c: string) => c.endsWith("hooks claude-code stop"))).toHaveLength(1);
     expect(commands).toContain("echo mine");
     expect(commands.some((c: string) => c.startsWith("rivet "))).toBe(false);
+  });
+});
+
+describe("shell rules on Windows", () => {
+  it("gives every Bash rule a PowerShell twin on Windows only", async () => {
+    expect(shellRules(["Bash(rivet:*)", "Read", "Bash(npm test)"], "win32")).toEqual([
+      "Bash(rivet:*)", "Read", "Bash(npm test)", "PowerShell(rivet:*)", "PowerShell(npm test)",
+    ]);
+    expect(shellRules(["Bash(rivet:*)"], "linux")).toEqual(["Bash(rivet:*)"]);
+    const win = claudeAgent("claude", undefined, undefined, "win32");
+    const argv = await win.launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", allowedTools: ["Bash(rivet:*)"] });
+    expect(argv[argv.indexOf("--allowedTools") + 1]).toBe("Bash(rivet:*),PowerShell(rivet:*)");
   });
 });

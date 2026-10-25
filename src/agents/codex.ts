@@ -32,6 +32,7 @@ const BASE_ARGS = [
 // Headless (codex exec) has nobody to approve anything: edits stay in a writable sandbox.
 export function codexPermissionArgs(permission: Permission, headless: boolean): string[] {
   const p = normalizePermission(permission);
+  if (p === "read-only") return headless ? ["--sandbox", "read-only"] : ["--sandbox", "read-only", "--ask-for-approval", "never"];
   if (p === "accept-edits" || p === "auto") {
     if (headless) return ["--sandbox", "workspace-write"];
     return p === "auto"

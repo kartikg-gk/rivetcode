@@ -15,7 +15,12 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
 const at = process.argv.indexOf("--");
-const spec = JSON.parse(at >= 0 ? process.argv[at + 1] ?? "{}" : "{}");
+// The script is the whole prompt, or the JSON object inside a longer one (a task built
+// around it, such as one from an issue).
+const raw = at >= 0 ? process.argv[at + 1] ?? "{}" : "{}";
+const spec = (() => {
+  try { return JSON.parse(raw); } catch { return JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)); }
+})();
 const exit = () => process.exit(spec.exitCode ?? 0);
 
 if (spec.failUntilAttempt && Number(process.env.RIVET_ATTEMPT ?? 0) < spec.failUntilAttempt) {

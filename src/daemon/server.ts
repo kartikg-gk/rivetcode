@@ -1,19 +1,24 @@
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude, findCodex } from "../agents/locate.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
-import { dataDir, assertId } from "../paths.js";
+import { dataDir, assertId, defaultProjectId } from "../paths.js";
 import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
-import { cleanRun, prepareRun, RunInputError, SetupError } from "../scheduler/runs.js";
+import { cleanRun, MODEL_FAMILIES, prepareRun, repoRoot, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
+import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
+import { checkCue } from "../scheduler/cues.js";
+import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
+import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, type Run } from "../store.js";
 import { runUsage } from "../usage.js";
-import { ACTIVITY_STATES, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
+import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
 import { emptyTrash, waitForTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
@@ -21,12 +26,18 @@ const BODY_LIMIT = 1024 * 1024;
 const CONFIG_KEYS = [
   "check",
   "test",
+  "verify.reuse",
   "worker.agent",
   "worker.permission",
   "worker.model",
+  "claude.model",
+  "codex.model",
   "worker.allowedTools",
   "worker.mode",
   "pr",
+  "review",
+  "review.agent",
+  "pr.feedback",
   "github.repo",
   "copy",
   "setup",
@@ -50,6 +61,10 @@ export type DaemonOptions = {
   prWatchMs?: number;
   // How often workers' branches are checked for clashes to tell their orchestrators about.
   radarMs?: number;
+  // How often due automations are looked for.
+  automationMs?: number;
+  // How often workers are checked against their task's time and token limits.
+  limitMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -188,6 +203,38 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     onError: (error) => { opts.onError?.(error); },
   });
 
+  // Creates a run with the project's settings and starts its agent.
+  async function newRun(o: Omit<NewRun, "data" | "defaultAgentFor" | "copyFor" | "setupFor">): Promise<Run> {
+    const run = await prepareRun({
+      ...o, data,
+      defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
+      copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
+      // One command per line, run in order in every new worktree.
+      setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
+    });
+    await write(() => store.saveRun(run));
+    void scheduler.startRun(run.id).catch((e) => opts.onError?.(e));
+    return run;
+  }
+
+  // Automations whose time has come start their run; each is moved to its next time first,
+  // so a failure is recorded once and not retried every tick. A time missed while the
+  // daemon was down runs once.
+  async function runDueAutomations(now = new Date()): Promise<void> {
+    const due = await write(() => store.listAutomations().filter((a) => a.enabled && Date.parse(a.nextRunAt) <= now.getTime()));
+    for (const a of due) {
+      const next = nextRun(parseCron(a.cron), a.zone, now).toISOString();
+      await write(() => store.saveAutomation({ ...a, nextRunAt: next, lastRunAt: now.toISOString() }));
+      try {
+        const run = await newRun({ repo: a.repo, task: a.prompt, role: a.role, name: a.name, ...(a.agent ? { agent: a.agent } : {}) });
+        await write(() => store.recordAutomationRun({ automationId: a.id, scheduledFor: a.nextRunAt, runId: run.id, createdAt: now.toISOString() }));
+      } catch (error) {
+        await write(() => store.recordAutomationRun({ automationId: a.id, scheduledFor: a.nextRunAt, error: (error as Error).message, createdAt: now.toISOString() }));
+        opts.onError?.(error);
+      }
+    }
+  }
+
   const server = createServer((req, res) => {
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) return;
@@ -213,11 +260,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   let markStopped!: () => void;
   const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
   const onSignal = () => { void stop(); };
+  let automationTimer: NodeJS.Timeout | undefined;
   function stop(): Promise<void> {
     if (stopping) return stopping;
     stopping = (async () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      if (automationTimer) clearInterval(automationTimer);
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
@@ -321,6 +370,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (activity) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
+      // A reviewer's hooks have nothing to record: it is not the run's session.
+      if (nodeId === "review" || nodeId === "partner") {
+        reply(res, 204);
+        return;
+      }
       const payload = await body(req);
       if (payload.state !== undefined && !ACTIVITY_STATES.includes(payload.state as ActivityState)) {
         throw new HttpError(400, "invalid activity state");
@@ -334,8 +388,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 204);
         return;
       }
+      const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
+      if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
     }
@@ -345,10 +401,53 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const { runId, nodeId } = session(payload.sessionId);
       if (!REPORT_KINDS.includes(payload.kind as ReportKind)) throw new HttpError(400, "invalid report kind");
       const message = optionalString(payload.message, "message");
+      // A partner's report is its result for the worker that delegated to it.
+      if (nodeId === "partner") {
+        scheduler.partnerReport(runId, payload.kind as string, message);
+        reply(res, 201, { id: 0 });
+        return;
+      }
       const id = await write(() => store.createReport(runId, nodeId, payload.kind as ReportKind, message));
       if (id === null) throw new HttpError(404, "unknown session");
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
+      return;
+    }
+    const delegation = /^\/api\/v1\/sessions\/([^/]+)\/delegate$/.exec(path);
+    if (delegation) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId, nodeId } = session(delegation[1]);
+      if (nodeId !== NODE_ID) throw new HttpError(409, "only a worker delegates");
+      const payload = await body(req);
+      const agent = optionalString(payload.agent, "agent");
+      if (agent !== undefined && !AGENTS.includes(agent as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
+      const model = optionalString(payload.model, "model");
+      reply(res, 202, await scheduler.delegate(runId, {
+        task: optionalString(payload.task, "task") ?? "", review: payload.review === true,
+        ...(agent ? { agent: agent as never } : {}), ...(model ? { model } : {}),
+      }));
+      return;
+    }
+    const submit = /^\/api\/v1\/sessions\/([^/]+)\/review$/.exec(path);
+    if (submit) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId, nodeId } = session(submit[1]);
+      if (nodeId !== "review") throw new HttpError(409, "only a reviewer submits a review");
+      const payload = await body(req);
+      if (payload.verdict !== "approved" && payload.verdict !== "changes_requested") throw new HttpError(400, "verdict must be approved or changes_requested");
+      if (typeof payload.summary !== "string" || !payload.summary.trim()) throw new HttpError(400, "summary is required");
+      const comments = (Array.isArray(payload.comments) ? payload.comments : []) as { path: string; line: number; body: string }[];
+      for (const c of comments) {
+        if (typeof c?.path !== "string" || !Number.isInteger(c?.line) || c.line < 1 || typeof c?.body !== "string") throw new HttpError(400, "each comment needs path, line and body");
+      }
+      reply(res, 200, await scheduler.submitReview(runId, { verdict: payload.verdict, summary: payload.summary.trim(), comments }));
+      return;
+    }
+    const check = /^\/api\/v1\/sessions\/([^/]+)\/check$/.exec(path);
+    if (check) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId } = session(check[1]);
+      reply(res, 200, await scheduler.agentCheck(runId));
       return;
     }
     const send = /^\/api\/v1\/sessions\/([^/]+)\/send$/.exec(path);
@@ -381,11 +480,15 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const payload = await body(req);
-      if (typeof payload.repo !== "string" || typeof payload.task !== "string") {
+      const issueRef = optionalString(payload.issue, "issue");
+      let spec: TaskSpec | undefined;
+      try { spec = checkSpec(payload.spec); } catch (e) { throw new HttpError(400, (e as Error).message); }
+      if (typeof payload.repo !== "string" || (typeof payload.task !== "string" && issueRef === undefined)) {
         throw new HttpError(400, "repo and task must be strings");
       }
       const agent = optionalString(payload.agent, "agent");
-      const name = optionalString(payload.name, "name");
+      let name = optionalString(payload.name, "name");
+      let task = typeof payload.task === "string" ? payload.task : "";
       const model = optionalString(payload.model, "model");
       const role = (optionalString(payload.role, "role") ?? "worker") as Role;
       if (!ROLES.includes(role)) throw new HttpError(400, `role must be one of ${ROLES.join(", ")}`);
@@ -404,28 +507,98 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           base ??= sender.base;
         }
       }
+      // A task from an issue: the issue is read now, so the worker starts with it.
+      let issue: number | undefined;
+      if (issueRef !== undefined) {
+        try {
+          const root = await repoRoot(repo);
+          const gh = await github({ repo: root, project: defaultProjectId(root) } as Run);
+          const found = await gh.issue(issueNumber(issueRef, gh.repo));
+          issue = found.number;
+          task = issueTask(found, task);
+          name ??= found.title.slice(0, 100);
+        } catch (error) {
+          if (error instanceof RunInputError || error instanceof IssueRefError) throw new HttpError(400, error.message);
+          throw new HttpError(409, `cannot read issue ${issueRef}: ${(error as Error).message}`);
+        }
+      }
       let run;
       try {
-        run = await prepareRun({
-          data, repo, task: payload.task as string, role,
+        run = await newRun({
+          repo, task, role, ...(issue ? { issue } : {}), ...(spec ? { spec } : {}),
           ...(name !== undefined ? { name } : {}), ...(model !== undefined ? { model } : {}), ...(orchestrator ? { orchestrator } : {}),
           ...(base !== undefined ? { base } : {}), ...(agent !== undefined ? { agent } : {}),
-          defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
-          copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
-          // One command per line, run in order in every new worktree.
-          setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
         });
       } catch (error) {
         if (error instanceof RunInputError) throw new HttpError(400, error.message);
         if (error instanceof SetupError) throw new HttpError(409, error.message);
         throw error;
       }
-      await write(() => store.saveRun(run));
-      void scheduler.startRun(run.id).catch((e) => opts.onError?.(e));
       reply(res, 201, { runId: run.id });
       return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy))?$/.exec(path);
+    if (path === "/api/v1/automations") {
+      if (req.method === "GET") {
+        const all = await write(() => store.listAutomations().map((a) => ({ ...a, runs: store.automationRuns(a.id).slice(-5) })));
+        reply(res, 200, { automations: all });
+        return;
+      }
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      const repoArg = optionalString(payload.repo, "repo");
+      const prompt = optionalString(payload.prompt, "prompt");
+      const name = optionalString(payload.name, "name")?.trim();
+      const cron = optionalString(payload.cron, "cron");
+      const zone = optionalString(payload.zone, "zone") ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const role = (optionalString(payload.role, "role") ?? "worker") as Role;
+      const agent = optionalString(payload.agent, "agent");
+      if (!repoArg || !prompt?.trim() || !name || !cron) throw new HttpError(400, "repo, name, cron and prompt are required");
+      if (!/^[\w.-]{1,64}$/.test(name)) throw new HttpError(400, "a name is one word of at most 64 characters");
+      if (!ROLES.includes(role)) throw new HttpError(400, `role must be one of ${ROLES.join(", ")}`);
+      if (agent !== undefined && !AGENTS.includes(agent as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
+      let next: string;
+      try {
+        checkZone(zone);
+        next = nextRun(parseCron(cron), zone, new Date()).toISOString();
+      } catch (e) { throw new HttpError(400, (e as Error).message); }
+      let root: string;
+      try { root = await repoRoot(repoArg); } catch (e) { throw new HttpError(400, (e as Error).message); }
+      const project = defaultProjectId(root);
+      if (await write(() => store.listAutomations(project).some((a) => a.name === name))) throw new HttpError(409, `an automation "${name}" exists`);
+      const automation = {
+        id: `a${randomBytes(6).toString("hex")}`, project, repo: root, name, prompt: prompt.trim(), role, cron, zone,
+        enabled: true, nextRunAt: next, createdAt: new Date().toISOString(), ...(agent ? { agent } : {}),
+      };
+      await write(() => store.saveAutomation(automation));
+      reply(res, 201, automation);
+      return;
+    }
+    const automationRoute = /^\/api\/v1\/automations\/([^/]+)(?:\/(pause|resume|run))?$/.exec(path);
+    if (automationRoute) {
+      const [, ref, action] = automationRoute;
+      const found = await write(() => store.listAutomations().find((a) => a.id === ref || a.name === decodeURIComponent(ref!)));
+      if (!found) throw new HttpError(404, `no automation "${decodeURIComponent(ref!)}"`);
+      if (req.method === "DELETE" && !action) {
+        await write(() => store.deleteAutomation(found.id));
+        reply(res, 204);
+        return;
+      }
+      if (req.method !== "POST" || !action) throw new HttpError(405, "method not allowed");
+      if (action === "run") {
+        // Now, once, without moving its schedule.
+        const run = await newRun({ repo: found.repo, task: found.prompt, role: found.role, name: found.name, ...(found.agent ? { agent: found.agent } : {}) });
+        await write(() => store.recordAutomationRun({ automationId: found.id, scheduledFor: new Date().toISOString(), runId: run.id, createdAt: new Date().toISOString() }));
+        reply(res, 201, { runId: run.id });
+        return;
+      }
+      const enabled = action === "resume";
+      // Resuming starts from the next time after now, so missed times are not run.
+      const nextRunAt = enabled ? nextRun(parseCron(found.cron), found.zone, new Date()).toISOString() : found.nextRunAt;
+      await write(() => store.saveAutomation({ ...found, enabled, nextRunAt }));
+      reply(res, 200, { ...found, enabled, nextRunAt });
+      return;
+    }
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review|switch))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -443,7 +616,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         // Every conversation its agents had (retries and conflict fixes too), from their own files.
         const conversations = await write(() => store.conversations(run.id));
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, now: new Date(at).toISOString() });
+        const reviews = await write(() => store.reviewsOf(run.id));
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {
@@ -456,8 +630,23 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       if (action === "stop") {
-        await scheduler.stopRun(run.id);
-        reply(res, 204);
+        const payload = await body(req);
+        const workers = await scheduler.stopRun(run.id, { keepWorkers: payload.keepWorkers === true });
+        reply(res, 200, { workers });
+        return;
+      }
+      if (action === "switch") {
+        const payload = await body(req);
+        const to = optionalString(payload.agent, "agent");
+        if (!to || !AGENTS.includes(to as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
+        const model = optionalString(payload.model, "model");
+        if (model && MODEL_FAMILIES[to === "claude" ? "codex" : "claude"]?.test(model)) throw new HttpError(400, `model "${model}" is not a ${to} model`);
+        await scheduler.switchAgent(run.id, to as never, model);
+        reply(res, 202, { runId: run.id, agent: to });
+        return;
+      }
+      if (action === "review") {
+        reply(res, 202, { reviewId: await scheduler.startReview(run.id, "manual") });
         return;
       }
       if (action === "pr") {
@@ -480,6 +669,29 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const runs = await write(() => store.listRuns(project).map((id) => store.loadRun(id)));
       reply(res, 200, { conflicts: await radar(runs) });
       return;
+    }
+    const cues = /^\/api\/v1\/projects\/([^/]+)\/cues(?:\/([^/]+))?$/.exec(path);
+    if (cues) {
+      const project = decodeURIComponent(cues[1]!);
+      const name = cues[2] === undefined ? undefined : decodeURIComponent(cues[2]);
+      if (req.method === "GET" && name === undefined) {
+        reply(res, 200, { cues: await write(() => store.listCues(project)) });
+        return;
+      }
+      if (req.method === "PUT" && name !== undefined) {
+        const payload = await body(req);
+        let cue;
+        try { cue = checkCue(project, name, payload.type, payload.text); } catch (e) { throw new HttpError(400, (e as Error).message); }
+        await write(() => store.saveCue(cue));
+        reply(res, 200, cue);
+        return;
+      }
+      if (req.method === "DELETE" && name !== undefined) {
+        if (!(await write(() => store.deleteCue(project, name)))) throw new HttpError(404, `no cue "${name}"`);
+        reply(res, 204);
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
     }
     const config = /^\/api\/v1\/projects\/([^/]+)\/config$/.exec(path);
     if (config) {
@@ -513,7 +725,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
+    automationTimer = setInterval(() => { void runDueAutomations().catch((e) => opts.onError?.(e)); }, opts.automationMs ?? 30_000);
+    automationTimer.unref();
+    void runDueAutomations().catch((e) => opts.onError?.(e));
     scheduler.watchRadar(opts.radarMs ?? 60_000);
+    scheduler.watchLimits(opts.limitMs ?? 15_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {
       void scheduler.recover(id).catch((e) => opts.onError?.(e));
