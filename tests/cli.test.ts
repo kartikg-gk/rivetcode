@@ -250,6 +250,22 @@ describe("spawn, status, resume, clean, project", () => {
     expect(await runCli(["run", "missing.yaml"], inRepo())).toBe(2);
   });
 
+  it("read shows a session's timeline, and how to see more", async () => {
+    daemon = await startDaemon({ data, runFile, port: 0 });
+    const task = JSON.stringify({ files: { "a.txt": "a" }, commit: "a" });
+    expect(await runCli(["spawn", "--agent", "fake", "--name", "add a", task], inRepo())).toBe(0);
+    const runId = /worker (r\w+) started/.exec(out.join("\n"))![1]!;
+    await waitFor(runId, "done");
+    out = [];
+    expect(await runCli(["read", runId], inRepo())).toBe(0);
+    expect(out[0]).toMatch(new RegExp(`^${runId} \\(add a\\): fake, done(, exited)? · messages, 1 entries$`));
+    expect(out[1]).toMatch(/^#\d+ task: \{"files"/);
+    out = [];
+    expect(await runCli(["read", runId, "--activity", "--limit", "1"], inRepo())).toBe(0);
+    expect(out.at(-1)).toMatch(new RegExp(`^more: rivet read ${runId} --after \\d+ --activity$`));
+    expect(await runCli(["read"], inRepo())).toBe(2);
+  });
+
   it("saves, lists, runs and removes cues", async () => {
     daemon = await startDaemon({ data, runFile, port: 0 });
     const task = JSON.stringify({ files: { "c.txt": "from a cue" }, commit: "c" });

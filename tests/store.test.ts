@@ -130,25 +130,25 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
   });
 
   it("applies migrations 2 and 3 once to a version 1 database", () => {
     store.saveRun(sampleRun());
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     expect(versions()).toEqual([1]);
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     expect(store.loadRun("r1")).toMatchObject({ role: "worker", name: "", node: { id: "agent" } });
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
   });
 });
 
@@ -184,7 +184,7 @@ describe("migration 3 and project config", () => {
     store.saveRun(run);
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DELETE FROM schema_migrations WHERE version >= 3; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 3; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
     db.exec("CREATE TABLE n2 AS SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes; DROP TABLE nodes; ALTER TABLE n2 RENAME TO nodes;");
     db.close();
     store = openStore(data);
@@ -242,5 +242,25 @@ describe("pull requests", () => {
     expect(store.getPr("r1")).toEqual({ number: 7, url: "https://github.com/o/r/pull/7" });
     store.setPr("r1", { number: 7, url: "https://github.com/o/r/pull/7", handled: "ci:abc" });
     expect(store.getPr("r1")!.handled).toBe("ci:abc");
+  });
+});
+
+describe("timeline", () => {
+  it("keeps entries in order, pages them, narrows to messages, and skips a prompt seen twice", () => {
+    store.saveRun(sampleRun());
+    store.addTimeline("r1", "agent", [{ kind: "prompt", text: "do it" }]);
+    // A hook seeing the same prompt again adds nothing.
+    store.addTimeline("r1", "agent", [{ kind: "prompt", text: "do it" }, { kind: "tool", tool: "Bash", text: "npm test" }]);
+    store.addTimeline("r1", "agent", [{ kind: "assistant", text: "done" }]);
+    store.addTimeline("r1", "review", [{ kind: "prompt", text: "review it" }]);
+    const all = store.readTimeline("r1", { limit: 10 });
+    expect(all.total).toBe(4);
+    expect(all.items.map((i) => [i.session, i.kind, i.text])).toEqual([
+      ["agent", "prompt", "do it"], ["agent", "tool", "npm test"], ["agent", "assistant", "done"], ["review", "prompt", "review it"],
+    ]);
+    const messages = store.readTimeline("r1", { limit: 10, kinds: ["prompt", "message", "assistant"], session: "agent" });
+    expect(messages.items.map((i) => i.text)).toEqual(["do it", "done"]);
+    const page = store.readTimeline("r1", { limit: 2 });
+    expect(store.readTimeline("r1", { limit: 10, after: page.items[1]!.position }).items.map((i) => i.text)).toEqual(["done", "review it"]);
   });
 });

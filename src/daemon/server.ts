@@ -14,6 +14,15 @@ import { cleanRun, MODEL_FAMILIES, prepareRun, repoRoot, RunInputError, SetupErr
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
 import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
+import { MESSAGE_KINDS, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "../timeline.js";
+
+// Timeline entries a hook sent, kept only when well formed.
+function checkEntries(raw: unknown): TimelineEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((e): e is TimelineEntry => !!e && typeof e === "object" && TIMELINE_KINDS.includes((e as { kind: TimelineKind }).kind)
+    && typeof (e as { text: unknown }).text === "string" && ((e as { tool?: unknown }).tool === undefined || typeof (e as { tool?: unknown }).tool === "string"))
+    .slice(0, 50);
+}
 import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
@@ -372,18 +381,27 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (activity) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
-      // A reviewer's hooks have nothing to record: it is not the run's session.
+      const payload = await body(req);
+      // What the hook saw goes on the session's timeline (reviewers and partners too).
+      const entries = checkEntries(payload.timeline);
+      if (entries.length) await write(() => store.addTimeline(runId, nodeId, entries)).catch(() => {});
+      // A reviewer's or partner's activity is not the run's session state.
       if (nodeId === "review" || nodeId === "partner") {
         reply(res, 204);
         return;
       }
-      const payload = await body(req);
       if (payload.state !== undefined && !ACTIVITY_STATES.includes(payload.state as ActivityState)) {
         throw new HttpError(400, "invalid activity state");
       }
       const state = (payload.state as ActivityState | undefined) ?? null;
       const agentSessionId = optionalString(payload.agentSessionId, "agentSessionId");
-      if (state === null && agentSessionId === undefined) throw new HttpError(400, "state or agentSessionId is required");
+      if (state === null && agentSessionId === undefined) {
+        if (entries.length) {
+          reply(res, 204);
+          return;
+        }
+        throw new HttpError(400, "state or agentSessionId is required");
+      }
       // Hooks of an agent from an earlier launch may still fire; only the current launch counts.
       const launchId = optionalString(payload.launchId, "launchId");
       if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
@@ -483,6 +501,30 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         delivery = mode === "interrupt" && (await scheduler.interruptHeadless(runId)) ? "interrupted" : "turn-end";
       } else delivery = "next-launch";
       reply(res, 202, { id, delivery });
+      return;
+    }
+    const timelineRoute = /^\/api\/v1\/runs\/([^/]+)\/timeline$/.exec(path);
+    if (timelineRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = timelineRoute[1]!;
+      const run = await write(() => store.loadRun(runId)).catch(() => null);
+      if (!run) throw new HttpError(404, "unknown run");
+      const q = new URL(req.url ?? "", "http://x").searchParams;
+      const num = (k: string, d: number, max: number) => Math.min(max, Math.max(1, Number(q.get(k) ?? d) || d));
+      const view = q.get("view") === "activity" ? "activity" : "messages";
+      const limit = num("limit", 50, 100);
+      const maxChars = num("maxChars", 20_000, 50_000);
+      const session = q.get("session") ?? undefined;
+      const page = await write(() => store.readTimeline(run.id, {
+        after: Number(q.get("after") ?? 0) || 0, limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
+      }));
+      const items = page.items.map((i) => (i.text.length > maxChars
+        ? { ...i, text: i.text.slice(0, maxChars), cut: { shown: maxChars, length: i.text.length } } : i));
+      const last = items.at(-1)?.position;
+      reply(res, 200, {
+        run: { id: run.id, name: run.name, role: run.role, agent: run.node.agent, status: run.node.status, activity: run.node.activity ?? null },
+        view, total: page.total, items, ...(last !== undefined && page.items.length === limit ? { next: last } : {}),
+      });
       return;
     }
     const answerRoute = /^\/api\/v1\/runs\/([^/]+)\/answer$/.exec(path);

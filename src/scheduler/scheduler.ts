@@ -10,6 +10,7 @@ import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
 import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
+import { fromCodexJson, readableOutput, type TimelineEntry } from "../timeline.js";
 import { outsidePaths } from "./tasks.js";
 import { conversationFile, runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
@@ -99,6 +100,20 @@ export function createScheduler(d: SchedulerDeps) {
   const report = (e: unknown) => d.onError?.(e);
 
   const load = (runId: string) => d.write(() => d.store.loadRun(runId));
+
+  // A session's timeline. Codex run headless reports its work as JSON lines, read as they come.
+  const note = (runId: string, session: string, entries: TimelineEntry[]) =>
+    d.write(() => d.store.addTimeline(runId, session, entries)).catch(report);
+  function followStream(runId: string, session: string, sessionId: string, agentName: string, headless: boolean): void {
+    if (!headless || agentName !== "codex") return;
+    let partial = "";
+    d.runtime.attach(sessionId, (chunk) => {
+      const parts = (partial + chunk).split(/\r?\n/);
+      partial = parts.pop() ?? "";
+      const entries = parts.flatMap((line) => fromCodexJson(line) ?? []);
+      if (entries.length) void note(runId, session, entries);
+    });
+  }
   const sessionOf = (run: Run) => sessionIdOf(run.id, run.node.id);
 
   function track<T>(work: Promise<T>): Promise<T> {
@@ -182,6 +197,8 @@ export function createScheduler(d: SchedulerDeps) {
       throw e;
     }
     doneReported.delete(sessionId);
+    if (prompt !== undefined) await note(run.id, NODE_ID, [{ kind: o.resume ? "message" : "prompt", text: prompt }]);
+    followStream(run.id, NODE_ID, sessionId, node.agent, headless);
     await d.write(() => d.store.markLaunched(run.id, node.id));
     await deliverQueued(run.id);
     return launchId;
@@ -219,6 +236,7 @@ export function createScheduler(d: SchedulerDeps) {
         await d.runtime.write(sessionId, m.message);
       } catch { return; }
       await d.write(() => d.store.markDelivered(m.id));
+      await note(runId, NODE_ID, [{ kind: "message", text: m.message }]);
     }
   }
 
@@ -381,8 +399,9 @@ export function createScheduler(d: SchedulerDeps) {
     await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} gave up: ${why.split(/\r?\n/)[0]}`);
   }
 
+  // What an agent last printed, readable: Codex's JSON events become their text.
   function lastOutput(sessionId: string): string {
-    return (d.runtime.output(sessionId, OUTPUT_FOR_RETRY)?.lines ?? []).join("\n");
+    return readableOutput(d.runtime.output(sessionId, OUTPUT_FOR_RETRY)?.lines ?? []).join("\n");
   }
 
   async function onExit(sessionId: string, launchId: string, code: number | null): Promise<void> {
@@ -469,9 +488,10 @@ export function createScheduler(d: SchedulerDeps) {
 
   // "rivet report": every report goes on to the worker's orchestrator; "--done" also
   // stops the agent and takes the work.
-  async function onReport(runId: string, kind: string, note?: string): Promise<void> {
+  async function onReport(runId: string, kind: string, said?: string): Promise<void> {
     const run = await load(runId);
-    await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} reports ${kind}${note ? `: ${note}` : ""}`);
+    await note(runId, NODE_ID, [{ kind: "event", text: `reported ${kind}${said ? `: ${said}` : ""}` }]);
+    await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} reports ${kind}${said ? `: ${said}` : ""}`);
     if (kind !== "done" || run.role !== "worker") return;
     const sessionId = sessionOf(run);
     doneReported.add(sessionId);
@@ -722,6 +742,8 @@ export function createScheduler(d: SchedulerDeps) {
         sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
         env: agentEnv({ runId, nodeId: "review", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
       });
+      await note(runId, "review", [{ kind: "prompt", text: reviewerPrompt(run, pr, sha) }]);
+      followStream(runId, "review", session, agentName, true);
     } catch (e) {
       await d.write(() => d.store.endReview(id, { status: "failed", body: `could not start: ${(e as Error).message}` }));
       throw e;
@@ -812,6 +834,8 @@ export function createScheduler(d: SchedulerDeps) {
         sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
         env: agentEnv({ runId, nodeId: "partner", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
       });
+      await note(runId, "partner", [{ kind: "prompt", text: partnerPrompt(run, o.task, !!o.review, agentName) }]);
+      followStream(runId, "partner", session, agentName, true);
     } catch (e) {
       partners.delete(runId);
       throw e;

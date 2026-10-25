@@ -43,7 +43,7 @@ describe("codex commands", () => {
 
   it("runs codex exec when headless", () => {
     const cmd = codexStartCommand({ binary: "codex", workspace: "/w", permission: "accept-edits", prompt: "go", headless: true, hookFlags: [] });
-    expect(cmd.slice(0, 2)).toEqual(["codex", "exec"]);
+    expect(cmd.slice(0, 3)).toEqual(["codex", "exec", "--json"]);
     expect(cmd).toContain("workspace-write");
     expect(cmd.slice(-2)).toEqual(["--", "go"]);
   });
@@ -56,7 +56,7 @@ describe("codex commands", () => {
 
   it("resumes headless through exec resume, with the sandbox as config", () => {
     expect(codexResumeCommand({ binary: "codex", workspace: "/w", capturedId: "th-1", prompt: "messages", permission: "accept-edits", headless: true, hookFlags: [] }))
-      .toEqual(["codex", "exec", "resume", ...BASE, "-c", 'sandbox_mode="workspace-write"', "-c", "projects={'/w'={trust_level=\"trusted\"}}", "th-1", "--", "messages"]);
+      .toEqual(["codex", "exec", "resume", "--json", ...BASE, "-c", 'sandbox_mode="workspace-write"', "-c", "projects={'/w'={trust_level=\"trusted\"}}", "th-1", "--", "messages"]);
   });
 
   it("delivers its hooks as per-launch config calling this rivet by absolute path", () => {

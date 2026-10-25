@@ -9,6 +9,7 @@ import { mkdirSync } from "node:fs";
 import { readRunFile } from "../runfile.js";
 import type { Probes } from "./doctor.js";
 import { agentSessionIdOf, deriveActivity } from "./activity.js";
+import { fromHook } from "../timeline.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
 
 export type CliIo = {
@@ -67,6 +68,8 @@ const USAGE = `usage: rivet <command>
   send --session <id> --message <text> [--mode steer|queue|interrupt]
                                         send a message: as soon as it can take it (steer), once idle (queue),
                                         or stopping its current turn first (interrupt)
+  read <run> [--activity] [--after <n>] [--limit <n>] [--session agent|review|partner]
+                                        what a session was told and said (with --activity, what it did too)
   answer <run> yes|always|no [--note <text>]
                                         answer the permission question an agent in a terminal waits at`;
 
@@ -133,13 +136,15 @@ async function hooks(args: string[], io: CliIo): Promise<number> {
   }
   const state = deriveActivity(agent, event, payload);
   const agentSessionId = agentSessionIdOf(payload);
-  if (state === null && agentSessionId === undefined) return 0;
+  const timeline = fromHook(agent, event, payload);
+  if (state === null && agentSessionId === undefined && timeline.length === 0) return 0;
   const launchId = io.env.RIVET_LAUNCH_ID?.trim();
   const request = state === "blocked" || event === "permission-request" ? permissionRequestOf(payload) : undefined;
   try {
     await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/activity`, {
       ...(state ? { state } : {}),
       ...(request ? { request } : {}),
+      ...(timeline.length ? { timeline } : {}),
       ...(agentSessionId ? { agentSessionId } : {}),
       ...(launchId ? { launchId } : {}),
     }, HOOK_TIMEOUT_MS);
@@ -156,6 +161,28 @@ function permissionRequestOf(payload: Record<string, unknown>): { tool: string; 
   const input = (payload.tool_input ?? {}) as Record<string, unknown>;
   const detail = [input.command, input.file_path, input.path, input.url].find((v) => typeof v === "string") as string | undefined;
   return { tool, detail: detail ?? JSON.stringify(input).slice(0, 300) };
+}
+
+// A session's timeline: messages (what it was told and said) or
+// activity (its tool calls and results too), paged with --after.
+async function read(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["after", "limit", "session", "max-chars"]);
+  const runId = rest[0];
+  if (!runId) throw new UsageError("read needs a run id");
+  const q = new URLSearchParams({ view: flags.get("activity") === true ? "activity" : "messages" });
+  for (const [flag, key] of [["after", "after"], ["limit", "limit"], ["session", "session"], ["max-chars", "maxChars"]] as const) {
+    if (typeof flags.get(flag) === "string") q.set(key, flags.get(flag) as string);
+  }
+  type Item = { position: number; session: string; kind: string; tool?: string; text: string; at: string; cut?: { shown: number; length: number } };
+  const page = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}/timeline?${q}`, undefined, COMMAND_TIMEOUT_MS) as
+    { run: { id: string; name: string; agent: string; status: string; activity: string | null }; view: string; total: number; items: Item[]; next?: number };
+  io.out(`${page.run.id}${page.run.name ? ` (${page.run.name})` : ""}: ${page.run.agent}, ${page.run.status}${page.run.activity ? `, ${page.run.activity}` : ""} · ${page.view}, ${page.total} entries`);
+  for (const i of page.items) {
+    const who = i.kind === "assistant" ? "agent" : i.kind === "prompt" ? "task" : i.kind === "tool" ? `${i.tool ?? "tool"}` : i.kind === "result" ? `${i.tool ?? "tool"} result` : i.kind;
+    io.out(`#${i.position} ${i.session === "agent" ? "" : `[${i.session}] `}${who}: ${i.text}${i.cut ? `\n[shown ${i.cut.shown} of ${i.cut.length} characters; see more with --max-chars]` : ""}`);
+  }
+  if (page.next !== undefined) io.out(`more: rivet read ${runId} --after ${page.next}${page.view === "activity" ? " --activity" : ""}`);
+  return 0;
 }
 
 // Answers the permission question a terminal agent is waiting at.
@@ -739,6 +766,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "report": return await report(args, io);
       case "send": return await send(args, io);
       case "answer": return await answer(args, io);
+      case "read": return await read(args, io);
       case "check": return await check(io);
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);

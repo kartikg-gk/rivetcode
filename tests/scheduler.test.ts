@@ -718,3 +718,52 @@ describe("answering a permission question and send modes", () => {
     await api("POST", `/api/v1/runs/${runId}/stop`, {});
   });
 });
+
+describe("reading a session's timeline", () => {
+  it("shows what the worker was told and said; activity adds what it did; pages and cuts like a thread read", async () => {
+    await start();
+    const runId = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 300));
+    await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also add docs" });
+    // What a hook reports: the same prompt again (skipped), a tool call, its result, the reply.
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active", timeline: [
+      { kind: "prompt", text: JSON.stringify({ listen: true }) },
+      { kind: "tool", tool: "Bash", text: "npm test" }, { kind: "result", tool: "Bash", text: "ok" },
+      { kind: "assistant", text: "x".repeat(30) }, { kind: "nonsense", text: "dropped" },
+    ] });
+    const messages = (await api("GET", `/api/v1/runs/${runId}/timeline`)).json;
+    expect(messages).toMatchObject({ view: "messages", total: 3, run: { id: runId, agent: "fake", status: "running" } });
+    expect(messages.items.map((i: { kind: string }) => i.kind)).toEqual(["prompt", "message", "assistant"]);
+    const activity = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&limit=2`)).json;
+    expect(activity.total).toBe(5);
+    expect(activity.items.map((i: { kind: string }) => i.kind)).toEqual(["prompt", "message"]);
+    const rest = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&after=${activity.next}&maxChars=10`)).json;
+    expect(rest.items.map((i: { kind: string; text: string }) => [i.kind, i.text])).toEqual([["tool", "npm test"], ["result", "ok"], ["assistant", "xxxxxxxxxx"]]);
+    expect(rest.items[2].cut).toEqual({ shown: 10, length: 30 });
+    expect(rest.next).toBeUndefined();
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("keeps a headless Codex worker's replies and commands from its --json events, as they come", async () => {
+    const script = "for (const e of [" +
+      "{type:'item.completed',item:{type:'agent_message',text:'Looking at the tests.'}}," +
+      "{type:'item.started',item:{type:'command_execution',command:'npm test'}}," +
+      "{type:'item.completed',item:{type:'command_execution',command:'npm test',aggregated_output:'1 passing'}}," +
+      "{type:'item.completed',item:{type:'agent_message',text:'All green.'}}]) console.log(JSON.stringify(e));";
+    const fake = getAgent("fake");
+    const codexLike: Agent = { ...fake, name: "codex", launchCommand: async () => [process.execPath, "-e", script] };
+    daemon = await startDaemon({
+      data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, onError: (e) => errors.push(e),
+      agents: (name) => (name === "codex" ? codexLike : getAgent("fake")),
+    });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "check the tests", agent: "codex" })).json.runId as string;
+    await settled(runId);
+    const items = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity`)).json.items as { kind: string; tool?: string; text: string }[];
+    expect(items.map((i) => [i.kind, i.text])).toEqual([
+      ["prompt", expect.stringMatching(/^Your task: check the tests/)],
+      ["assistant", "Looking at the tests."], ["tool", "npm test"], ["result", "1 passing"], ["assistant", "All green."],
+      ["event", expect.stringMatching(/./)],
+    ].slice(0, items.length));
+    expect(items.slice(1, 5).map((i) => i.kind)).toEqual(["assistant", "tool", "result", "assistant"]);
+  });
+});

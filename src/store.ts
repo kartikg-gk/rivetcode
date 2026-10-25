@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
 import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
 import type { TaskSpec } from "./scheduler/tasks.js";
+import { TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "./timeline.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -68,6 +69,11 @@ export type Store = {
   automationRuns(automationId: string): AutomationRun[];
   // A project's cues, by name.
   saveCue(cue: Cue): void;
+  // A session's timeline (session: agent, review or partner). A prompt that repeats the
+  // session's recent prompts or messages is the same one seen twice (Rivet and a hook) and is skipped.
+  addTimeline(runId: string, session: string, entries: TimelineEntry[]): void;
+  // Entries after a position, oldest first; kinds narrows them (the messages view).
+  readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   listCues(project: string): Cue[];
   deleteCue(project: string, name: string): boolean;
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
@@ -124,6 +130,8 @@ export type AutomationRun = { id: number; automationId: string; scheduledFor: st
 
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
+
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string };
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -308,6 +316,20 @@ ALTER TABLE runs ADD COLUMN model TEXT;
 // The issue a run's task came from.
 MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
+` });
+
+// Each session's timeline: what it was told, did and said.
+MIGRATIONS.push({ version: 15, sql: `
+CREATE TABLE timeline (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  session TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('prompt', 'message', 'assistant', 'tool', 'result', 'event')),
+  tool TEXT,
+  text TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX timeline_run ON timeline (run_id, id);
 ` });
 
 // How a sent message is to be delivered.
@@ -631,6 +653,32 @@ export function openStore(data: string): Store {
         id: Number(r.id), automationId: r.automation_id, scheduledFor: r.scheduled_for, createdAt: r.created_at,
         ...(r.run_id !== null ? { runId: r.run_id } : {}), ...(r.error !== null ? { error: r.error } : {}),
       }));
+    },
+
+    addTimeline(runId, session, entries) {
+      const lastSaid = db.prepare("SELECT text FROM timeline WHERE run_id = ? AND session = ? AND kind IN ('prompt', 'message') ORDER BY id DESC LIMIT 5");
+      const insert = db.prepare("INSERT INTO timeline (run_id, session, kind, tool, text, at) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const e of entries) {
+        if (e.kind === "prompt") {
+          const recent = lastSaid.all(runId, session) as { text: string }[];
+          if (recent.some((r) => r.text.trim() === e.text.trim())) continue;
+        }
+        insert.run(runId, session, e.kind, e.tool ?? null, e.text, new Date().toISOString());
+      }
+    },
+
+    readTimeline(runId, o) {
+      const kinds = o.kinds ?? TIMELINE_KINDS;
+      const marks = kinds.map(() => "?").join(", ");
+      const where = `run_id = ? AND kind IN (${marks})${o.session ? " AND session = ?" : ""}`;
+      const args = [runId, ...kinds, ...(o.session ? [o.session] : [])];
+      const total = (db.prepare(`SELECT COUNT(*) AS n FROM timeline WHERE ${where}`).get(...args) as { n: number }).n;
+      type Row = { id: number; session: string; kind: TimelineKind; tool: string | null; text: string; at: string };
+      const rows = db.prepare(`SELECT * FROM timeline WHERE ${where} AND id > ? ORDER BY id LIMIT ?`).all(...args, o.after ?? 0, o.limit) as Row[];
+      return {
+        total: Number(total),
+        items: rows.map((r) => ({ position: Number(r.id), session: r.session, kind: r.kind, text: r.text, at: r.at, ...(r.tool !== null ? { tool: r.tool } : {}) })),
+      };
     },
 
     saveCue(cue) {
