@@ -214,6 +214,8 @@ export function codexChat(o: ChatOptions): ChatDriver {
   let threadId = "";
   let activeTurn = "";
   let turnEnded: (() => void) | null = null;
+  // Turns already over: turn/start's reply can arrive after its turn ended.
+  const finished = new Set<string>();
   const questions = new Map<string, number | string>();
   const settings = codexApproval(o.permission);
 
@@ -258,6 +260,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
         const t = (params.turn ?? {}) as { status?: string; error?: { message?: string } | null };
         const state = t.status === "interrupted" ? "interrupted" : t.status === "failed" ? "failed" : "completed";
         o.emit({ type: "turn", turnId, state, ...(t.error?.message ? { error: t.error.message } : {}) });
+        finished.add(turnId);
         if (turnId === activeTurn) activeTurn = "";
         turnEnded?.();
       } else if (method === "serverRequest/resolved") {
@@ -286,6 +289,8 @@ export function codexChat(o: ChatOptions): ChatDriver {
   function answer(requestId: string, choice: Choice): boolean {
     const id = questions.get(requestId);
     if (id === undefined) return false;
+    // Answered here, so Codex's later "resolved" notice says nothing new.
+    questions.delete(requestId);
     rpc.respond(id, { decision: choice === "yes" ? "accept" : choice === "always" ? "acceptForSession" : "decline" });
     return true;
   }
@@ -303,14 +308,16 @@ export function codexChat(o: ChatOptions): ChatDriver {
     },
     async prompt(said) {
       const ended = new Promise<void>((resolve) => { turnEnded = resolve; });
+      let id = "";
       try {
         const r = await rpc.call("turn/start", { threadId, input: [{ type: "text", text: said }] });
-        const id = text((r.turn as { id?: string } | undefined)?.id);
-        if (id && !activeTurn) { activeTurn = id; o.emit({ type: "turn", turnId: id, state: "running" }); }
+        id = text((r.turn as { id?: string } | undefined)?.id);
+        if (id && !activeTurn && !finished.has(id)) { activeTurn = id; o.emit({ type: "turn", turnId: id, state: "running" }); }
       } catch (e) {
         o.emit({ type: "turn", turnId: activeTurn || "start", state: "failed", error: (e as Error).message });
         return;
       }
+      if (id && finished.has(id)) return;
       await Promise.race([ended, rpc.closed]);
     },
     async steer(said) {
