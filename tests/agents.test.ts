@@ -7,7 +7,7 @@ import { getAgent } from "../src/agents/agent.js";
 import { CLAUDE_HOOKS, claudeAgent, shellRules } from "../src/agents/claude.js";
 import { git } from "../src/git.js";
 import { worktreePath } from "../src/paths.js";
-import { createWorktree, removeWorktree, waitForTrash } from "../src/worktree.js";
+import { createWorktree, removeWorktree } from "../src/worktree.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 describe("registry", () => {
@@ -114,7 +114,6 @@ describe("fake agent", () => {
   });
   afterEach(async () => {
     await removeWorktree(data, repo, path).catch(() => {});
-    await waitForTrash();
     await removeRepo(repo);
     await removeRepo(data);
   });

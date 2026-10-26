@@ -8,7 +8,7 @@ import { commandRules, modelFor } from "../src/scheduler/scheduler.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import type { Run } from "../src/store.js";
-import { listWorktrees, waitForTrash } from "../src/worktree.js";
+import { listWorktrees } from "../src/worktree.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
@@ -25,7 +25,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await daemon?.stop();
   daemon = undefined;
-  await waitForTrash();
   await removeRepo(repo);
   await removeRepo(data);
 });
@@ -267,7 +266,6 @@ describe("symlink list", () => {
     expect(run.node.status).toBe("done");
     expect(await readFile(join(run.node.worktree, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
     expect((await api("POST", `/api/v1/runs/${runId}/clean`)).status).toBe(200);
-    await waitForTrash();
     expect(existsSync(run.node.worktree)).toBe(false);
     expect(await readFile(join(repo, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
   });

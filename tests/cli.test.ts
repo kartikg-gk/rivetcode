@@ -207,8 +207,6 @@ describe("spawn, status, resume, clean, project", () => {
   afterEach(async () => {
     await daemon?.stop();
     daemon = undefined;
-    const { waitForTrash } = await import("../src/worktree.js");
-    await waitForTrash();
     await removeRepo(repo);
   });
 
@@ -359,8 +357,6 @@ describe("attach and panes", () => {
   afterEach(async () => {
     await daemon?.stop();
     daemon = undefined;
-    const { waitForTrash } = await import("../src/worktree.js");
-    await waitForTrash();
     await removeRepo(repo);
   });
 

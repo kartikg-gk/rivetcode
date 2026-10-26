@@ -28,7 +28,7 @@ import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
 import { runUsage } from "../usage.js";
 import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
-import { emptyTrash, waitForTrash } from "../worktree.js";
+import { emptyTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
@@ -300,7 +300,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
-      await waitForTrash();
       store.close();
       await releaseRunFile(runFile, process.pid);
       markStopped();
@@ -836,7 +835,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   } catch (error) {
     await runtime.stopAll();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
-    await waitForTrash();
     store.close();
     throw error;
   }

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, realpath, rename, rm, rmdir } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { mkdir, readdir, realpath, rm, rmdir } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 import { git, GitError } from "./git.js";
 import { samePath } from "./paths.js";
 import { recordedLinks, unlinkAll } from "./links.js";
@@ -154,95 +154,23 @@ async function remove(data: string, repo: string, path: string): Promise<void> {
     await rmdir(full);
     return;
   }
-  // Links into the main checkout come out before any delete, so nothing follows them.
-  const links = await recordedLinks(full);
-  // A lock means someone wants the worktree kept: leave it where it is and let git refuse.
-  if (!registered.locked && (await removeThroughTrash(data, repo, full, links))) return;
+  // Checked first, so a refused worktree keeps its links.
   if (await isDirty(full)) throw new DirtyWorktreeError(full);
-  await unlinkAll(full, links);
-  await git(["worktree", "remove", full], repo);
-}
-
-// Deleting a big worktree is slow, renaming it is instant. So a clean worktree goes into
-// the trash, git forgets it, and the files are deleted in the background.
-// Returns false when this route could not be used and the worktree is back in place.
-async function removeThroughTrash(data: string, repo: string, full: string, links: string[] = []): Promise<boolean> {
-  const item = await moveToTrash(data, full);
-  if (item === null) return false;
-
-  // Judged after the move, so nothing can write into the tree between check and delete.
-  const dirty = await isDirty(item.path).catch(() => null);
-  const pruned = dirty === false && (await prune(repo).then(() => true, () => false));
-  if (!pruned) {
-    await item.putBack();
-    if (dirty) throw new DirtyWorktreeError(full);
-    return false;
+  // Links come out before git deletes anything: git worktree remove on Windows follows a
+  // junction and empties the folder it points at.
+  await unlinkAll(full, await recordedLinks(full));
+  const refused = await git(["worktree", "remove", full], repo).then(() => null, (e: Error) => e);
+  await prune(repo);
+  if ((await listWorktrees(repo)).some((w) => samePath(w.path, full))) {
+    throw new WorktreeError(`refusing to remove ${full}: git still lists it${refused ? ` (${refused.message.trim()})` : ""}`);
   }
-
-  // If git cannot be asked, the tree was clean anyway, so nothing uncommitted is lost.
-  const stillKnown = await listWorktrees(repo).then(
-    (list) => list.some((w) => samePath(w.path, full)),
-    () => false,
-  );
-  if (stillKnown) {
-    await item.putBack();
-    throw new WorktreeError(`refusing to remove ${full}: git still lists it after pruning`);
-  }
-  await unlinkAll(item.path, links);
-  item.purge();
-  return true;
+  // Whatever git left behind (files it does not track).
+  await rm(full, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
-type TrashItem = { path: string; putBack(): Promise<void>; purge(): void };
-
-function trashDir(data: string): string {
-  return join(data, "worktrees", ".trash");
-}
-
-// Each removal gets its own fresh slot folder, so two removals never pick the same name.
-async function moveToTrash(data: string, full: string): Promise<TrashItem | null> {
-  let slot: string;
-  try {
-    await mkdir(trashDir(data), { recursive: true });
-    slot = await mkdtemp(join(trashDir(data), `${basename(full)}-`));
-  } catch {
-    return null;
-  }
-  const path = join(slot, "tree");
-  try {
-    await rename(full, path);
-  } catch {
-    await rmdir(slot).catch(() => {});
-    return null;
-  }
-  return {
-    path,
-    putBack: async () => {
-      await rename(path, full).catch(() => {});
-      await rmdir(slot).catch(() => {});
-    },
-    purge: () => deleteLater(slot),
-  };
-}
-
-const pendingDeletes = new Set<Promise<void>>();
-
-function deleteLater(path: string): void {
-  const job: Promise<void> = rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-    .catch(() => {})
-    .finally(() => pendingDeletes.delete(job));
-  pendingDeletes.add(job);
-}
-
-// Deletes whatever an earlier process left in the trash. Call once at startup.
+// Earlier versions moved removed worktrees into a trash folder; deletes what is left there.
 export async function emptyTrash(data: string): Promise<void> {
-  const names = await readdir(trashDir(data)).catch(() => [] as string[]);
-  for (const name of names) deleteLater(join(trashDir(data), name));
-}
-
-// Waits for background deletes; tests and shutdown use this.
-export async function waitForTrash(): Promise<void> {
-  await Promise.all([...pendingDeletes]);
+  await rm(join(data, "worktrees", ".trash"), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 function isInside(child: string, parent: string): boolean {

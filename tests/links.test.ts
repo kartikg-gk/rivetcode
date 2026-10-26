@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { linkListed, recordedLinks } from "../src/links.js";
 import { worktreePath } from "../src/paths.js";
-import { createWorktree, isDirty, removeWorktree, waitForTrash } from "../src/worktree.js";
+import { createWorktree, isDirty, removeWorktree } from "../src/worktree.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
@@ -25,7 +25,6 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await removeWorktree(data, repo, wt).catch(() => {});
-  await waitForTrash();
   await removeRepo(repo);
   await removeRepo(data);
 });
@@ -42,7 +41,6 @@ describe("linked folders", () => {
   it("removing the worktree takes the link out and leaves the real folder alone", async () => {
     await linkListed(repo, wt, ["node_modules"]);
     await removeWorktree(data, repo, wt);
-    await waitForTrash();
     expect(existsSync(wt)).toBe(false);
     expect(await readFile(join(repo, "node_modules", "dep", "index.js"), "utf8")).toBe("module.exports = 1;\n");
   });
