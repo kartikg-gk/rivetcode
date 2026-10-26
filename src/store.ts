@@ -3,9 +3,10 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
-import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
+import { ACTIVITY_STATES, AGENTS, NODE_ID, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
 import type { TaskSpec } from "./scheduler/tasks.js";
 import { redact, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "./timeline.js";
+import type { ChatEvent } from "./chat/drivers.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -79,6 +80,11 @@ export type Store = {
   listProjects(): string[];
   // A run's state changes after a position, oldest first.
   readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
+  // Folds a chat session's events into its conversation; returns what they mean for the
+  // session: its new activity, and the question it waits on (null once answered).
+  recordChat(runId: string, session: string, events: ChatEvent[]): ChatOutcome;
+  // A chat session's conversation as timeline entries, in the order they happened.
+  readChat(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   // Entries after a position, oldest first; kinds narrows them (the messages view).
   readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   listCues(project: string): Cue[];
@@ -139,6 +145,7 @@ export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
 export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string };
+export type ChatOutcome = { activity?: ActivityState; question?: { tool: string; detail: string; requestId: string } | null; conversationId?: string };
 export type RunEvent = { position: number; nodeId?: string; type: string; data: Record<string, unknown>; at: string };
 
 export type NodeUpdate = {
@@ -153,11 +160,13 @@ export type NodeUpdate = {
   // The agent running the session (changed by a switch), and its own conversation id.
   agent?: Node["agent"];
   agentSessionId?: string | null;
+  sessionMode?: Node["sessionMode"];
+  providerConversationId?: string | null;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
   status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt", prStatus: "pr_status",
-  agent: "agent", agentSessionId: "agent_session_id",
+  agent: "agent", agentSessionId: "agent_session_id", sessionMode: "session_mode", providerConversationId: "provider_conversation_id",
 };
 
 export class RunStoreError extends Error {
@@ -326,6 +335,71 @@ MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
 ` });
 
+// Chat sessions: how each session runs, and the conversation of a chat session (its
+// turns, readable messages and activities), kept by Rivet.
+MIGRATIONS.push({ version: 17, sql: `
+ALTER TABLE nodes ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'terminal' CHECK (session_mode IN ('terminal', 'chat'));
+ALTER TABLE nodes ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
+CREATE TABLE conversations (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('session', 'project')),
+  project TEXT NOT NULL,
+  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+  session TEXT,
+  latest_sequence INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK ((scope = 'session' AND run_id IS NOT NULL AND session IS NOT NULL) OR (scope = 'project' AND run_id IS NULL))
+);
+CREATE UNIQUE INDEX conversations_session ON conversations (run_id, session) WHERE run_id IS NOT NULL;
+CREATE TABLE conversation_turns (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  provider_turn_id TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'interrupted', 'failed')),
+  error_message TEXT NOT NULL DEFAULT '',
+  requested_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX conversation_turns_conversation ON conversation_turns (conversation_id, requested_at);
+CREATE UNIQUE INDEX conversation_turns_provider ON conversation_turns (conversation_id, provider_turn_id) WHERE provider_turn_id <> '';
+CREATE TABLE conversation_messages (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES conversation_turns(id) ON DELETE SET NULL,
+  sequence INTEGER NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  origin TEXT NOT NULL CHECK (origin IN ('human', 'automation', 'daemon', 'provider')),
+  text TEXT NOT NULL DEFAULT '',
+  provider_item_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (conversation_id, sequence)
+);
+CREATE UNIQUE INDEX conversation_messages_provider_item ON conversation_messages (conversation_id, provider_item_id) WHERE provider_item_id <> '';
+CREATE TABLE conversation_activities (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES conversation_turns(id) ON DELETE SET NULL,
+  sequence INTEGER NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL CHECK (kind IN ('command', 'file_change', 'plan', 'reasoning', 'approval', 'usage', 'error', 'system')),
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'pending', 'resolved')),
+  summary TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  provider_item_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (conversation_id, sequence)
+);
+CREATE UNIQUE INDEX conversation_activities_provider_item ON conversation_activities (conversation_id, provider_item_id) WHERE provider_item_id <> '';
+CREATE UNIQUE INDEX conversation_activities_request ON conversation_activities (conversation_id, request_id) WHERE request_id <> '';
+CREATE INDEX conversation_activities_pending ON conversation_activities (conversation_id, kind, status);
+` });
+
 // Every change to a run's state, in order, kept beside the tables that hold its current state.
 MIGRATIONS.push({ version: 16, sql: `
 CREATE TABLE events (
@@ -449,7 +523,7 @@ type NodeRow = {
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
   summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
   activity_at: string | null; finished_at: string | null; started_at: string | null; first_signal_at: string | null;
-  shared: string;
+  shared: string; session_mode: string; provider_conversation_id: string;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -471,8 +545,8 @@ export function openStore(data: string): Store {
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
       branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at,
-      started_at, first_signal_at, shared)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      started_at, first_signal_at, shared, session_mode, provider_conversation_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
   const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
@@ -548,7 +622,7 @@ export function openStore(data: string): Store {
           "[]", n.agent, n.branch, n.worktree, n.status, n.attempts,
           n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
-          "[]",
+          "[]", n.sessionMode ?? "terminal", n.providerConversationId ?? "",
         );
         // Created once, then only real changes.
         if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
@@ -581,6 +655,8 @@ export function openStore(data: string): Store {
         ...(n.finished_at !== null ? { finishedAt: n.finished_at } : {}),
         ...(n.started_at !== null ? { startedAt: n.started_at } : {}),
         ...(n.first_signal_at !== null ? { firstSignalAt: n.first_signal_at } : {}),
+        ...(n.session_mode === "chat" ? { sessionMode: "chat" as const } : {}),
+        ...(n.provider_conversation_id ? { providerConversationId: n.provider_conversation_id } : {}),
       }));
       if (!nodes[0]) throw new RunStoreError(`run ${runId} has no session`);
       return {
@@ -727,6 +803,10 @@ export function openStore(data: string): Store {
     },
 
     pruneTimeline(project, before) {
+      db.prepare(`DELETE FROM conversations WHERE run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
       db.prepare(`DELETE FROM events WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
@@ -742,6 +822,108 @@ export function openStore(data: string): Store {
       type Row = { id: number; node_id: string | null; type: string; data: string; at: string };
       return (db.prepare("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?").all(runId, o.after ?? 0, o.limit) as Row[])
         .map((r) => ({ position: Number(r.id), type: r.type, data: JSON.parse(r.data) as Record<string, unknown>, at: r.at, ...(r.node_id !== null ? { nodeId: r.node_id } : {}) }));
+    },
+
+    recordChat(runId, session, events) {
+      const run = selectRun.get(runId) as { project: string } | undefined;
+      if (!run) throw new RunStoreError(`no run ${runId}`);
+      const now = new Date().toISOString();
+      const out: ChatOutcome = {};
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        let conv = db.prepare("SELECT id FROM conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
+        if (!conv) {
+          conv = { id: randomBytes(8).toString("hex") };
+          db.prepare("INSERT INTO conversations (id, scope, project, run_id, session, created_at, updated_at) VALUES (?, 'session', ?, ?, ?, ?, ?)")
+            .run(conv.id, run.project, runId, session, now, now);
+        }
+        const c = conv.id;
+        const nextSeq = () => Number((db.prepare("UPDATE conversations SET latest_sequence = latest_sequence + 1, updated_at = ? WHERE id = ? RETURNING latest_sequence")
+          .get(now, c) as { latest_sequence: number }).latest_sequence);
+        const turnRow = (providerTurnId?: string) => providerTurnId
+          ? (db.prepare("SELECT id FROM conversation_turns WHERE conversation_id = ? AND provider_turn_id = ?").get(c, providerTurnId) as { id: string } | undefined)?.id ?? null
+          : null;
+        for (const e of events) {
+          if (e.type === "conversation") {
+            out.conversationId = e.id;
+            if (session === NODE_ID) {
+              db.prepare("UPDATE nodes SET provider_conversation_id = ? WHERE run_id = ? AND id = ?").run(e.id, runId, NODE_ID);
+              logEvent(runId, NODE_ID, "chat.conversation", { id: e.id });
+            }
+          } else if (e.type === "turn") {
+            const id = turnRow(e.turnId);
+            if (e.state === "running") {
+              if (!id) db.prepare("INSERT INTO conversation_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at) VALUES (?, ?, ?, 'running', ?, ?)")
+                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now);
+              out.activity = "active";
+            } else {
+              if (id) db.prepare("UPDATE conversation_turns SET state = ?, error_message = ?, completed_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
+              out.activity = "idle";
+            }
+          } else if (e.type === "message") {
+            const text = redact(e.text);
+            const found = db.prepare("SELECT id FROM conversation_messages WHERE conversation_id = ? AND provider_item_id = ?").get(c, e.itemId) as { id: string } | undefined;
+            if (found) db.prepare("UPDATE conversation_messages SET text = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, now, found.id);
+            else db.prepare(`INSERT INTO conversation_messages (id, conversation_id, turn_id, sequence, role, origin, text, provider_item_id, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, e.role === "user" ? "daemon" : "provider", text, e.itemId, now, now);
+          } else {
+            const key = e.requestId ? "request_id" : "provider_item_id";
+            const keyValue = e.requestId ?? e.itemId ?? "";
+            const detail = e.output !== undefined || e.tool !== undefined ? JSON.stringify({ ...(e.tool ? { tool: e.tool } : {}), ...(e.output !== undefined ? { output: redact(e.output) } : {}) }) : "";
+            const found = keyValue ? db.prepare(`SELECT id, summary FROM conversation_activities WHERE conversation_id = ? AND ${key} = ?`).get(c, keyValue) as { id: string; summary: string } | undefined : undefined;
+            const summary = redact(e.summary);
+            if (found) db.prepare("UPDATE conversation_activities SET status = ?, summary = ?, detail_json = CASE WHEN ? = '' THEN detail_json ELSE ? END, revision = revision + 1, updated_at = ? WHERE id = ?")
+              .run(e.status, e.kind === "approval" && e.status === "resolved" ? `${found.summary} (${summary})` : summary || found.summary, detail, detail, now, found.id);
+            else db.prepare(`INSERT INTO conversation_activities (id, conversation_id, turn_id, sequence, kind, status, summary, detail_json, request_id, provider_item_id, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.kind, e.status, summary, detail,
+                e.requestId ?? "", e.requestId ? "" : e.itemId ?? "", now, now);
+            if (e.kind === "approval" && e.status === "pending") {
+              out.activity = "blocked";
+              out.question = { tool: e.tool ?? "tool", detail: summary.replace(/^[^:]*: /, ""), requestId: e.requestId ?? "" };
+            } else if (e.kind === "approval" && e.status === "resolved") {
+              out.question = null;
+              out.activity = "active";
+            }
+          }
+        }
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+      return out;
+    },
+
+    readChat(runId, o) {
+      const conv = db.prepare("SELECT id FROM conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
+      if (!conv) return { items: [], total: 0 };
+      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string };
+      const rows = db.prepare(`
+        SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at FROM conversation_messages WHERE conversation_id = ?
+        UNION ALL
+        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at FROM conversation_activities WHERE conversation_id = ?
+        ORDER BY sequence`).all(conv.id, conv.id) as Row[];
+      let firstUser = true;
+      const all: TimelineItem[] = [];
+      for (const r of rows) {
+        const base = { position: Number(r.sequence), session: o.session ?? NODE_ID, at: r.at };
+        if (r.source === "message") {
+          const kind: TimelineKind = r.role === "assistant" ? "assistant" : firstUser ? "prompt" : "message";
+          if (r.role === "user") firstUser = false;
+          all.push({ ...base, kind, text: r.text });
+          continue;
+        }
+        const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};
+        if (r.kind === "command" || r.kind === "file_change") {
+          const failed = r.status === "failed" ? " (failed)" : "";
+          all.push({ ...base, kind: "tool", tool: detail.tool ?? (r.kind === "command" ? "shell" : "edit"), text: `${r.text}${failed}${detail.output ? `\n${detail.output}` : ""}` });
+        } else if (r.kind === "approval") all.push({ ...base, kind: "event", text: `asked to use ${r.text}${r.status === "pending" ? " (waiting for an answer)" : ""}` });
+        else if (r.kind !== "usage") all.push({ ...base, kind: "event", text: `${r.kind}: ${r.text}` });
+      }
+      const kinds = new Set(o.kinds ?? TIMELINE_KINDS);
+      const shown = all.filter((i) => kinds.has(i.kind));
+      const after = o.after ?? 0;
+      return { total: shown.length, items: shown.filter((i) => i.position > after).slice(0, o.limit) };
     },
 
     listProjects() {
