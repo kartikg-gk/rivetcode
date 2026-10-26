@@ -547,6 +547,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       });
       return;
     }
+    const eventsRoute = /^\/api\/v1\/runs\/([^/]+)\/events$/.exec(path);
+    if (eventsRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = eventsRoute[1]!;
+      if (!(await write(() => store.loadRun(runId)).catch(() => null))) throw new HttpError(404, "unknown run");
+      const q = new URL(req.url ?? "", "http://x").searchParams;
+      const limit = Math.min(500, Math.max(1, Number(q.get("limit") ?? 100) || 100));
+      const events = await write(() => store.readEvents(runId, { after: Number(q.get("after") ?? 0) || 0, limit }));
+      const last = events.at(-1)?.position;
+      reply(res, 200, { events, ...(last !== undefined && events.length === limit ? { next: last } : {}) });
+      return;
+    }
     const answerRoute = /^\/api\/v1\/runs\/([^/]+)\/answer$/.exec(path);
     if (answerRoute) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");

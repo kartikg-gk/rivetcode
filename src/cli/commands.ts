@@ -191,6 +191,23 @@ async function read(args: string[], io: CliIo): Promise<number> {
   return 0;
 }
 
+// How a run's state changed, in order: launches, activity, messages, reports, PR, reviews.
+async function events(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["after", "limit"]);
+  const runId = rest[0];
+  if (!runId) throw new UsageError("events needs a run id");
+  const q = new URLSearchParams();
+  for (const k of ["after", "limit"]) if (typeof flags.get(k) === "string") q.set(k, flags.get(k) as string);
+  const page = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}/events?${q}`, undefined, COMMAND_TIMEOUT_MS) as
+    { events: { position: number; nodeId?: string; type: string; data: Record<string, unknown>; at: string }[]; next?: number };
+  for (const e of page.events) {
+    const data = Object.entries(e.data).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(" ");
+    io.out(`#${e.position} ${e.at} ${e.nodeId ? `[${e.nodeId}] ` : ""}${e.type}${data ? ` ${data}` : ""}`);
+  }
+  if (page.next !== undefined) io.out(`more: rivet events ${runId} --after ${page.next}`);
+  return 0;
+}
+
 // Answers the permission question a terminal agent is waiting at.
 async function answer(args: string[], io: CliIo): Promise<number> {
   const { flags, rest } = parseFlags(args, ["note"]);
@@ -773,6 +790,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "send": return await send(args, io);
       case "answer": return await answer(args, io);
       case "read": return await read(args, io);
+      case "events": return await events(args, io);
       case "check": return await check(io);
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);

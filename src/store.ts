@@ -77,6 +77,8 @@ export type Store = {
   pruneTimeline(project: string, before: string): number;
   // Every project that has runs.
   listProjects(): string[];
+  // A run's state changes after a position, oldest first.
+  readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
   // Entries after a position, oldest first; kinds narrows them (the messages view).
   readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   listCues(project: string): Cue[];
@@ -137,6 +139,7 @@ export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
 export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string };
+export type RunEvent = { position: number; nodeId?: string; type: string; data: Record<string, unknown>; at: string };
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -323,6 +326,19 @@ MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
 ` });
 
+// Every change to a run's state, in order, kept beside the tables that hold its current state.
+MIGRATIONS.push({ version: 16, sql: `
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  node_id TEXT,
+  type TEXT NOT NULL,
+  data TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX events_run ON events (run_id, id);
+` });
+
 // Each session's timeline: what it was told, did and said.
 MIGRATIONS.push({ version: 15, sql: `
 CREATE TABLE timeline (
@@ -499,6 +515,17 @@ export function openStore(data: string): Store {
     }
   }
 
+  const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
+  const selectActivity = db.prepare("SELECT activity FROM nodes WHERE run_id = ? AND id = ?");
+  // Written in the same call as the change it records; a failure to log never fails the change.
+  function logEvent(runId: string, nodeId: string | null, type: string, data: Record<string, unknown> = {}): void {
+    try { insertEvent.run(runId, nodeId, type, JSON.stringify(data), new Date().toISOString()); } catch { /* run gone */ }
+  }
+  // Hooks report activity on every tool call; only a change is an event.
+  function activityBefore(runId: string, nodeId: string): string | null | undefined {
+    return (selectActivity.get(runId, nodeId) as { activity: string | null } | undefined)?.activity;
+  }
+
   return {
     saveRun(run) {
       try {
@@ -520,6 +547,7 @@ export function openStore(data: string): Store {
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
           "[]",
         );
+        logEvent(run.id, n.id, "run.saved", { status: n.status });
         db.exec("COMMIT");
       } catch (e) {
         db.exec("ROLLBACK");
@@ -569,21 +597,27 @@ export function openStore(data: string): Store {
     },
 
     setActivity(runId, nodeId, state, agentSessionId) {
+      const before = activityBefore(runId, nodeId);
       const now = state === null ? null : new Date().toISOString();
-      return updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
+      const found = updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
+      if (found && state !== null && state !== before) logEvent(runId, nodeId, "activity", { from: before ?? null, to: state });
+      return found;
     },
 
     recordSignal(runId, nodeId, state, agentSessionId) {
+      const before = activityBefore(runId, nodeId);
       const now = new Date().toISOString();
       const at = state === null ? null : now;
       const found = updateSignal.run(state, at, at, agentSessionId ?? null, now, runId, nodeId).changes > 0;
       if (found && agentSessionId) insertConversation.run(agentSessionId, now, runId, nodeId);
+      if (found && state !== null && state !== before) logEvent(runId, nodeId, "activity", { from: before ?? null, to: state });
       return found;
     },
 
     markLaunched(runId, nodeId) {
       const now = new Date().toISOString();
       updateLaunched.run(now, now, runId, nodeId);
+      logEvent(runId, nodeId, "launched");
     },
 
     conversations(runId) {
@@ -593,12 +627,16 @@ export function openStore(data: string): Store {
 
     createReport(runId, nodeId, kind, message) {
       if (!sessionExists.get(runId, nodeId)) return null;
-      return Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
+      const id = Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
+      logEvent(runId, nodeId, "report", { kind });
+      return id;
     },
 
     queueMessage(runId, nodeId, message, from, mode = "steer") {
       if (!sessionExists.get(runId, nodeId)) return null;
-      return Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString(), mode).lastInsertRowid);
+      const id = Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString(), mode).lastInsertRowid);
+      logEvent(runId, nodeId, "message.queued", { id, mode, from: from ?? null });
+      return id;
     },
 
     undeliveredMessages(runId, nodeId) {
@@ -607,7 +645,9 @@ export function openStore(data: string): Store {
     },
 
     markDelivered(id) {
-      updateDelivered.run(new Date().toISOString(), id);
+      if (updateDelivered.run(new Date().toISOString(), id).changes === 0) return;
+      const row = db.prepare("SELECT run_id, node_id FROM outbox WHERE id = ?").get(id) as { run_id: string; node_id: string } | undefined;
+      if (row) logEvent(row.run_id, row.node_id, "message.delivered", { id });
     },
 
     exitStaleSessions() {
@@ -620,6 +660,7 @@ export function openStore(data: string): Store {
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+      logEvent(runId, nodeId, "node.updated", Object.fromEntries(keys.map((k) => [k, fields[k]])));
     },
 
     saveAutomation(a) {
@@ -674,11 +715,21 @@ export function openStore(data: string): Store {
     },
 
     pruneTimeline(project, before) {
+      db.prepare(`DELETE FROM events WHERE run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
       return Number(db.prepare(`DELETE FROM timeline WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
           AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`)
         .run(project, before).changes);
+    },
+
+    readEvents(runId, o) {
+      type Row = { id: number; node_id: string | null; type: string; data: string; at: string };
+      return (db.prepare("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?").all(runId, o.after ?? 0, o.limit) as Row[])
+        .map((r) => ({ position: Number(r.id), type: r.type, data: JSON.parse(r.data) as Record<string, unknown>, at: r.at, ...(r.node_id !== null ? { nodeId: r.node_id } : {}) }));
     },
 
     listProjects() {
@@ -716,13 +767,16 @@ export function openStore(data: string): Store {
     },
 
     startReview(runId, sha, trigger) {
+      logEvent(runId, "review", "review.started", { sha, trigger });
       return Number(db.prepare("INSERT INTO reviews (run_id, sha, trigger, status, created_at) VALUES (?, ?, ?, 'running', ?)")
         .run(runId, sha, trigger, new Date().toISOString()).lastInsertRowid);
     },
 
     endReview(id, f) {
-      db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
-        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id);
+      const ended = db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
+        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id).changes;
+      const row = ended ? db.prepare("SELECT run_id FROM reviews WHERE id = ?").get(id) as { run_id: string } | undefined : undefined;
+      if (row) logEvent(row.run_id, "review", "review.ended", { status: f.status, verdict: f.verdict ?? null });
     },
 
     reviewsOf(runId) {
@@ -746,6 +800,7 @@ export function openStore(data: string): Store {
       db.prepare(`INSERT INTO pull_requests (run_id, number, url, handled) VALUES (?, ?, ?, ?)
         ON CONFLICT (run_id) DO UPDATE SET number = excluded.number, url = excluded.url, handled = excluded.handled`)
         .run(runId, pr.number, pr.url, pr.handled ?? null);
+      logEvent(runId, null, "pr", { number: pr.number, handled: pr.handled ?? null });
     },
 
     getTerminateOnPrMerge(runId) {
