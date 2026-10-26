@@ -786,6 +786,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (AUTOSTART.has(command ?? "")) await ensureDaemon(io);
     switch (command) {
       case "hooks": return await hooks(args, io);
+      // The process behind a chat session (started by the daemon, not by people).
+      case "chat-host": {
+        const { runHost } = await import("../chat/host.js");
+        return await runHost(JSON.parse(Buffer.from(args[0] ?? "", "base64url").toString("utf8")), io.env);
+      }
       case "report": return await report(args, io);
       case "send": return await send(args, io);
       case "answer": return await answer(args, io);

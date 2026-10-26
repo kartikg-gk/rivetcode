@@ -86,6 +86,7 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
       if (!headless) await ensureClaudeTrust(configPath, workspace);
     },
     name: "claude",
+    binary,
     signals: true,
     promptVia: "argv",
     // Print mode reads stdin only at start, so a headless claude takes no messages.
