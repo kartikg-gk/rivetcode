@@ -274,6 +274,7 @@ describe("timeline", () => {
     store.markDelivered(id);
     store.createReport("r1", "agent", "done", "ok");
     store.updateNode("r1", "agent", { status: "done" });
+    store.updateNode("r1", "agent", { status: "done" });
     store.setPr("r1", { number: 7, url: "u" });
     expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
       ["run.created", { status: sampleRun().node.status, agent: sampleRun().node.agent }],

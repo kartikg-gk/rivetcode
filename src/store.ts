@@ -665,10 +665,14 @@ export function openStore(data: string): Store {
     updateNode(runId, nodeId, fields) {
       const keys = (Object.keys(fields) as (keyof NodeUpdate)[]).filter((k) => fields[k] !== undefined);
       if (keys.length === 0) return;
+      const old = db.prepare(`SELECT ${keys.map((k) => UPDATE_COLUMNS[k]).join(", ")} FROM nodes WHERE run_id = ? AND id = ?`)
+        .get(runId, nodeId) as Record<string, unknown> | undefined;
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
-      logEvent(runId, nodeId, "node.updated", Object.fromEntries(keys.map((k) => [k, fields[k]])));
+      // Only what actually changed, as with a re-saved run.
+      const diff = keys.filter((k) => old?.[UPDATE_COLUMNS[k]] !== fields[k]);
+      if (diff.length) logEvent(runId, nodeId, "node.updated", Object.fromEntries(diff.map((k) => [k, fields[k]])));
     },
 
     saveAutomation(a) {
