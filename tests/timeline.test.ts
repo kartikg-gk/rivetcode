@@ -13,6 +13,10 @@ describe("secrets on the timeline", () => {
     expect(redact("DB_PASSWORD=hunter22\nAPI_KEY: 'abcdef123'\nPORT=3000")).toBe("DB_PASSWORD=[secret removed]\nAPI_KEY: '[secret removed]'\nPORT=3000");
     expect(redact("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----")).toBe("[secret removed]");
     expect(redact("3 tests passed in src/a.ts; max_tokens: 4000")).toBe("3 tests passed in src/a.ts; max_tokens: 4000");
+    // Counts and words that only contain a secret word stay.
+    for (const s of ["input_tokens: 1234567", "Total tokens: 812345", "tokenizer: bert-base-uncased", "SECRET_COUNT=123456"]) expect(redact(s)).toBe(s);
+    expect(redact("AWS_SECRET_ACCESS_KEY=abcdefgh123")).toBe("AWS_SECRET_ACCESS_KEY=[secret removed]");
+    expect(redact("password = hunter22")).toBe("password = [secret removed]");
   });
 });
 

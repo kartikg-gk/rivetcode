@@ -27,7 +27,9 @@ const SECRETS: [RegExp, string][] = [
   [/\bxox[abpr]-[A-Za-z0-9-]{10,}/g, "[secret removed]"],
   [/\bAIza[0-9A-Za-z_-]{35}\b/g, "[secret removed]"],
   [/(\bBearer\s+)[A-Za-z0-9._~+/-]{20,}=*/gi, "$1[secret removed]"],
-  [/(\b[A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY)[A-Za-z0-9_]*\s*[=:]\s*["']?)(?!\[secret removed\])[^\s"'#]{6,}/gi, "$1[secret removed]"],
+  // The name must end in the secret word (input_tokens, tokenizer are not secrets), and a
+  // number is a count, not a secret.
+  [/(\b[A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|SECRET_KEY|ACCESS_KEY|PRIVATE_KEY)\b\s*[=:]\s*["']?)(?!\[secret removed\])(?!\d+\b)[^\s"'#]{6,}/gi, "$1[secret removed]"],
 ];
 
 export function redact(s: string): string {
