@@ -51,7 +51,10 @@ const CONFIG_KEYS = [
   "copy",
   "symlink",
   "setup",
+  "timeline.keep",
 ];
+// Days a finished run's timeline is kept unless timeline.keep says otherwise ("forever" keeps it).
+const TIMELINE_KEEP_DAYS = 30;
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -73,6 +76,8 @@ export type DaemonOptions = {
   radarMs?: number;
   // How often due automations are looked for.
   automationMs?: number;
+  // How often finished runs' old timelines are removed.
+  pruneMs?: number;
   // How often workers are checked against their task's time and token limits.
   limitMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
@@ -272,12 +277,26 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
   const onSignal = () => { void stop(); };
   let automationTimer: NodeJS.Timeout | undefined;
+  let pruneTimer: NodeJS.Timeout | undefined;
+  // Finished runs' timelines go after timeline.keep days: they hold tool output, which can
+  // carry what redaction misses.
+  async function pruneTimelines(): Promise<void> {
+    await write(() => {
+      for (const project of store.listProjects()) {
+        const keep = store.getConfig(project)["timeline.keep"];
+        if (keep === "forever") continue;
+        const days = keep !== undefined && Number(keep) >= 0 ? Number(keep) : TIMELINE_KEEP_DAYS;
+        store.pruneTimeline(project, new Date(Date.now() - days * 86_400_000).toISOString());
+      }
+    });
+  }
   function stop(): Promise<void> {
     if (stopping) return stopping;
     stopping = (async () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
       if (automationTimer) clearInterval(automationTimer);
+      if (pruneTimer) clearInterval(pruneTimer);
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
@@ -801,6 +820,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
     automationTimer = setInterval(() => { void runDueAutomations().catch((e) => opts.onError?.(e)); }, opts.automationMs ?? 30_000);
     automationTimer.unref();
+    pruneTimer = setInterval(() => { void pruneTimelines().catch((e) => opts.onError?.(e)); }, opts.pruneMs ?? 3_600_000);
+    pruneTimer.unref();
+    void pruneTimelines().catch((e) => opts.onError?.(e));
     void runDueAutomations().catch((e) => opts.onError?.(e));
     scheduler.watchRadar(opts.radarMs ?? 60_000);
     scheduler.watchLimits(opts.limitMs ?? 15_000);

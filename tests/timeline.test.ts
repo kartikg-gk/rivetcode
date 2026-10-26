@@ -1,5 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { fromClaudeStream, fromCodexJson, fromHook, fromStream, readableOutput } from "../src/timeline.js";
+import { fromClaudeStream, fromCodexJson, fromHook, fromStream, readableOutput, redact } from "../src/timeline.js";
+
+describe("secrets on the timeline", () => {
+  it("removes keys, tokens and named secrets, and leaves ordinary text alone", () => {
+    const gh = "ghp_" + "a1".repeat(18);
+    const sk = "sk-ant-" + "x".repeat(30);
+    const aws = "AKIA" + "ABCDEFGHIJKLMNOP";
+    expect(redact(`push with ${gh} now`)).toBe("push with [secret removed] now");
+    expect(redact(`key ${sk}`)).toBe("key [secret removed]");
+    expect(redact(aws)).toBe("[secret removed]");
+    expect(redact("Authorization: Bearer " + "t".repeat(30))).toBe("Authorization: Bearer [secret removed]");
+    expect(redact("DB_PASSWORD=hunter22\nAPI_KEY: 'abcdef123'\nPORT=3000")).toBe("DB_PASSWORD=[secret removed]\nAPI_KEY: '[secret removed]'\nPORT=3000");
+    expect(redact("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----")).toBe("[secret removed]");
+    expect(redact("3 tests passed in src/a.ts; max_tokens: 4000")).toBe("3 tests passed in src/a.ts; max_tokens: 4000");
+  });
+});
 
 describe("timeline from hooks", () => {
   it("reads Claude's prompt, tool calls, results and last reply, with the fields seen live", () => {

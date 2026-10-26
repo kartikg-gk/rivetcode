@@ -263,4 +263,23 @@ describe("timeline", () => {
     const page = store.readTimeline("r1", { limit: 2 });
     expect(store.readTimeline("r1", { limit: 10, after: page.items[1]!.position }).items.map((i) => i.text)).toEqual(["done", "review it"]);
   });
+
+  it("stores entries without secrets", () => {
+    store.saveRun(sampleRun());
+    store.addTimeline("r1", "agent", [{ kind: "result", tool: "Bash", text: "GITHUB_TOKEN=abcdef123456" }]);
+    expect(store.readTimeline("r1", { limit: 10 }).items[0]!.text).toBe("GITHUB_TOKEN=[secret removed]");
+  });
+
+  it("prunes only the timelines of runs that finished before the cutoff", () => {
+    store.saveRun(sampleRun());
+    store.addTimeline("r1", "agent", [{ kind: "assistant", text: "working" }]);
+    // Still running: kept however old.
+    expect(store.pruneTimeline(sampleRun().project, "2999-01-01T00:00:00.000Z")).toBe(0);
+    store.updateNode("r1", "agent", { finishedAt: "2026-10-01T00:00:00.000Z" });
+    expect(store.pruneTimeline(sampleRun().project, "2026-09-01T00:00:00.000Z")).toBe(0);
+    expect(store.pruneTimeline("other", "2026-11-01T00:00:00.000Z")).toBe(0);
+    expect(store.pruneTimeline(sampleRun().project, "2026-11-01T00:00:00.000Z")).toBe(1);
+    expect(store.readTimeline("r1", { limit: 10 }).total).toBe(0);
+    expect(store.listProjects()).toEqual([sampleRun().project]);
+  });
 });

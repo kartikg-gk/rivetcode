@@ -16,6 +16,24 @@ const RESULT_LIMIT = 4_000;
 const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}\n[cut at ${n} characters]` : s);
 const text = (v: unknown): string => (typeof v === "string" ? v : v === undefined || v === null ? "" : JSON.stringify(v));
 
+// Secrets a command or file can print: removed before an entry is stored, as the timeline
+// is kept and other agents read it. A named secret keeps its name.
+const SECRETS: [RegExp, string][] = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[secret removed]"],
+  [/\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/g, "[secret removed]"],
+  [/\bgh[pousr]_[A-Za-z0-9]{30,}/g, "[secret removed]"],
+  [/\bgithub_pat_[A-Za-z0-9_]{30,}/g, "[secret removed]"],
+  [/\bAKIA[0-9A-Z]{16}\b/g, "[secret removed]"],
+  [/\bxox[abpr]-[A-Za-z0-9-]{10,}/g, "[secret removed]"],
+  [/\bAIza[0-9A-Za-z_-]{35}\b/g, "[secret removed]"],
+  [/(\bBearer\s+)[A-Za-z0-9._~+/-]{20,}=*/gi, "$1[secret removed]"],
+  [/(\b[A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY)[A-Za-z0-9_]*\s*[=:]\s*["']?)(?!\[secret removed\])[^\s"'#]{6,}/gi, "$1[secret removed]"],
+];
+
+export function redact(s: string): string {
+  return SECRETS.reduce((out, [pattern, to]) => out.replace(pattern, to), s);
+}
+
 // A tool call in one line: its name and what it acts on.
 export function describeTool(input: unknown): string {
   const i = (input ?? {}) as Record<string, unknown>;

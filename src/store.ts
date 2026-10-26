@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
 import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
 import type { TaskSpec } from "./scheduler/tasks.js";
-import { TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "./timeline.js";
+import { redact, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "./timeline.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -72,6 +72,11 @@ export type Store = {
   // A session's timeline (session: agent, review or partner). A prompt that repeats the
   // session's recent prompts or messages is the same one seen twice (Rivet and a hook) and is skipped.
   addTimeline(runId: string, session: string, entries: TimelineEntry[]): void;
+  // Removes the timelines of a project's runs whose sessions all finished before a time;
+  // returns how many entries went.
+  pruneTimeline(project: string, before: string): number;
+  // Every project that has runs.
+  listProjects(): string[];
   // Entries after a position, oldest first; kinds narrows them (the messages view).
   readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   listCues(project: string): Cue[];
@@ -659,12 +664,25 @@ export function openStore(data: string): Store {
       const lastSaid = db.prepare("SELECT text FROM timeline WHERE run_id = ? AND session = ? AND kind IN ('prompt', 'message') ORDER BY id DESC LIMIT 5");
       const insert = db.prepare("INSERT INTO timeline (run_id, session, kind, tool, text, at) VALUES (?, ?, ?, ?, ?, ?)");
       for (const e of entries) {
+        const text = redact(e.text);
         if (e.kind === "prompt") {
           const recent = lastSaid.all(runId, session) as { text: string }[];
-          if (recent.some((r) => r.text.trim() === e.text.trim())) continue;
+          if (recent.some((r) => r.text.trim() === text.trim())) continue;
         }
-        insert.run(runId, session, e.kind, e.tool ?? null, e.text, new Date().toISOString());
+        insert.run(runId, session, e.kind, e.tool ?? null, text, new Date().toISOString());
       }
+    },
+
+    pruneTimeline(project, before) {
+      return Number(db.prepare(`DELETE FROM timeline WHERE run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`)
+        .run(project, before).changes);
+    },
+
+    listProjects() {
+      return (db.prepare("SELECT DISTINCT project FROM runs ORDER BY project").all() as { project: string }[]).map((r) => r.project);
     },
 
     readTimeline(runId, o) {
