@@ -276,7 +276,7 @@ describe("timeline", () => {
     store.updateNode("r1", "agent", { status: "done" });
     store.setPr("r1", { number: 7, url: "u" });
     expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
-      ["run.saved", { status: sampleRun().node.status }],
+      ["run.created", { status: sampleRun().node.status, agent: sampleRun().node.agent }],
       ["activity", { from: null, to: "active" }],
       ["activity", { from: "active", to: "idle" }],
       ["message.queued", { id, mode: "queue", from: "orchestrator" }],
@@ -287,6 +287,21 @@ describe("timeline", () => {
     ]);
     const first = store.readEvents("r1", { limit: 2 });
     expect(store.readEvents("r1", { limit: 1, after: first[1]!.position })[0]!.data).toEqual({ from: "active", to: "idle" });
+  });
+
+  it("logs a run's creation once, a re-save only when its status changed, and sessions closed at startup", () => {
+    const run = sampleRun();
+    store.saveRun(run);
+    store.saveRun(run);
+    store.saveRun({ ...run, node: { ...run.node, status: "done" } });
+    store.setActivity("r1", "agent", "active");
+    store.exitStaleSessions();
+    expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
+      ["run.created", { status: run.node.status, agent: run.node.agent }],
+      ["node.updated", { status: "done" }],
+      ["activity", { from: null, to: "active" }],
+      ["session.exited", { from: "active", reason: "daemon restarted" }],
+    ]);
   });
 
   it("stores entries without secrets", () => {

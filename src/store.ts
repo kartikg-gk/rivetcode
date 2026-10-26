@@ -517,6 +517,8 @@ export function openStore(data: string): Store {
 
   const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
   const selectActivity = db.prepare("SELECT activity FROM nodes WHERE run_id = ? AND id = ?");
+  const selectStatus = db.prepare("SELECT status FROM nodes WHERE run_id = ? AND id = ?");
+  const selectStale = db.prepare("SELECT run_id, id, activity FROM nodes WHERE activity IS NOT NULL AND activity <> 'exited'");
   // Written in the same call as the change it records; a failure to log never fails the change.
   function logEvent(runId: string, nodeId: string | null, type: string, data: Record<string, unknown> = {}): void {
     try { insertEvent.run(runId, nodeId, type, JSON.stringify(data), new Date().toISOString()); } catch { /* run gone */ }
@@ -535,6 +537,7 @@ export function openStore(data: string): Store {
       }
       db.exec("BEGIN IMMEDIATE");
       try {
+        const before = selectRun.get(run.id) ? (selectStatus.get(run.id, run.node.id) as { status: string } | undefined)?.status ?? null : undefined;
         upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null, run.spec ? JSON.stringify(run.spec) : null);
         deleteNodes.run(run.id);
         const n = run.node;
@@ -547,7 +550,9 @@ export function openStore(data: string): Store {
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
           "[]",
         );
-        logEvent(run.id, n.id, "run.saved", { status: n.status });
+        // Created once, then only real changes.
+        if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
+        else if (before !== n.status) logEvent(run.id, n.id, "node.updated", { status: n.status });
         db.exec("COMMIT");
       } catch (e) {
         db.exec("ROLLBACK");
@@ -651,6 +656,9 @@ export function openStore(data: string): Store {
     },
 
     exitStaleSessions() {
+      // Sessions a stopped daemon left behind: each gets session.exited.
+      const stale = selectStale.all() as { run_id: string; id: string; activity: string }[];
+      for (const s of stale) logEvent(s.run_id, s.id, "session.exited", { from: s.activity, reason: "daemon restarted" });
       return Number(updateStale.run().changes);
     },
 
