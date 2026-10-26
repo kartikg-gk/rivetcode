@@ -14,12 +14,21 @@ import { cleanRun, MODEL_FAMILIES, prepareRun, repoRoot, RunInputError, SetupErr
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
 import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
+import { MESSAGE_KINDS, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "../timeline.js";
+
+// Timeline entries a hook sent, kept only when well formed.
+function checkEntries(raw: unknown): TimelineEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((e): e is TimelineEntry => !!e && typeof e === "object" && TIMELINE_KINDS.includes((e as { kind: TimelineKind }).kind)
+    && typeof (e as { text: unknown }).text === "string" && ((e as { tool?: unknown }).tool === undefined || typeof (e as { tool?: unknown }).tool === "string"))
+    .slice(0, 50);
+}
 import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
-import { openStore, RunStoreError, type Run } from "../store.js";
+import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
 import { runUsage } from "../usage.js";
 import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
-import { emptyTrash, waitForTrash } from "../worktree.js";
+import { emptyTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
@@ -40,8 +49,12 @@ const CONFIG_KEYS = [
   "pr.feedback",
   "github.repo",
   "copy",
+  "symlink",
   "setup",
+  "timeline.keep",
 ];
+// Days a finished run's timeline is kept unless timeline.keep says otherwise ("forever" keeps it).
+const TIMELINE_KEEP_DAYS = 30;
 const REPORT_KINDS = ["done", "stuck", "needs-input"] as const;
 type ReportKind = (typeof REPORT_KINDS)[number];
 
@@ -63,6 +76,8 @@ export type DaemonOptions = {
   radarMs?: number;
   // How often due automations are looked for.
   automationMs?: number;
+  // How often finished runs' old timelines are removed.
+  pruneMs?: number;
   // How often workers are checked against their task's time and token limits.
   limitMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
@@ -209,6 +224,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       ...o, data,
       defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
       copyFor: (project) => (store.getConfig(project).copy ?? "").split(",").map((f) => f.trim()).filter(Boolean),
+      linkFor: (project) => (store.getConfig(project).symlink ?? "").split(",").map((f) => f.trim()).filter(Boolean),
       // One command per line, run in order in every new worktree.
       setupFor: (project) => (store.getConfig(project).setup ?? "").split(/\r?\n/).map((c) => c.trim()).filter(Boolean),
     });
@@ -261,16 +277,29 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
   const onSignal = () => { void stop(); };
   let automationTimer: NodeJS.Timeout | undefined;
+  let pruneTimer: NodeJS.Timeout | undefined;
+  // Finished runs' timelines go after timeline.keep days: they hold tool output, which can
+  // carry what redaction misses.
+  async function pruneTimelines(): Promise<void> {
+    await write(() => {
+      for (const project of store.listProjects()) {
+        const keep = store.getConfig(project)["timeline.keep"];
+        if (keep === "forever") continue;
+        const days = keep !== undefined && Number(keep) >= 0 ? Number(keep) : TIMELINE_KEEP_DAYS;
+        store.pruneTimeline(project, new Date(Date.now() - days * 86_400_000).toISOString());
+      }
+    });
+  }
   function stop(): Promise<void> {
     if (stopping) return stopping;
     stopping = (async () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
       if (automationTimer) clearInterval(automationTimer);
+      if (pruneTimer) clearInterval(pruneTimer);
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
-      await waitForTrash();
       store.close();
       await releaseRunFile(runFile, process.pid);
       markStopped();
@@ -370,18 +399,29 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (activity) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
-      // A reviewer's hooks have nothing to record: it is not the run's session.
+      const payload = await body(req);
+      // What the hook saw goes on the session's timeline (reviewers and partners too).
+      // A session whose JSON stream Rivet reads gets only prompts from its hooks.
+      const entries = checkEntries(payload.timeline)
+        .filter((e) => e.kind === "prompt" || !scheduler.streamsTimeline(sessionIdOf(runId, nodeId)));
+      if (entries.length) await write(() => store.addTimeline(runId, nodeId, entries)).catch(() => {});
+      // A reviewer's or partner's activity is not the run's session state.
       if (nodeId === "review" || nodeId === "partner") {
         reply(res, 204);
         return;
       }
-      const payload = await body(req);
       if (payload.state !== undefined && !ACTIVITY_STATES.includes(payload.state as ActivityState)) {
         throw new HttpError(400, "invalid activity state");
       }
       const state = (payload.state as ActivityState | undefined) ?? null;
       const agentSessionId = optionalString(payload.agentSessionId, "agentSessionId");
-      if (state === null && agentSessionId === undefined) throw new HttpError(400, "state or agentSessionId is required");
+      if (state === null && agentSessionId === undefined) {
+        if (entries.length) {
+          reply(res, 204);
+          return;
+        }
+        throw new HttpError(400, "state or agentSessionId is required");
+      }
       // Hooks of an agent from an earlier launch may still fire; only the current launch counts.
       const launchId = optionalString(payload.launchId, "launchId");
       if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
@@ -391,7 +431,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
+      // What a permission question asks, when the hook says; forgotten once the agent moves on.
+      if (state === "blocked") {
+        const request = payload.request as { tool?: unknown; detail?: unknown } | undefined;
+        if (request && typeof request.tool === "string") {
+          scheduler.setPending(runId, { tool: request.tool.slice(0, 100), detail: typeof request.detail === "string" ? request.detail.slice(0, 500) : "" });
+        }
+      } else if (state !== null) scheduler.setPending(runId, null);
       if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
+      // An agent that went idle can take what was queued for it.
+      if (state === "idle" || state === "waiting_input") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
     }
@@ -457,13 +506,67 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const payload = await body(req);
       if (typeof payload.message !== "string") throw new HttpError(400, "message must be a string");
       const from = optionalString(payload.from, "from");
-      const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from));
+      const mode = (optionalString(payload.mode, "mode") ?? "steer") as SendMode;
+      if (!SEND_MODES.includes(mode)) throw new HttpError(400, `mode must be one of ${SEND_MODES.join(", ")}`);
+      const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from, mode));
       if (id === null) throw new HttpError(404, "unknown session");
       const target = sessionIdOf(runId, nodeId);
-      // Typed in now, handed over when a headless agent ends its turn, or at the next launch.
-      const delivery = runtime.takesInput(target) ? "now" : runtime.isAlive(target) ? "turn-end" : "next-launch";
-      if (delivery === "now") await scheduler.deliver(runId);
+      let delivery: string;
+      if (runtime.takesInput(target)) {
+        await scheduler.deliver(runId);
+        const left = await write(() => store.undeliveredMessages(runId, nodeId).some((m) => m.id === id));
+        const activity = await write(() => store.loadRun(runId).node.activity);
+        delivery = !left ? (mode === "interrupt" ? "interrupted" : "now") : activity === "blocked" ? "after-answer" : "when-idle";
+      } else if (runtime.isAlive(target)) {
+        delivery = mode === "interrupt" && (await scheduler.interruptHeadless(runId)) ? "interrupted" : "turn-end";
+      } else delivery = "next-launch";
       reply(res, 202, { id, delivery });
+      return;
+    }
+    const timelineRoute = /^\/api\/v1\/runs\/([^/]+)\/timeline$/.exec(path);
+    if (timelineRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = timelineRoute[1]!;
+      const run = await write(() => store.loadRun(runId)).catch(() => null);
+      if (!run) throw new HttpError(404, "unknown run");
+      const q = new URL(req.url ?? "", "http://x").searchParams;
+      const num = (k: string, d: number, max: number) => Math.min(max, Math.max(1, Number(q.get(k) ?? d) || d));
+      const view = q.get("view") === "activity" ? "activity" : "messages";
+      const limit = num("limit", 50, 100);
+      const maxChars = num("maxChars", 20_000, 50_000);
+      const session = q.get("session") ?? undefined;
+      const page = await write(() => store.readTimeline(run.id, {
+        after: Number(q.get("after") ?? 0) || 0, limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
+      }));
+      const items = page.items.map((i) => (i.text.length > maxChars
+        ? { ...i, text: i.text.slice(0, maxChars), cut: { shown: maxChars, length: i.text.length } } : i));
+      const last = items.at(-1)?.position;
+      reply(res, 200, {
+        run: { id: run.id, name: run.name, role: run.role, agent: run.node.agent, status: run.node.status, activity: run.node.activity ?? null },
+        view, total: page.total, items, ...(last !== undefined && page.items.length === limit ? { next: last } : {}),
+      });
+      return;
+    }
+    const eventsRoute = /^\/api\/v1\/runs\/([^/]+)\/events$/.exec(path);
+    if (eventsRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = eventsRoute[1]!;
+      if (!(await write(() => store.loadRun(runId)).catch(() => null))) throw new HttpError(404, "unknown run");
+      const q = new URL(req.url ?? "", "http://x").searchParams;
+      const limit = Math.min(500, Math.max(1, Number(q.get("limit") ?? 100) || 100));
+      const events = await write(() => store.readEvents(runId, { after: Number(q.get("after") ?? 0) || 0, limit }));
+      const last = events.at(-1)?.position;
+      reply(res, 200, { events, ...(last !== undefined && events.length === limit ? { next: last } : {}) });
+      return;
+    }
+    const answerRoute = /^\/api\/v1\/runs\/([^/]+)\/answer$/.exec(path);
+    if (answerRoute) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      const choice = payload.choice;
+      if (choice !== "yes" && choice !== "always" && choice !== "no") throw new HttpError(400, "choice must be yes, always or no");
+      await scheduler.answer(answerRoute[1]!, choice, optionalString(payload.note, "note"));
+      reply(res, 204);
       return;
     }
     if (path === "/api/v1/runs") {
@@ -617,7 +720,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const conversations = await write(() => store.conversations(run.id));
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         const reviews = await write(() => store.reviewsOf(run.id));
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, now: new Date(at).toISOString() });
+        const pendingRequest = scheduler.pendingRequest(run.id);
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {
@@ -727,6 +831,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
     automationTimer = setInterval(() => { void runDueAutomations().catch((e) => opts.onError?.(e)); }, opts.automationMs ?? 30_000);
     automationTimer.unref();
+    pruneTimer = setInterval(() => { void pruneTimelines().catch((e) => opts.onError?.(e)); }, opts.pruneMs ?? 3_600_000);
+    pruneTimer.unref();
+    void pruneTimelines().catch((e) => opts.onError?.(e));
     void runDueAutomations().catch((e) => opts.onError?.(e));
     scheduler.watchRadar(opts.radarMs ?? 60_000);
     scheduler.watchLimits(opts.limitMs ?? 15_000);
@@ -740,7 +847,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   } catch (error) {
     await runtime.stopAll();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
-    await waitForTrash();
     store.close();
     throw error;
   }

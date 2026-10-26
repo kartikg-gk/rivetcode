@@ -130,25 +130,25 @@ describe("schema migrations", () => {
   };
 
   it("records each applied migration once, across reopening", () => {
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   });
 
   it("applies migrations 2 and 3 once to a version 1 database", () => {
     store.saveRun(sampleRun());
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     expect(versions()).toEqual([1]);
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     expect(store.loadRun("r1")).toMatchObject({ role: "worker", name: "", node: { id: "agent" } });
     store.close();
     store = openStore(data);
-    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(versions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   });
 });
 
@@ -157,13 +157,13 @@ describe("outbox and stale sessions", () => {
     store.saveRun(sampleRun());
     store.saveRun(sampleRun("r2"));
     const first = store.queueMessage("r1", "agent", "one")!;
-    const second = store.queueMessage("r1", "agent", "two", "r2-agent")!;
+    const second = store.queueMessage("r1", "agent", "two", "r2-agent", "queue")!;
     store.queueMessage("r2", "agent", "for the other");
     expect(store.undeliveredMessages("r1", "agent")).toEqual([
-      { id: first, message: "one" }, { id: second, message: "two" },
+      { id: first, message: "one", mode: "steer" }, { id: second, message: "two", mode: "queue" },
     ]);
     store.markDelivered(first);
-    expect(store.undeliveredMessages("r1", "agent")).toEqual([{ id: second, message: "two" }]);
+    expect(store.undeliveredMessages("r1", "agent")).toEqual([{ id: second, message: "two", mode: "queue" }]);
   });
 
   it("marks every session that still looks alive as exited", () => {
@@ -184,7 +184,7 @@ describe("migration 3 and project config", () => {
     store.saveRun(run);
     store.close();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DELETE FROM schema_migrations WHERE version >= 3; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 3; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE project_config; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge;");
     db.exec("CREATE TABLE n2 AS SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes; DROP TABLE nodes; ALTER TABLE n2 RENAME TO nodes;");
     db.close();
     store = openStore(data);
@@ -242,5 +242,85 @@ describe("pull requests", () => {
     expect(store.getPr("r1")).toEqual({ number: 7, url: "https://github.com/o/r/pull/7" });
     store.setPr("r1", { number: 7, url: "https://github.com/o/r/pull/7", handled: "ci:abc" });
     expect(store.getPr("r1")!.handled).toBe("ci:abc");
+  });
+});
+
+describe("timeline", () => {
+  it("keeps entries in order, pages them, narrows to messages, and skips a prompt seen twice", () => {
+    store.saveRun(sampleRun());
+    store.addTimeline("r1", "agent", [{ kind: "prompt", text: "do it" }]);
+    // A hook seeing the same prompt again adds nothing.
+    store.addTimeline("r1", "agent", [{ kind: "prompt", text: "do it" }, { kind: "tool", tool: "Bash", text: "npm test" }]);
+    store.addTimeline("r1", "agent", [{ kind: "assistant", text: "done" }]);
+    store.addTimeline("r1", "review", [{ kind: "prompt", text: "review it" }]);
+    const all = store.readTimeline("r1", { limit: 10 });
+    expect(all.total).toBe(4);
+    expect(all.items.map((i) => [i.session, i.kind, i.text])).toEqual([
+      ["agent", "prompt", "do it"], ["agent", "tool", "npm test"], ["agent", "assistant", "done"], ["review", "prompt", "review it"],
+    ]);
+    const messages = store.readTimeline("r1", { limit: 10, kinds: ["prompt", "message", "assistant"], session: "agent" });
+    expect(messages.items.map((i) => i.text)).toEqual(["do it", "done"]);
+    const page = store.readTimeline("r1", { limit: 2 });
+    expect(store.readTimeline("r1", { limit: 10, after: page.items[1]!.position }).items.map((i) => i.text)).toEqual(["done", "review it"]);
+  });
+
+  it("logs each change to a run's state, but not a repeated activity", () => {
+    store.saveRun(sampleRun());
+    store.setActivity("r1", "agent", "active");
+    store.setActivity("r1", "agent", "active");
+    store.setActivity("r1", "agent", "idle");
+    const id = store.queueMessage("r1", "agent", "hi", "orchestrator", "queue")!;
+    store.markDelivered(id);
+    store.markDelivered(id);
+    store.createReport("r1", "agent", "done", "ok");
+    store.updateNode("r1", "agent", { status: "done" });
+    store.updateNode("r1", "agent", { status: "done" });
+    store.setPr("r1", { number: 7, url: "u" });
+    expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
+      ["run.created", { status: sampleRun().node.status, agent: sampleRun().node.agent }],
+      ["activity", { from: null, to: "active" }],
+      ["activity", { from: "active", to: "idle" }],
+      ["message.queued", { id, mode: "queue", from: "orchestrator" }],
+      ["message.delivered", { id }],
+      ["report", { kind: "done" }],
+      ["node.updated", { status: "done" }],
+      ["pr", { number: 7, handled: null }],
+    ]);
+    const first = store.readEvents("r1", { limit: 2 });
+    expect(store.readEvents("r1", { limit: 1, after: first[1]!.position })[0]!.data).toEqual({ from: "active", to: "idle" });
+  });
+
+  it("logs a run's creation once, a re-save only when its status changed, and sessions closed at startup", () => {
+    const run = sampleRun();
+    store.saveRun(run);
+    store.saveRun(run);
+    store.saveRun({ ...run, node: { ...run.node, status: "done" } });
+    store.setActivity("r1", "agent", "active");
+    store.exitStaleSessions();
+    expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
+      ["run.created", { status: run.node.status, agent: run.node.agent }],
+      ["node.updated", { status: "done" }],
+      ["activity", { from: null, to: "active" }],
+      ["session.exited", { from: "active", reason: "daemon restarted" }],
+    ]);
+  });
+
+  it("stores entries without secrets", () => {
+    store.saveRun(sampleRun());
+    store.addTimeline("r1", "agent", [{ kind: "result", tool: "Bash", text: "GITHUB_TOKEN=abcdef123456" }]);
+    expect(store.readTimeline("r1", { limit: 10 }).items[0]!.text).toBe("GITHUB_TOKEN=[secret removed]");
+  });
+
+  it("prunes only the timelines of runs that finished before the cutoff", () => {
+    store.saveRun(sampleRun());
+    store.addTimeline("r1", "agent", [{ kind: "assistant", text: "working" }]);
+    // Still running: kept however old.
+    expect(store.pruneTimeline(sampleRun().project, "2999-01-01T00:00:00.000Z")).toBe(0);
+    store.updateNode("r1", "agent", { finishedAt: "2026-10-01T00:00:00.000Z" });
+    expect(store.pruneTimeline(sampleRun().project, "2026-09-01T00:00:00.000Z")).toBe(0);
+    expect(store.pruneTimeline("other", "2026-11-01T00:00:00.000Z")).toBe(0);
+    expect(store.pruneTimeline(sampleRun().project, "2026-11-01T00:00:00.000Z")).toBe(1);
+    expect(store.readTimeline("r1", { limit: 10 }).total).toBe(0);
+    expect(store.listProjects()).toEqual([sampleRun().project]);
   });
 });

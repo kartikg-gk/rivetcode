@@ -5,17 +5,7 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/git.js";
 import { branchName, worktreePath } from "../src/paths.js";
-import {
-  createWorktree,
-  DirtyWorktreeError,
-  isDirty,
-  listWorktrees,
-  pruneWorktrees,
-  removeWorktree,
-  emptyTrash,
-  waitForTrash,
-  WorktreeError,
-} from "../src/worktree.js";
+import { createWorktree, DirtyWorktreeError, isDirty, listWorktrees, pruneWorktrees, removeWorktree, emptyTrash, WorktreeError } from "../src/worktree.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
@@ -25,7 +15,6 @@ beforeEach(async () => {
   data = await makeDataDir();
 });
 afterEach(async () => {
-  await waitForTrash();
   await removeRepo(repo);
   await removeRepo(data);
 });
@@ -275,10 +264,8 @@ describe("concurrency", () => {
   }, 180_000);
 });
 
-describe("removal through the trash", () => {
-  const trash = () => join(data, "worktrees", ".trash");
-
-  it("moves a clean worktree aside and deletes it in the background", async () => {
+describe("removal", () => {
+  it("removes a clean worktree and git forgets it", async () => {
     const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
 
@@ -286,11 +273,9 @@ describe("removal through the trash", () => {
 
     expect(existsSync(path)).toBe(false);
     expect((await listWorktrees(repo)).map((w) => w.path)).toEqual([resolve(repo)]);
-    await waitForTrash();
-    expect(existsSync(trash()) ? await readdir(trash()) : []).toEqual([]);
   });
 
-  it("puts a dirty worktree back where it was", async () => {
+  it("leaves a dirty worktree as it was", async () => {
     const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await writeFile(join(path, "new.ts"), "export {}\n");
@@ -298,12 +283,10 @@ describe("removal through the trash", () => {
     await expect(removeWorktree(data, repo, path)).rejects.toThrow(DirtyWorktreeError);
 
     expect(existsSync(join(path, "new.ts"))).toBe(true);
-    expect(existsSync(trash()) ? await readdir(trash()) : []).toEqual([]);
-    expect(await isDirty(path)).toBe(true);
     expect((await listWorktrees(repo)).map((w) => w.path)).toContain(resolve(path));
   });
 
-  it("does not move a locked worktree; git refuses it in place", async () => {
+  it("leaves a locked worktree; git refuses it", async () => {
     const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
     await git(["worktree", "lock", path], repo);
@@ -311,21 +294,18 @@ describe("removal through the trash", () => {
     await expect(removeWorktree(data, repo, path)).rejects.toThrow(/locked/);
 
     expect(existsSync(join(path, "README.txt"))).toBe(true);
-    expect(existsSync(trash()) ? await readdir(trash()) : []).toEqual([]);
-    expect((await listWorktrees(repo)).find((w) => w.path === resolve(path))!.locked).toBe(true);
   });
 
   it("refuses a path outside the data dir's worktrees folder", async () => {
     await expect(removeWorktree(data, repo, join(repo, "..", "elsewhere"))).rejects.toThrow(/outside/);
   });
 
-  it("sweeps leftovers from an earlier crash", async () => {
-    await mkdir(join(trash(), "root-abc123", "deep"), { recursive: true });
-    await writeFile(join(trash(), "root-abc123", "deep", "f.txt"), "x");
+  it("deletes the trash folder earlier versions left", async () => {
+    await mkdir(join(data, "worktrees", ".trash", "root-abc123", "deep"), { recursive: true });
+    await writeFile(join(data, "worktrees", ".trash", "root-abc123", "deep", "f.txt"), "x");
 
     await emptyTrash(data);
-    await waitForTrash();
 
-    expect(await readdir(trash())).toEqual([]);
+    expect(existsSync(join(data, "worktrees", ".trash"))).toBe(false);
   });
 });

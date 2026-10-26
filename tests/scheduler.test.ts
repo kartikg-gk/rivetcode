@@ -8,7 +8,7 @@ import { commandRules, modelFor } from "../src/scheduler/scheduler.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import type { Run } from "../src/store.js";
-import { listWorktrees, waitForTrash } from "../src/worktree.js";
+import { listWorktrees } from "../src/worktree.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
@@ -25,7 +25,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await daemon?.stop();
   daemon = undefined;
-  await waitForTrash();
   await removeRepo(repo);
   await removeRepo(data);
 });
@@ -189,7 +188,7 @@ describe("an orchestrator", () => {
     await new Promise((r) => setTimeout(r, 400));
     const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
     expect(inbox.split(/\r?\n/).filter((l) => l.includes("is waiting for a permission answer"))).toHaveLength(1);
-    expect(inbox).toContain(`Answer it with rivet send --session ${worker}-agent --message`);
+    expect(inbox).toContain(`Answer with: rivet answer ${worker} yes|always|no`);
     await api("POST", `/api/v1/runs/${orchestrator}/stop`, {});
   });
 
@@ -249,6 +248,26 @@ describe("clean", () => {
     expect((await api("POST", `/api/v1/runs/${runId}/clean`)).json).toEqual({ removed: ["agent"], kept: [] });
     expect(existsSync(run.node.worktree)).toBe(false);
     expect((await git(["branch", "--list", run.node.branch], repo)).trim()).not.toBe("");
+  });
+});
+
+describe("symlink list", () => {
+  it("links an ignored folder into each worktree, and cleaning leaves the real one alone", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    await writeFile(join(repo, ".gitignore"), "node_modules/\n");
+    await git(["add", ".gitignore"], repo);
+    await git(["commit", "-q", "-m", "ignore deps"], repo);
+    await mkdir(join(repo, "node_modules", "dep"), { recursive: true });
+    await writeFile(join(repo, "node_modules", "dep", "x.js"), "x");
+    await start();
+    await setCfg("symlink", "node_modules");
+    const runId = await spawn({ files: { "a.txt": "a" }, commit: "a" });
+    const run = await settled(runId);
+    expect(run.node.status).toBe("done");
+    expect(await readFile(join(run.node.worktree, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
+    expect((await api("POST", `/api/v1/runs/${runId}/clean`)).status).toBe(200);
+    expect(existsSync(run.node.worktree)).toBe(false);
+    expect(await readFile(join(repo, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
   });
 });
 
@@ -640,5 +659,132 @@ describe("switching a worker's agent", () => {
     const runId = await spawn({ commit: "none" });
     await settled(runId);
     expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "codex" })).json.error).toMatch(/is done/);
+  });
+});
+
+describe("answering a permission question and send modes", () => {
+  // A worker in a terminal that writes every line it gets to inbox.txt.
+  async function terminalWorker(): Promise<{ runId: string; inbox: () => Promise<string> }> {
+    await start();
+    await setCfg("worker.mode", "interactive");
+    const runId = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 400));
+    const worktree = (await getRun(runId)).node.worktree;
+    return { runId, inbox: () => readFile(join(worktree, "inbox.txt"), "utf8").catch(() => "") };
+  }
+  const activity = (runId: string, state: string, request?: object) =>
+    api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state, ...(request ? { request } : {}) });
+  async function inboxHas(inbox: () => Promise<string>, text: string): Promise<string> {
+    const end = Date.now() + 5000;
+    while (!(await inbox()).includes(text) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    return inbox();
+  }
+
+  it("holds messages while the agent is blocked, shows the question, and answers it", async () => {
+    const { runId, inbox } = await terminalWorker();
+    await activity(runId, "blocked", { tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest).toMatchObject({ tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
+    // Typed into the question, a message would answer it: it waits.
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also add docs" })).json.delivery).toBe("after-answer");
+    expect(await inbox()).not.toContain("also add docs");
+    expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "no", note: "use git ls-files instead" })).status).toBe(204);
+    const text = await inboxHas(inbox, "also add docs");
+    expect(text.split(/\r?\n/).filter(Boolean)).toEqual(["n", "use git ls-files instead", "also add docs"]);
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest).toBeUndefined();
+    expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" })).json.error).toMatch(/not waiting for a permission answer/);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("queue waits for the agent to be idle; steer goes in at once", async () => {
+    const { runId, inbox } = await terminalWorker();
+    await activity(runId, "active");
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "later please", mode: "queue" })).json.delivery).toBe("when-idle");
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "after that", mode: "steer" })).json.delivery).toBe("when-idle");
+    expect(await inbox()).toBe("");
+    await activity(runId, "idle");
+    expect((await inboxHas(inbox, "after that")).split(/\r?\n/).filter(Boolean)).toEqual(["later please", "after that"]);
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "now", mode: "bogus" })).status).toBe(400);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("an answer for an agent without a terminal is refused", async () => {
+    await start();
+    const runId = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 300));
+    await activity(runId, "blocked");
+    expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" })).json.error).toMatch(/only an agent in a terminal/);
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+});
+
+describe("reading a session's timeline", () => {
+  it("shows what the worker was told and said; activity adds what it did; pages and cuts like a thread read", async () => {
+    await start();
+    const runId = await spawn({ listen: true });
+    await new Promise((r) => setTimeout(r, 300));
+    await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also add docs" });
+    // What a hook reports: the same prompt again (skipped), a tool call, its result, the reply.
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active", timeline: [
+      { kind: "prompt", text: JSON.stringify({ listen: true }) },
+      { kind: "tool", tool: "Bash", text: "npm test" }, { kind: "result", tool: "Bash", text: "ok" },
+      { kind: "assistant", text: "x".repeat(30) }, { kind: "nonsense", text: "dropped" },
+    ] });
+    const messages = (await api("GET", `/api/v1/runs/${runId}/timeline`)).json;
+    expect(messages).toMatchObject({ view: "messages", total: 3, run: { id: runId, agent: "fake", status: "running" } });
+    expect(messages.items.map((i: { kind: string }) => i.kind)).toEqual(["prompt", "message", "assistant"]);
+    const activity = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&limit=2`)).json;
+    expect(activity.total).toBe(5);
+    expect(activity.items.map((i: { kind: string }) => i.kind)).toEqual(["prompt", "message"]);
+    const rest = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&after=${activity.next}&maxChars=10`)).json;
+    expect(rest.items.map((i: { kind: string; text: string }) => [i.kind, i.text])).toEqual([["tool", "npm test"], ["result", "ok"], ["assistant", "xxxxxxxxxx"]]);
+    expect(rest.items[2].cut).toEqual({ shown: 10, length: 30 });
+    expect(rest.next).toBeUndefined();
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("keeps a headless Claude worker's every reply and call from stream-json, and its hooks add no duplicates", async () => {
+    const events = [
+      { type: "system", subtype: "init" },
+      { type: "assistant", message: { content: [{ type: "text", text: "Reading the code." }, { type: "tool_use", id: "t1", name: "Read", input: { file_path: "a.ts" } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "export {}" }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "Nothing to change." }] } },
+    ];
+    const script = `setTimeout(() => { for (const e of ${JSON.stringify(events)}) console.log(JSON.stringify(e)); }, 600);`;
+    const fake = getAgent("fake");
+    const claudeLike: Agent = { ...fake, name: "claude", launchCommand: async () => [process.execPath, "-e", script] };
+    await start(claudeLike);
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "look at a.ts", agent: "claude" })).json.runId as string;
+    await new Promise((r) => setTimeout(r, 200));
+    // Its hooks report the same call: dropped, as the stream has it.
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active", timeline: [{ kind: "tool", tool: "Read", text: "a.ts" }] });
+    await settled(runId);
+    const items = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity`)).json.items as { kind: string; tool?: string; text: string }[];
+    expect(items.filter((i) => i.kind !== "event").map((i) => [i.kind, i.tool ?? "", i.text])).toEqual([
+      ["prompt", "", expect.stringMatching(/^Your task: look at a\.ts/)],
+      ["assistant", "", "Reading the code."], ["tool", "Read", "a.ts"], ["result", "Read", "export {}"], ["assistant", "", "Nothing to change."],
+    ]);
+  });
+
+  it("keeps a headless Codex worker's replies and commands from its --json events, as they come", async () => {
+    const script = "for (const e of [" +
+      "{type:'item.completed',item:{type:'agent_message',text:'Looking at the tests.'}}," +
+      "{type:'item.started',item:{type:'command_execution',command:'npm test'}}," +
+      "{type:'item.completed',item:{type:'command_execution',command:'npm test',aggregated_output:'1 passing'}}," +
+      "{type:'item.completed',item:{type:'agent_message',text:'All green.'}}]) console.log(JSON.stringify(e));";
+    const fake = getAgent("fake");
+    const codexLike: Agent = { ...fake, name: "codex", launchCommand: async () => [process.execPath, "-e", script] };
+    daemon = await startDaemon({
+      data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, onError: (e) => errors.push(e),
+      agents: (name) => (name === "codex" ? codexLike : getAgent("fake")),
+    });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "check the tests", agent: "codex" })).json.runId as string;
+    await settled(runId);
+    const items = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity`)).json.items as { kind: string; tool?: string; text: string }[];
+    expect(items.map((i) => [i.kind, i.text])).toEqual([
+      ["prompt", expect.stringMatching(/^Your task: check the tests/)],
+      ["assistant", "Looking at the tests."], ["tool", "npm test"], ["result", "1 passing"], ["assistant", "All green."],
+      ["event", expect.stringMatching(/./)],
+    ].slice(0, items.length));
+    expect(items.slice(1, 5).map((i) => i.kind)).toEqual(["assistant", "tool", "result", "assistant"]);
   });
 });

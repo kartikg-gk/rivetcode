@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GITIGNORE_MARKER, ensureWorkspaceGitignore, hooksManager } from "../src/agents/hooks.js";
 import { git } from "../src/git.js";
-import { createWorktree, removeWorktree, waitForTrash } from "../src/worktree.js";
+import { createWorktree, removeWorktree } from "../src/worktree.js";
 import { worktreePath } from "../src/paths.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
@@ -126,7 +126,6 @@ describe("hook files stay out of git", () => {
       await manager.install(path);
       expect((await git(["status", "--porcelain"], path)).trim()).toBe("");
       await removeWorktree(data, repo, path);
-      await waitForTrash();
     } finally {
       await removeRepo(repo);
       await removeRepo(data);

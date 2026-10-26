@@ -10,6 +10,7 @@ import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
 import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
+import { fromStream, readableOutput, type TimelineEntry } from "../timeline.js";
 import { outsidePaths } from "./tasks.js";
 import { conversationFile, runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
@@ -50,6 +51,9 @@ export function modelFor(agent: Node["agent"], config: Record<string, string>): 
 
 // What an orchestrator brought back by resume is told before anything else.
 const RESTART_NOTE = "Rivet was restarted. Before starting anything, run rivet status: workers you started earlier may still be running or already done, so do not start the same work again.";
+
+// How long a terminal agent gets to settle after Esc before more is typed.
+const INTERRUPT_SETTLE_MS = 600;
 
 // A worker gets this many launches before Rivet stops retrying and asks the user.
 export const MAX_ATTEMPTS = 2;
@@ -96,6 +100,28 @@ export function createScheduler(d: SchedulerDeps) {
   const report = (e: unknown) => d.onError?.(e);
 
   const load = (runId: string) => d.write(() => d.store.loadRun(runId));
+
+  // A session's timeline. Codex run headless reports its work as JSON lines, read as they come.
+  const note = (runId: string, session: string, entries: TimelineEntry[]) =>
+    d.write(() => d.store.addTimeline(runId, session, entries)).catch(report);
+  // Sessions whose JSON stream Rivet reads: their hooks add only prompts, or every call
+  // and reply would be there twice.
+  const streamed = new Set<string>();
+  function followStream(runId: string, session: string, sessionId: string, agentName: string, headless: boolean): void {
+    if (!headless || (agentName !== "codex" && agentName !== "claude")) {
+      streamed.delete(sessionId);
+      return;
+    }
+    streamed.add(sessionId);
+    let partial = "";
+    const toolNames = new Map<string, string>();
+    d.runtime.attach(sessionId, (chunk) => {
+      const parts = (partial + chunk).split(/\r?\n/);
+      partial = parts.pop() ?? "";
+      const entries = parts.flatMap((line) => fromStream(line, toolNames) ?? []);
+      if (entries.length) void note(runId, session, entries);
+    });
+  }
   const sessionOf = (run: Run) => sessionIdOf(run.id, run.node.id);
 
   function track<T>(work: Promise<T>): Promise<T> {
@@ -179,6 +205,8 @@ export function createScheduler(d: SchedulerDeps) {
       throw e;
     }
     doneReported.delete(sessionId);
+    if (prompt !== undefined) await note(run.id, NODE_ID, [{ kind: o.resume ? "message" : "prompt", text: prompt }]);
+    followStream(run.id, NODE_ID, sessionId, node.agent, headless);
     await d.write(() => d.store.markLaunched(run.id, node.id));
     await deliverQueued(run.id);
     return launchId;
@@ -198,12 +226,78 @@ export function createScheduler(d: SchedulerDeps) {
   async function deliverNow(runId: string): Promise<void> {
     const sessionId = sessionIdOf(runId, NODE_ID);
     const queued = await d.write(() => d.store.undeliveredMessages(runId, NODE_ID));
+    if (queued.length === 0) return;
+    // A headless agent gets its messages when its turn ends (see messagesAtTurnEnd).
+    if (!d.runtime.takesInput(sessionId)) return;
+    const activity = (await load(runId)).node.activity;
+    // Typed into a permission question, a message would answer it: nothing goes in until
+    // the question is answered (rivet answer).
+    if (activity === "blocked") return;
     for (const m of queued) {
-      // A headless agent gets its messages when its turn ends (see messagesAtTurnEnd).
-      if (!d.runtime.takesInput(sessionId)) return;
-      try { await d.runtime.write(sessionId, m.message); } catch { return; }
+      // In order: a queued message waits for the agent to be idle, and so does what follows it.
+      if (m.mode === "queue" && activity !== "idle" && activity !== "waiting_input") return;
+      try {
+        if (m.mode === "interrupt" && activity !== "idle" && activity !== "waiting_input") {
+          d.runtime.input(sessionId, "\x1b");
+          await new Promise((r) => setTimeout(r, INTERRUPT_SETTLE_MS));
+        }
+        await d.runtime.write(sessionId, m.message);
+      } catch { return; }
       await d.write(() => d.store.markDelivered(m.id));
+      await note(runId, NODE_ID, [{ kind: "message", text: m.message }]);
     }
+  }
+
+  // An interrupting message to a headless agent: its turn is stopped and its conversation
+  // resumed with the message. Without a conversation to resume it waits like any other.
+  async function interruptHeadless(runId: string): Promise<boolean> {
+    const run = await load(runId);
+    const session = sessionOf(run);
+    if (!d.runtime.isAlive(session) || d.runtime.takesInput(session)) return false;
+    const queued = await d.write(() => d.store.undeliveredMessages(runId, NODE_ID));
+    if (!queued.some((m) => m.mode === "interrupt")) return false;
+    const cfg = { sessionId: session, workspace: run.node.worktree, ...(run.node.agentSessionId ? { capturedId: run.node.agentSessionId } : {}) };
+    if (!(await d.agents(run.node.agent).restoreCommand(cfg))) return false;
+    await stopSession(session);
+    return messagesAtTurnEnd(await load(runId));
+  }
+
+  // The permission question each terminal agent is stuck at, as its hook reported it.
+  const pendingRequests = new Map<string, { tool: string; detail: string; at: string }>();
+  function setPending(runId: string, request: { tool: string; detail: string } | null): void {
+    if (request) pendingRequests.set(runId, { ...request, at: new Date().toISOString() });
+    else pendingRequests.delete(runId);
+  }
+
+  // The keys each agent's permission question takes. Claude: checked live (1 runs it,
+  // Esc refuses it). Codex: its documented keys; it could not be made to ask in a check.
+  const ANSWER_KEYS: Record<string, Record<"yes" | "always" | "no", string>> = {
+    claude: { yes: "1", always: "2", no: "\x1b" },
+    codex: { yes: "y", always: "a", no: "\x1b" },
+    fake: { yes: "y\r", always: "a\r", no: "n\r" },
+  };
+
+  // "rivet answer": answers the permission question a terminal agent waits at; a refusal
+  // can carry what to do instead, typed in once the question is gone.
+  async function answer(runId: string, choice: "yes" | "always" | "no", note?: string): Promise<void> {
+    const run = await load(runId);
+    const session = sessionOf(run);
+    if (!d.runtime.isAlive(session)) throw new SchedulerError(409, `run ${runId} is not running`);
+    if (run.node.activity !== "blocked") throw new SchedulerError(409, `run ${runId} is not waiting for a permission answer`);
+    const keys = ANSWER_KEYS[run.node.agent];
+    if (!keys) throw new SchedulerError(409, `no answer keys for ${run.node.agent}`);
+    try {
+      d.runtime.input(session, keys[choice]);
+    } catch {
+      throw new SchedulerError(409, "only an agent in a terminal is asked for permission");
+    }
+    setPending(runId, null);
+    await d.write(() => d.store.setActivity(runId, NODE_ID, "active"));
+    if (choice === "no" && note?.trim()) {
+      await new Promise((r) => setTimeout(r, INTERRUPT_SETTLE_MS));
+      await d.runtime.write(session, note.trim());
+    }
+    void deliverQueued(runId).catch(report);
   }
 
   function firstPrompt(run: Run, retry?: string): string {
@@ -313,8 +407,9 @@ export function createScheduler(d: SchedulerDeps) {
     await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} gave up: ${why.split(/\r?\n/)[0]}`);
   }
 
+  // What an agent last printed, readable: Codex's JSON events become their text.
   function lastOutput(sessionId: string): string {
-    return (d.runtime.output(sessionId, OUTPUT_FOR_RETRY)?.lines ?? []).join("\n");
+    return readableOutput(d.runtime.output(sessionId, OUTPUT_FOR_RETRY)?.lines ?? []).join("\n");
   }
 
   async function onExit(sessionId: string, launchId: string, code: number | null): Promise<void> {
@@ -382,11 +477,12 @@ export function createScheduler(d: SchedulerDeps) {
     const run = await load(runId);
     if (run.role !== "worker" || !run.orchestrator) return;
     const session = sessionOf(run);
-    const shown = (d.runtime.output(session, 12)?.lines ?? []).join("\n").trim();
+    const request = pendingRequests.get(runId);
+    const shown = request ? "" : (d.runtime.output(session, 12)?.lines ?? []).join("\n").trim();
     await tellOrchestrator(run, [
       `Worker ${run.id}${run.name ? ` (${run.name})` : ""} is waiting for a permission answer and does nothing until it gets one.`,
-      ...(shown ? ["Its screen ends with:", shown] : []),
-      `Answer it with rivet send --session ${session} --message "<the choice's number>", or tell the user.`,
+      ...(request ? [`It asks to use ${request.tool}: ${request.detail}`] : shown ? ["Its screen ends with:", shown] : []),
+      `Answer with: rivet answer ${run.id} yes|always|no [--note "<what to do instead>"]. Answer when it follows from the task; otherwise ask the user.`,
     ].join("\n"));
   }
 
@@ -400,9 +496,10 @@ export function createScheduler(d: SchedulerDeps) {
 
   // "rivet report": every report goes on to the worker's orchestrator; "--done" also
   // stops the agent and takes the work.
-  async function onReport(runId: string, kind: string, note?: string): Promise<void> {
+  async function onReport(runId: string, kind: string, said?: string): Promise<void> {
     const run = await load(runId);
-    await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} reports ${kind}${note ? `: ${note}` : ""}`);
+    await note(runId, NODE_ID, [{ kind: "event", text: `reported ${kind}${said ? `: ${said}` : ""}` }]);
+    await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} reports ${kind}${said ? `: ${said}` : ""}`);
     if (kind !== "done" || run.role !== "worker") return;
     const sessionId = sessionOf(run);
     doneReported.add(sessionId);
@@ -653,6 +750,8 @@ export function createScheduler(d: SchedulerDeps) {
         sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
         env: agentEnv({ runId, nodeId: "review", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
       });
+      await note(runId, "review", [{ kind: "prompt", text: reviewerPrompt(run, pr, sha) }]);
+      followStream(runId, "review", session, agentName, true);
     } catch (e) {
       await d.write(() => d.store.endReview(id, { status: "failed", body: `could not start: ${(e as Error).message}` }));
       throw e;
@@ -743,6 +842,8 @@ export function createScheduler(d: SchedulerDeps) {
         sessionId: session, workspace: run.node.worktree, argv, launchId, stdin: "ignore",
         env: agentEnv({ runId, nodeId: "partner", project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
       });
+      await note(runId, "partner", [{ kind: "prompt", text: partnerPrompt(run, o.task, !!o.review, agentName) }]);
+      followStream(runId, "partner", session, agentName, true);
     } catch (e) {
       partners.delete(runId);
       throw e;
@@ -905,7 +1006,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, startRun, onBlocked, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { launch, streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

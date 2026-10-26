@@ -84,7 +84,8 @@ function common(o: CodexOptions): string[] {
 }
 
 export function codexStartCommand(o: CodexOptions): string[] {
-  const args = [o.binary, ...(o.headless ? ["exec"] : []), ...BASE_ARGS,
+  // Headless, Codex prints its work as JSON events, which Rivet keeps as the session's timeline.
+  const args = [o.binary, ...(o.headless ? ["exec", "--json"] : []), ...BASE_ARGS,
     ...codexPermissionArgs(o.permission ?? "default", !!o.headless), ...o.hookFlags, ...common(o)];
   if (o.prompt) args.push("--", o.prompt);
   return args;
@@ -97,7 +98,7 @@ export function codexResumeCommand(o: CodexOptions & { capturedId?: string }): s
   // Headless resume (codex exec resume) takes no --sandbox flag; the same mode goes in as config.
   const permission = codexPermissionArgs(o.permission ?? "default", !!o.headless)
     .flatMap((a, i, all) => (a === "--sandbox" ? ["-c", `sandbox_mode=${basicString(all[i + 1]!)}`] : all[i - 1] === "--sandbox" ? [] : [a]));
-  const args = [o.binary, ...(o.headless ? ["exec", "resume"] : ["resume"]), ...BASE_ARGS, ...permission, ...o.hookFlags, ...common(o), id];
+  const args = [o.binary, ...(o.headless ? ["exec", "resume", "--json"] : ["resume"]), ...BASE_ARGS, ...permission, ...o.hookFlags, ...common(o), id];
   if (o.prompt) args.push("--", o.prompt);
   return args;
 }

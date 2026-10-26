@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
 import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
 import type { TaskSpec } from "./scheduler/tasks.js";
+import { redact, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "./timeline.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -42,8 +43,10 @@ export type Store = {
   // Every agent conversation a run's nodes have had.
   conversations(runId: string): { nodeId: string; agent: string; id: string }[];
   createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
-  queueMessage(runId: string, nodeId: string, message: string, from?: string): number | null;
-  undeliveredMessages(runId: string, nodeId: string): { id: number; message: string }[];
+  // mode: steer (typed in as soon as the agent can take it), queue (only once it is idle),
+  // interrupt (its current turn is stopped first).
+  queueMessage(runId: string, nodeId: string, message: string, from?: string, mode?: SendMode): number | null;
+  undeliveredMessages(runId: string, nodeId: string): { id: number; message: string; mode: SendMode }[];
   markDelivered(id: number): void;
   // After a daemon restart no agent is running; returns how many nodes were changed.
   exitStaleSessions(): number;
@@ -66,6 +69,18 @@ export type Store = {
   automationRuns(automationId: string): AutomationRun[];
   // A project's cues, by name.
   saveCue(cue: Cue): void;
+  // A session's timeline (session: agent, review or partner). A prompt that repeats the
+  // session's recent prompts or messages is the same one seen twice (Rivet and a hook) and is skipped.
+  addTimeline(runId: string, session: string, entries: TimelineEntry[]): void;
+  // Removes the timelines of a project's runs whose sessions all finished before a time;
+  // returns how many entries went.
+  pruneTimeline(project: string, before: string): number;
+  // Every project that has runs.
+  listProjects(): string[];
+  // A run's state changes after a position, oldest first.
+  readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
+  // Entries after a position, oldest first; kinds narrows them (the messages view).
+  readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   listCues(project: string): Cue[];
   deleteCue(project: string, name: string): boolean;
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
@@ -119,6 +134,12 @@ export type Automation = {
 
 // One time an automation came round: the run it started, or why it could not.
 export type AutomationRun = { id: number; automationId: string; scheduledFor: string; runId?: string; error?: string; createdAt: string };
+
+export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
+export type SendMode = (typeof SEND_MODES)[number];
+
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string };
+export type RunEvent = { position: number; nodeId?: string; type: string; data: Record<string, unknown>; at: string };
 
 export type NodeUpdate = {
   status?: Node["status"];
@@ -305,6 +326,38 @@ MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
 ` });
 
+// Every change to a run's state, in order, kept beside the tables that hold its current state.
+MIGRATIONS.push({ version: 16, sql: `
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  node_id TEXT,
+  type TEXT NOT NULL,
+  data TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX events_run ON events (run_id, id);
+` });
+
+// Each session's timeline: what it was told, did and said.
+MIGRATIONS.push({ version: 15, sql: `
+CREATE TABLE timeline (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  session TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('prompt', 'message', 'assistant', 'tool', 'result', 'event')),
+  tool TEXT,
+  text TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX timeline_run ON timeline (run_id, id);
+` });
+
+// How a sent message is to be delivered.
+MIGRATIONS.push({ version: 14, sql: `
+ALTER TABLE outbox ADD COLUMN mode TEXT NOT NULL DEFAULT 'steer' CHECK (mode IN ('steer', 'queue', 'interrupt'));
+` });
+
 // A task file's definition of done, limits and guardrails, as JSON.
 MIGRATIONS.push({ version: 13, sql: `
 ALTER TABLE runs ADD COLUMN spec TEXT;
@@ -433,9 +486,9 @@ export function openStore(data: string): Store {
   const sessionExists = db.prepare("SELECT 1 FROM nodes WHERE run_id = ? AND id = ?");
   const insertReport = db.prepare(`INSERT INTO reports (run_id, node_id, kind, message, created_at)
     VALUES (?, ?, ?, ?, ?)`);
-  const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at)
-    VALUES (?, ?, ?, ?, ?)`);
-  const selectUndelivered = db.prepare(`SELECT id, message FROM outbox
+  const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at, mode)
+    VALUES (?, ?, ?, ?, ?, ?)`);
+  const selectUndelivered = db.prepare(`SELECT id, message, mode FROM outbox
     WHERE run_id = ? AND node_id = ? AND delivered_at IS NULL ORDER BY id`);
   const updateDelivered = db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
   const updateSignal = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
@@ -462,6 +515,19 @@ export function openStore(data: string): Store {
     }
   }
 
+  const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
+  const selectActivity = db.prepare("SELECT activity FROM nodes WHERE run_id = ? AND id = ?");
+  const selectStatus = db.prepare("SELECT status FROM nodes WHERE run_id = ? AND id = ?");
+  const selectStale = db.prepare("SELECT run_id, id, activity FROM nodes WHERE activity IS NOT NULL AND activity <> 'exited'");
+  // Written in the same call as the change it records; a failure to log never fails the change.
+  function logEvent(runId: string, nodeId: string | null, type: string, data: Record<string, unknown> = {}): void {
+    try { insertEvent.run(runId, nodeId, type, JSON.stringify(data), new Date().toISOString()); } catch { /* run gone */ }
+  }
+  // Hooks report activity on every tool call; only a change is an event.
+  function activityBefore(runId: string, nodeId: string): string | null | undefined {
+    return (selectActivity.get(runId, nodeId) as { activity: string | null } | undefined)?.activity;
+  }
+
   return {
     saveRun(run) {
       try {
@@ -471,6 +537,7 @@ export function openStore(data: string): Store {
       }
       db.exec("BEGIN IMMEDIATE");
       try {
+        const before = selectRun.get(run.id) ? (selectStatus.get(run.id, run.node.id) as { status: string } | undefined)?.status ?? null : undefined;
         upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null, run.spec ? JSON.stringify(run.spec) : null);
         deleteNodes.run(run.id);
         const n = run.node;
@@ -483,6 +550,9 @@ export function openStore(data: string): Store {
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
           "[]",
         );
+        // Created once, then only real changes.
+        if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
+        else if (before !== n.status) logEvent(run.id, n.id, "node.updated", { status: n.status });
         db.exec("COMMIT");
       } catch (e) {
         db.exec("ROLLBACK");
@@ -532,21 +602,27 @@ export function openStore(data: string): Store {
     },
 
     setActivity(runId, nodeId, state, agentSessionId) {
+      const before = activityBefore(runId, nodeId);
       const now = state === null ? null : new Date().toISOString();
-      return updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
+      const found = updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
+      if (found && state !== null && state !== before) logEvent(runId, nodeId, "activity", { from: before ?? null, to: state });
+      return found;
     },
 
     recordSignal(runId, nodeId, state, agentSessionId) {
+      const before = activityBefore(runId, nodeId);
       const now = new Date().toISOString();
       const at = state === null ? null : now;
       const found = updateSignal.run(state, at, at, agentSessionId ?? null, now, runId, nodeId).changes > 0;
       if (found && agentSessionId) insertConversation.run(agentSessionId, now, runId, nodeId);
+      if (found && state !== null && state !== before) logEvent(runId, nodeId, "activity", { from: before ?? null, to: state });
       return found;
     },
 
     markLaunched(runId, nodeId) {
       const now = new Date().toISOString();
       updateLaunched.run(now, now, runId, nodeId);
+      logEvent(runId, nodeId, "launched");
     },
 
     conversations(runId) {
@@ -556,33 +632,47 @@ export function openStore(data: string): Store {
 
     createReport(runId, nodeId, kind, message) {
       if (!sessionExists.get(runId, nodeId)) return null;
-      return Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
+      const id = Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
+      logEvent(runId, nodeId, "report", { kind });
+      return id;
     },
 
-    queueMessage(runId, nodeId, message, from) {
+    queueMessage(runId, nodeId, message, from, mode = "steer") {
       if (!sessionExists.get(runId, nodeId)) return null;
-      return Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString()).lastInsertRowid);
+      const id = Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString(), mode).lastInsertRowid);
+      logEvent(runId, nodeId, "message.queued", { id, mode, from: from ?? null });
+      return id;
     },
 
     undeliveredMessages(runId, nodeId) {
-      return (selectUndelivered.all(runId, nodeId) as { id: number; message: string }[])
-        .map((r) => ({ id: Number(r.id), message: r.message }));
+      return (selectUndelivered.all(runId, nodeId) as { id: number; message: string; mode: SendMode }[])
+        .map((r) => ({ id: Number(r.id), message: r.message, mode: r.mode }));
     },
 
     markDelivered(id) {
-      updateDelivered.run(new Date().toISOString(), id);
+      if (updateDelivered.run(new Date().toISOString(), id).changes === 0) return;
+      const row = db.prepare("SELECT run_id, node_id FROM outbox WHERE id = ?").get(id) as { run_id: string; node_id: string } | undefined;
+      if (row) logEvent(row.run_id, row.node_id, "message.delivered", { id });
     },
 
     exitStaleSessions() {
+      // Sessions a stopped daemon left behind: each gets session.exited.
+      const stale = selectStale.all() as { run_id: string; id: string; activity: string }[];
+      for (const s of stale) logEvent(s.run_id, s.id, "session.exited", { from: s.activity, reason: "daemon restarted" });
       return Number(updateStale.run().changes);
     },
 
     updateNode(runId, nodeId, fields) {
       const keys = (Object.keys(fields) as (keyof NodeUpdate)[]).filter((k) => fields[k] !== undefined);
       if (keys.length === 0) return;
+      const old = db.prepare(`SELECT ${keys.map((k) => UPDATE_COLUMNS[k]).join(", ")} FROM nodes WHERE run_id = ? AND id = ?`)
+        .get(runId, nodeId) as Record<string, unknown> | undefined;
       const sql = `UPDATE nodes SET ${keys.map((k) => `${UPDATE_COLUMNS[k]} = ?`).join(", ")} WHERE run_id = ? AND id = ?`;
       const changed = db.prepare(sql).run(...keys.map((k) => fields[k] as string | number | null), runId, nodeId).changes;
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
+      // Only what actually changed, as with a re-saved run.
+      const diff = keys.filter((k) => old?.[UPDATE_COLUMNS[k]] !== fields[k]);
+      if (diff.length) logEvent(runId, nodeId, "node.updated", Object.fromEntries(diff.map((k) => [k, fields[k]])));
     },
 
     saveAutomation(a) {
@@ -623,6 +713,55 @@ export function openStore(data: string): Store {
       }));
     },
 
+    addTimeline(runId, session, entries) {
+      const lastSaid = db.prepare("SELECT text FROM timeline WHERE run_id = ? AND session = ? AND kind IN ('prompt', 'message') ORDER BY id DESC LIMIT 5");
+      const insert = db.prepare("INSERT INTO timeline (run_id, session, kind, tool, text, at) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const e of entries) {
+        const text = redact(e.text);
+        if (e.kind === "prompt") {
+          const recent = lastSaid.all(runId, session) as { text: string }[];
+          if (recent.some((r) => r.text.trim() === text.trim())) continue;
+        }
+        insert.run(runId, session, e.kind, e.tool ?? null, text, new Date().toISOString());
+      }
+    },
+
+    pruneTimeline(project, before) {
+      db.prepare(`DELETE FROM events WHERE run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
+      return Number(db.prepare(`DELETE FROM timeline WHERE run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`)
+        .run(project, before).changes);
+    },
+
+    readEvents(runId, o) {
+      type Row = { id: number; node_id: string | null; type: string; data: string; at: string };
+      return (db.prepare("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?").all(runId, o.after ?? 0, o.limit) as Row[])
+        .map((r) => ({ position: Number(r.id), type: r.type, data: JSON.parse(r.data) as Record<string, unknown>, at: r.at, ...(r.node_id !== null ? { nodeId: r.node_id } : {}) }));
+    },
+
+    listProjects() {
+      return (db.prepare("SELECT DISTINCT project FROM runs ORDER BY project").all() as { project: string }[]).map((r) => r.project);
+    },
+
+    readTimeline(runId, o) {
+      const kinds = o.kinds ?? TIMELINE_KINDS;
+      const marks = kinds.map(() => "?").join(", ");
+      const where = `run_id = ? AND kind IN (${marks})${o.session ? " AND session = ?" : ""}`;
+      const args = [runId, ...kinds, ...(o.session ? [o.session] : [])];
+      const total = (db.prepare(`SELECT COUNT(*) AS n FROM timeline WHERE ${where}`).get(...args) as { n: number }).n;
+      type Row = { id: number; session: string; kind: TimelineKind; tool: string | null; text: string; at: string };
+      const rows = db.prepare(`SELECT * FROM timeline WHERE ${where} AND id > ? ORDER BY id LIMIT ?`).all(...args, o.after ?? 0, o.limit) as Row[];
+      return {
+        total: Number(total),
+        items: rows.map((r) => ({ position: Number(r.id), session: r.session, kind: r.kind, text: r.text, at: r.at, ...(r.tool !== null ? { tool: r.tool } : {}) })),
+      };
+    },
+
     saveCue(cue) {
       db.prepare(`INSERT INTO cues (project, name, type, text, updated_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (project, name) DO UPDATE SET type = excluded.type, text = excluded.text, updated_at = excluded.updated_at`)
@@ -640,13 +779,16 @@ export function openStore(data: string): Store {
     },
 
     startReview(runId, sha, trigger) {
+      logEvent(runId, "review", "review.started", { sha, trigger });
       return Number(db.prepare("INSERT INTO reviews (run_id, sha, trigger, status, created_at) VALUES (?, ?, ?, 'running', ?)")
         .run(runId, sha, trigger, new Date().toISOString()).lastInsertRowid);
     },
 
     endReview(id, f) {
-      db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
-        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id);
+      const ended = db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
+        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id).changes;
+      const row = ended ? db.prepare("SELECT run_id FROM reviews WHERE id = ?").get(id) as { run_id: string } | undefined : undefined;
+      if (row) logEvent(row.run_id, "review", "review.ended", { status: f.status, verdict: f.verdict ?? null });
     },
 
     reviewsOf(runId) {
@@ -670,6 +812,7 @@ export function openStore(data: string): Store {
       db.prepare(`INSERT INTO pull_requests (run_id, number, url, handled) VALUES (?, ?, ?, ?)
         ON CONFLICT (run_id) DO UPDATE SET number = excluded.number, url = excluded.url, handled = excluded.handled`)
         .run(runId, pr.number, pr.url, pr.handled ?? null);
+      logEvent(runId, null, "pr", { number: pr.number, handled: pr.handled ?? null });
     },
 
     getTerminateOnPrMerge(runId) {

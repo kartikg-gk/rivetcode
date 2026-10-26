@@ -8,7 +8,7 @@ import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import { githubClient } from "../src/github/github.js";
 import type { Run } from "../src/store.js";
-import { waitForTrash } from "../src/worktree.js";
+
 import { mockGitHub, type MockGitHub } from "./github-mock.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
@@ -31,7 +31,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await daemon?.stop();
   daemon = undefined;
-  await waitForTrash();
   await gh.close();
   for (const d of [repo, origin, data]) await removeRepo(d);
 });

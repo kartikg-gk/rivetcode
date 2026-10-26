@@ -75,6 +75,10 @@ export function shellRules(rules: string[] | undefined, platform: string = proce
   return out;
 }
 
+// Headless, Claude prints every message and tool call as JSON events (--verbose is required
+// for stream-json in print mode); Rivet keeps them as the session's timeline.
+const STREAM_ARGS = ["--output-format", "stream-json", "--verbose"];
+
 export function claudeAgent(binary: string, configPath = claudeConfigPath(), projectsDir = claudeProjectsDir(), platform: string = process.platform): Agent {
   return {
     // Only the interactive app asks about folder trust; print mode does not.
@@ -95,7 +99,7 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
       const allowedTools = shellRules(cfg.allowedTools, platform);
       return claudeStartCommand({
         binary, ...cfg, ...(allowedTools ? { allowedTools } : {}), ...(taken ? { nativeSessionId: randomUUID() } : {}),
-        ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+        ...(headless ? { print: true, extraArgs: STREAM_ARGS } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },
     // Only a conversation Claude actually saved can be resumed; otherwise there is none.
@@ -104,7 +108,8 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
       if (id === null || !conversationExists(projectsDir, id)) return null;
       const allowedTools = shellRules(cfg.allowedTools, platform);
       return claudeResumeCommand({
-        binary, ...cfg, ...(allowedTools ? { allowedTools } : {}), ...(headless ? { print: true } : {}), ...(headless === false ? { noChrome: true } : {}),
+        binary, ...cfg, ...(allowedTools ? { allowedTools } : {}),
+        ...(headless ? { print: true, extraArgs: STREAM_ARGS } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },
     installHooks: (workspace) => claudeHooks.install(workspace),
