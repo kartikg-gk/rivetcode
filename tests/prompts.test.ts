@@ -20,3 +20,19 @@ describe("pull request feedback for a worker", () => {
     ]);
   });
 });
+
+describe("taking over a worker from another agent", () => {
+  it("points a chat's new agent at the run's own record, a terminal's at the old agent's file", async () => {
+    const { switchPrompt } = await import("../src/scheduler/prompts.js");
+    const { sessionRun } = await import("./helpers.js");
+    const run = sessionRun("/data", { id: "r1", project: "p" });
+    run.node = { ...run.node, agent: "codex" };
+    const chat = switchPrompt(run, { agent: "claude", conversation: null, history: "rivet read r1 --activity", log: "", status: " M a.ts" });
+    expect(chat).toContain("You take over this task from another agent (claude)");
+    expect(chat).toContain("M a.ts");
+    expect(chat).toContain("Its conversation so far, page by page: rivet read r1 --activity");
+    const terminal = switchPrompt(run, { agent: "claude", conversation: "/c/x.jsonl", log: "abc1 first", status: "" });
+    expect(terminal).toContain("Its conversation is saved at /c/x.jsonl.");
+    expect(terminal).not.toContain("rivet read");
+  });
+});

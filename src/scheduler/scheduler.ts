@@ -954,6 +954,8 @@ export function createScheduler(d: SchedulerDeps) {
     if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
     const from = run.node.agent;
     const conversation = run.node.agentSessionId ? conversationFile(from, run.node.agentSessionId) : null;
+    // A chat's whole conversation is Rivet's own record, readable with rivet read.
+    const history = run.node.sessionMode === "chat" ? `rivet read ${runId} --activity` : null;
     await stopSession(sessionOf(run));
     const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
     const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
@@ -965,7 +967,7 @@ export function createScheduler(d: SchedulerDeps) {
     });
     if (run.node.status !== "running") await transition(runId, "running");
     const switched = await load(runId);
-    await launch(switched, switchPrompt(switched, { agent: from, conversation, log, status }));
+    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status }));
     await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
   }
 
