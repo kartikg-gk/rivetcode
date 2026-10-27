@@ -39,7 +39,11 @@ function checkChatEvents(raw: unknown): ChatEvent[] {
     else if (e.type === "turn" && str(e.turnId) && TURN_STATES.includes(e.state as string)) {
       out.push({ type: "turn", turnId: e.turnId as string, state: e.state as "running", ...(str(e.error) ? { error: cut(e.error as string) } : {}) });
     } else if (e.type === "message" && str(e.itemId) && str(e.text) && (e.role === "user" || e.role === "assistant")) {
-      out.push({ type: "message", itemId: e.itemId as string, role: e.role, text: cut(e.text as string), ...(str(e.turnId) ? { turnId: e.turnId as string } : {}) });
+      out.push({ type: "message", itemId: e.itemId as string, role: e.role, text: cut(e.text as string), ...(str(e.turnId) ? { turnId: e.turnId as string } : {}), ...(e.streaming === true ? { streaming: true } : {}) });
+    } else if (e.type === "usage" && (e.mode === "add" || e.mode === "set")) {
+      const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? { ok: true as const, v } : null);
+      const fields = ["input", "output", "cached", "total", "contextUsed", "contextWindow"] as const;
+      out.push({ type: "usage", mode: e.mode, ...Object.fromEntries(fields.filter((f) => n(e[f])).map((f) => [f, e[f] as number])) });
     } else if (e.type === "activity" && CHAT_KINDS.includes(e.kind as string) && CHAT_STATUSES.includes(e.status as string) && str(e.summary)) {
       out.push({
         type: "activity", kind: e.kind as "command", status: e.status as "running", summary: cut(e.summary as string),
@@ -490,6 +494,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events)));
+      const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
+      if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
       const state = outcome.activity ?? null;
       if (nodeId === "review" || nodeId === "partner" || state === null) {
         reply(res, 204);
@@ -607,6 +613,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         run: { id: run.id, name: run.name, role: run.role, agent: run.node.agent, status: run.node.status, activity: run.node.activity ?? null },
         view, total: page.total, items, ...(last !== undefined && page.items.length === limit ? { next: last } : {}),
       });
+      return;
+    }
+    // A chat session's agent lines as they came, for looking into what Rivet made of them.
+    const providerRoute = /^\/api\/v1\/runs\/([^/]+)\/provider-events$/.exec(path);
+    if (providerRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = providerRoute[1]!;
+      if (!(await write(() => store.loadRun(runId)).catch(() => null))) throw new HttpError(404, "unknown run");
+      const q = new URL(req.url ?? "", "http://x").searchParams;
+      const limit = Math.min(1000, Math.max(1, Number(q.get("limit") ?? 200) || 200));
+      const lines = await write(() => store.providerLines(runId, { after: Number(q.get("after") ?? 0) || 0, limit, ...(q.get("session") ? { session: q.get("session")! } : {}) }));
+      const last = lines.at(-1)?.position;
+      reply(res, 200, { lines, ...(last !== undefined && lines.length === limit ? { next: last } : {}) });
       return;
     }
     const eventsRoute = /^\/api\/v1\/runs\/([^/]+)\/events$/.exec(path);
@@ -783,7 +802,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), now: new Date(at).toISOString() });
+        const chatUsage = run.node.sessionMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), ...(chatUsage ? { chatUsage } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {

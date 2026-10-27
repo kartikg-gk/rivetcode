@@ -12,7 +12,12 @@ export type ActivityStatus = "running" | "completed" | "failed" | "pending" | "r
 export type ChatEvent =
   | { type: "conversation"; id: string }
   | { type: "turn"; turnId: string; state: "running" | "completed" | "interrupted" | "failed"; error?: string }
-  | { type: "message"; itemId: string; role: "user" | "assistant"; text: string; turnId?: string }
+  // streaming: the text so far of a reply still being written; the same item comes again,
+  // longer, until a last time without it.
+  | { type: "message"; itemId: string; role: "user" | "assistant"; text: string; turnId?: string; streaming?: boolean }
+  // Tokens: "add" counts one turn's use, "set" replaces the totals with the agent's own.
+  // contextUsed/contextWindow: how full the conversation's context is.
+  | { type: "usage"; mode: "add" | "set"; input?: number; output?: number; cached?: number; total?: number; contextUsed?: number; contextWindow?: number }
   | { type: "activity"; itemId?: string; requestId?: string; kind: ActivityKind; status: ActivityStatus; summary: string; tool?: string; output?: string; turnId?: string };
 
 // What a permission question asks: the tool, and its command or file.
@@ -27,6 +32,8 @@ export type ChatOptions = {
   resume?: string;
   env: Record<string, string>;
   emit(e: ChatEvent): void;
+  // Every line the agent wrote, as it came, for the record.
+  raw?(line: string): void;
   // Answers a question on its own (e.g. a command the session is allowed), or leaves it to
   // be answered by rivet answer.
   decide(a: Approval): Choice | undefined;
@@ -58,6 +65,26 @@ function override(env: Record<string, string>): string[] | null {
 }
 
 const RESULT_LIMIT = 4_000;
+// A reply being written is reported at most this often.
+const STREAM_EVERY_MS = 150;
+const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+
+// Reports a growing reply now and then, and whole at the end.
+function streamer(emit: (e: ChatEvent) => void) {
+  const last = new Map<string, number>();
+  return {
+    grow(itemId: string, textSoFar: string, turnId: string) {
+      const now = Date.now();
+      if (now - (last.get(itemId) ?? 0) < STREAM_EVERY_MS) return;
+      last.set(itemId, now);
+      emit({ type: "message", itemId, role: "assistant", text: textSoFar, turnId, streaming: true });
+    },
+    done(itemId: string, whole: string, turnId: string) {
+      last.delete(itemId);
+      if (whole.trim()) emit({ type: "message", itemId, role: "assistant", text: whole, turnId });
+    },
+  };
+}
 const text = (v: unknown): string => (typeof v === "string" ? v : v === undefined || v === null ? "" : JSON.stringify(v));
 
 // The ACP adapter for Claude Code ships with Rivet; Claude Code itself is the user's own
@@ -86,8 +113,9 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   let message: { id: string; text: string } | null = null;
   const tools = new Map<string, { tool: string; summary: string }>();
   const questions = new Map<string, { id: number | string; options: { optionId: string; kind: string }[] }>();
+  const stream = streamer(o.emit);
   const flush = () => {
-    if (message && message.text.trim()) o.emit({ type: "message", itemId: message.id, role: "assistant", text: message.text, turnId: activeTurn });
+    if (message) stream.done(message.id, message.text, activeTurn);
     message = null;
   };
   const rpc: Rpc = connect(child, {
@@ -101,6 +129,11 @@ export function claudeChat(o: ChatOptions): ChatDriver {
         if (message && message.id !== id) flush();
         message = message ?? { id, text: "" };
         message.text += piece;
+        stream.grow(message.id, message.text, activeTurn);
+        return;
+      }
+      if (kind === "usage_update") {
+        o.emit({ type: "usage", mode: "set", ...(num(u.used) !== undefined ? { contextUsed: num(u.used)! } : {}), ...(num(u.size) !== undefined ? { contextWindow: num(u.size)! } : {}) });
         return;
       }
       if (kind !== "tool_call" && kind !== "tool_call_update" && kind !== "plan") return;
@@ -144,6 +177,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
     },
   }, { jsonrpc: true });
+  if (o.raw) rpc.onLine(o.raw);
   const exited = rpc.closed;
 
   function answer(requestId: string, choice: Choice): boolean {
@@ -175,6 +209,11 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       try {
         const r = await rpc.call("session/prompt", { sessionId, prompt: [{ type: "text", text: said }] });
         flush();
+        // The turn's own use; the totals are their sum.
+        const u = (r.usage ?? {}) as Record<string, unknown>;
+        if (num(u.totalTokens) !== undefined) {
+          o.emit({ type: "usage", mode: "add", input: num(u.inputTokens) ?? 0, output: num(u.outputTokens) ?? 0, cached: (num(u.cachedReadTokens) ?? 0) + (num(u.cachedWriteTokens) ?? 0), total: num(u.totalTokens)! });
+        }
         o.emit({ type: "turn", turnId: activeTurn, state: r.stopReason === "cancelled" ? "interrupted" : "completed" });
       } catch (e) {
         flush();
@@ -218,12 +257,17 @@ export function codexChat(o: ChatOptions): ChatDriver {
   const finished = new Set<string>();
   const questions = new Map<string, number | string>();
   const settings = codexApproval(o.permission);
+  const stream = streamer(o.emit);
+  const growing = new Map<string, string>();
 
   const item = (it: Record<string, unknown>, done: boolean, turnId: string) => {
     const id = text(it.id);
     switch (it.type) {
       case "agentMessage":
-        if (done && text(it.text).trim()) o.emit({ type: "message", itemId: id, role: "assistant", text: text(it.text), turnId });
+        if (done) {
+          growing.delete(id);
+          stream.done(id, text(it.text), turnId);
+        }
         return;
       case "commandExecution": {
         const actions = Array.isArray(it.commandActions) ? (it.commandActions as { command?: string }[]) : [];
@@ -253,6 +297,21 @@ export function codexChat(o: ChatOptions): ChatDriver {
     notify(method, params) {
       const turnId = text(params.turnId) || text((params.turn as { id?: string } | undefined)?.id) || activeTurn;
       if (method === "item/started" || method === "item/completed") item((params.item ?? {}) as Record<string, unknown>, method === "item/completed", turnId);
+      else if (method === "item/agentMessage/delta") {
+        const id = text(params.itemId);
+        const soFar = (growing.get(id) ?? "") + text(params.delta);
+        growing.set(id, soFar);
+        stream.grow(id, soFar, turnId);
+      } else if (method === "thread/tokenUsage/updated") {
+        // Codex keeps the thread's totals itself; the last request shows how full the context is.
+        const u = (params.tokenUsage ?? {}) as { total?: Record<string, unknown>; last?: Record<string, unknown>; modelContextWindow?: unknown };
+        o.emit({
+          type: "usage", mode: "set",
+          input: num(u.total?.inputTokens) ?? 0, output: num(u.total?.outputTokens) ?? 0, cached: num(u.total?.cachedInputTokens) ?? 0, total: num(u.total?.totalTokens) ?? 0,
+          ...(num(u.last?.totalTokens) !== undefined ? { contextUsed: num(u.last?.totalTokens)! } : {}),
+          ...(num(u.modelContextWindow) !== undefined ? { contextWindow: num(u.modelContextWindow)! } : {}),
+        });
+      }
       else if (method === "turn/started") {
         activeTurn = turnId;
         o.emit({ type: "turn", turnId, state: "running" });
@@ -285,6 +344,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
       o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${detail}`, tool, turnId: text(params.turnId) || activeTurn });
     },
   }, { jsonrpc: false });
+  if (o.raw) rpc.onLine(o.raw);
 
   function answer(requestId: string, choice: Choice): boolean {
     const id = questions.get(requestId);

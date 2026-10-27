@@ -22,6 +22,9 @@ export type Control =
   | { type: "answer"; choice: Choice; note?: string; requestId?: string };
 
 const POST_TIMEOUT_MS = 10_000;
+// What happens within this long goes to Rivet in one post (a streaming reply is many events).
+const BATCH_MS = 100;
+const RAW_LINE_LIMIT = 64 * 1024;
 
 export function encodeConfig(c: HostConfig): string {
   return Buffer.from(JSON.stringify(c)).toString("base64url");
@@ -48,20 +51,32 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   const launchId = env.RIVET_LAUNCH_ID ?? "";
   // Posted in order, one batch at a time.
   let pending: ChatEvent[] = [];
+  let raw: string[] = [];
   let posting = Promise.resolve();
+  let timer: NodeJS.Timeout | null = null;
   const post = () => {
-    if (pending.length === 0) return posting;
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (pending.length === 0 && raw.length === 0) return posting;
     const events = pending;
+    const lines = raw;
     pending = [];
-    posting = posting.then(() => callDaemon(env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/chat`, { launchId, events }, POST_TIMEOUT_MS))
+    raw = [];
+    posting = posting.then(() => callDaemon(env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/chat`, { launchId, events, raw: lines }, POST_TIMEOUT_MS))
       .then(() => {}, (e: Error) => { process.stderr.write(`chat: could not report to rivet: ${e.message}\n`); });
     return posting;
   };
-  const emit = (e: ChatEvent) => { pending.push(e); void post(); };
+  const later = () => { timer ??= setTimeout(() => { void post(); }, BATCH_MS); };
+  // A growing reply waits for the batch; everything else is reported at once.
+  const emit = (e: ChatEvent) => {
+    pending.push(e);
+    if (e.type === "message" && e.streaming) later();
+    else void post();
+  };
+  const keepLine = (line: string) => { raw.push(line.length > RAW_LINE_LIMIT ? line.slice(0, RAW_LINE_LIMIT) : line); later(); };
 
   let questionOpen: Approval | null = null;
   const options = {
-    binary: config.binary, cwd: config.cwd, permission: config.permission, env: env as Record<string, string>, emit,
+    binary: config.binary, cwd: config.cwd, permission: config.permission, env: env as Record<string, string>, emit, raw: keepLine,
     ...(config.model ? { model: config.model } : {}),
     ...(config.resume ? { resume: config.resume } : {}),
     decide: (a: Approval): Choice | undefined => {

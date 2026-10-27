@@ -38,11 +38,17 @@ async function turn(text, finish) {
     update({ sessionUpdate: "tool_call_update", toolCallId: `tc${turns}`, rawInput: { command: "ls" }, _meta: { claudeCode: { toolName: "Bash" } } });
     update({ sessionUpdate: "tool_call_update", toolCallId: `tc${turns}`, status: "completed", rawOutput: "a.txt" });
     update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(0, 6) } });
+    await sleep(200);
     update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(6) } });
+    update({ sessionUpdate: "usage_update", used: 1000 * turns, size: 200000 });
   } else {
     out({ method: "item/started", params: { threadId: "th1", turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "inProgress" } } });
     out({ method: "item/completed", params: { threadId: "th1", turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "completed", aggregatedOutput: "a.txt" } } });
+    out({ method: "item/agentMessage/delta", params: { threadId: "th1", turnId: t.id, itemId: `m${turns}`, delta: said.slice(0, 6) } });
+    await sleep(200);
+    out({ method: "item/agentMessage/delta", params: { threadId: "th1", turnId: t.id, itemId: `m${turns}`, delta: said.slice(6) } });
     out({ method: "item/completed", params: { threadId: "th1", turnId: t.id, item: { type: "agentMessage", id: `m${turns}`, text: said } } });
+    out({ method: "thread/tokenUsage/updated", params: { threadId: "th1", turnId: t.id, tokenUsage: { total: { totalTokens: 150 * turns, inputTokens: 100 * turns, cachedInputTokens: 40 * turns, outputTokens: 50 * turns }, last: { totalTokens: 1000 * turns }, modelContextWindow: 200000 } } });
     out({ method: "turn/completed", params: { threadId: "th1", turn: { id: t.id, status: t.cancelled ? "interrupted" : "completed" } } });
   }
   active = null;
@@ -61,7 +67,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     case "session/new": return reply({ sessionId: "s1" });
     case "session/resume": return reply({});
     case "session/set_config_option": return reply({ configOptions: [] });
-    case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn" }));
+    case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));
     case "_session/steering": if (active) { active.steered.push(p.prompt[0].text); return reply({ outcome: "injected" }); } return reply({ outcome: "promptRequired" });
     case "session/cancel": if (active) active.cancelled = true; return;
     case "thread/start": return reply({ thread: { id: "th1" } });
