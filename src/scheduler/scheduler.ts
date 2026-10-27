@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import { git } from "../git.js";
 import type { Agent } from "../agents/agent.js";
 import { abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand, workingTree } from "../merge.js";
@@ -947,11 +949,31 @@ export function createScheduler(d: SchedulerDeps) {
 
   // --- Switching a worker to another agent: the running one stops, the new one starts in
   // the same worktree, branch and pull request with a handoff of where things are.
-  async function switchAgent(runId: string, to: Node["agent"], model?: string): Promise<void> {
-    const run = await load(runId);
+  // A switch waits this long for the agent to finish its turn (unless told to cut it short).
+  const SWITCH_WAIT_MS = 100_000;
+
+  async function switchAgent(runId: string, to: Node["agent"], model?: string, now = false, waitMs = SWITCH_WAIT_MS): Promise<void> {
+    let run = await load(runId);
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
     if (run.node.status === "done" || run.node.status === "pending") throw new SchedulerError(409, `run ${runId} is ${run.node.status}; switch a worker that is working, failed or escalated`);
     if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
+    // An agent is switched between turns: stopped mid-turn it can leave a git lock,
+    // a half-done merge or a half-installed package behind.
+    const busy = () => d.runtime.isAlive(sessionOf(run)) && (run.node.activity === "active" || run.node.activity === "blocked");
+    for (const end = Date.now() + waitMs; !now && busy(); run = await load(runId)) {
+      if (Date.now() > end) throw new SchedulerError(409, `run ${runId} is still working; switch again when it is idle, or with --now to stop it mid-turn`);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    // It may have finished its task while the switch waited.
+    if (doneReported.has(sessionOf(run)) || run.node.status === "done") throw new SchedulerError(409, `run ${runId} finished its task; nothing to switch`);
+    const notes: string[] = [];
+    if (d.runtime.isAlive(partnerSession(runId))) {
+      await stopSession(partnerSession(runId));
+      notes.push("An agent it had delegated part of the work to was stopped; that part may be unfinished.");
+    }
+    partners.delete(runId);
+    awaitingPartner.delete(runId);
+    setPending(runId, null);
     const from = run.node.agent;
     const conversation = run.node.agentSessionId ? conversationFile(from, run.node.agentSessionId) : null;
     // A chat's whole conversation is Rivet's own record, readable with rivet read.
@@ -959,6 +981,7 @@ export function createScheduler(d: SchedulerDeps) {
     await stopSession(sessionOf(run));
     const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
     const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
+    notes.push(...await settleGit(run.node.worktree));
     await d.write(() => {
       d.store.updateNode(runId, NODE_ID, { agent: to, agentSessionId: null });
       const fresh = d.store.loadRun(runId);
@@ -967,8 +990,23 @@ export function createScheduler(d: SchedulerDeps) {
     });
     if (run.node.status !== "running") await transition(runId, "running");
     const switched = await load(runId);
-    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status }));
+    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status, notes }));
     await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
+  }
+
+  // After an agent is stopped: a lock its git left is removed (no one holds it now), and a
+  // merge or rebase it left half done is named for the next agent.
+  async function settleGit(worktree: string): Promise<string[]> {
+    const dir = (await git(["rev-parse", "--absolute-git-dir"], worktree).catch(() => "")).trim();
+    if (!dir) return [];
+    const notes: string[] = [];
+    if (existsSync(join(dir, "index.lock"))) {
+      await rm(join(dir, "index.lock"), { force: true });
+      notes.push("Its git was stopped mid-command; the lock it left was removed.");
+    }
+    if (existsSync(join(dir, "MERGE_HEAD"))) notes.push("A merge is in progress (git status shows it): finish or abort it first.");
+    if (existsSync(join(dir, "rebase-merge")) || existsSync(join(dir, "rebase-apply"))) notes.push("A rebase is in progress: finish it (git rebase --continue) or abort it first.");
+    return notes;
   }
 
   let watcher: NodeJS.Timeout | undefined;

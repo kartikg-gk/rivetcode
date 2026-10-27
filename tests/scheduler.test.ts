@@ -29,7 +29,7 @@ afterEach(async () => {
   await removeRepo(data);
 });
 
-async function start(claude?: Agent, more: { radarMs?: number; limitMs?: number } = {}): Promise<void> {
+async function start(claude?: Agent, more: { radarMs?: number; limitMs?: number; switchWaitMs?: number } = {}): Promise<void> {
   daemon = await startDaemon({
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, ...more,
     agents: (name) => (name === "claude" && claude ? claude : getAgent("fake")),
@@ -652,6 +652,40 @@ describe("switching a worker's agent", () => {
     expect((await api("GET", `/api/v1/runs/${runId}`)).json.live).toBe(true);
     expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).json.error).toMatch(/already runs claude/);
     await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("waits for a working agent's turn to end, and after stopping one mid-turn clears what it left", async () => {
+    const seen: string[] = [];
+    const fake = getAgent("fake");
+    const recording: Agent = { ...fake, launchCommand: async (cfg) => { seen.push(cfg.prompt ?? ""); return fake.launchCommand({ ...cfg, prompt: JSON.stringify({ stayFor: 60_000 }) }); } };
+    await start(recording, { switchWaitMs: 300 });
+    const runId = await spawn({ stayFor: 60_000 });
+    await new Promise((r) => setTimeout(r, 500));
+    // Working, and asking a question: not switched without --now.
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "blocked", request: { tool: "Bash", detail: "npm publish" } });
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).json.error).toMatch(/still working.*--now/);
+    // Its git was mid-command when stopped.
+    const gitDir = (await git(["rev-parse", "--absolute-git-dir"], (await getRun(runId)).node.worktree)).trim();
+    await writeFile(join(gitDir, "index.lock"), "");
+    await writeFile(join(gitDir, "MERGE_HEAD"), (await git(["rev-parse", "HEAD"], repo)).trim() + "\n");
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude", now: true })).status).toBe(202);
+    expect(existsSync(join(gitDir, "index.lock"))).toBe(false);
+    expect(seen[0]).toContain("Its git was stopped mid-command; the lock it left was removed.");
+    expect(seen[0]).toContain("A merge is in progress");
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest).toBeUndefined();
+    await api("POST", `/api/v1/runs/${runId}/stop`, {});
+  });
+
+  it("does not switch a worker that finishes while the switch waits", async () => {
+    await start(undefined, { switchWaitMs: 5_000 });
+    const runId = await spawn({ stayFor: 60_000 });
+    await new Promise((r) => setTimeout(r, 500));
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active" });
+    const switching = api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" });
+    await new Promise((r) => setTimeout(r, 300));
+    await api("POST", "/api/v1/reports", { sessionId: `${runId}-agent`, kind: "done", message: "finished" });
+    expect((await switching).json.error).toMatch(/finished its task/);
+    expect((await getRun(runId)).node.agent).toBe("fake");
   });
 
   it("refuses a finished worker", async () => {

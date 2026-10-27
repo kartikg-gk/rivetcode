@@ -112,6 +112,8 @@ export type DaemonOptions = {
   automationMs?: number;
   // How often finished runs' old timelines are removed.
   pruneMs?: number;
+  // How long a switch waits for a working agent to finish its turn.
+  switchWaitMs?: number;
   // How often workers are checked against their task's time and token limits.
   limitMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
@@ -827,7 +829,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         if (!to || !AGENTS.includes(to as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
         const model = optionalString(payload.model, "model");
         if (model && MODEL_FAMILIES[to === "claude" ? "codex" : "claude"]?.test(model)) throw new HttpError(400, `model "${model}" is not a ${to} model`);
-        await scheduler.switchAgent(run.id, to as never, model);
+        await scheduler.switchAgent(run.id, to as never, model, payload.now === true, opts.switchWaitMs);
         reply(res, 202, { runId: run.id, agent: to });
         return;
       }
