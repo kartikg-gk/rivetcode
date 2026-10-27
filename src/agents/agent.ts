@@ -25,6 +25,8 @@ export type AgentRestore = Omit<AgentLaunch, "nativeSessionId"> & { capturedId?:
 // An adapter only describes how to run an agent's own CLI; running it is the runtime's job.
 export type Agent = {
   name: AgentName;
+  // The agent's own CLI, which a chat session runs through its protocol.
+  binary?: string;
   promptVia: PromptVia;
   // Whether text typed into its stdin reaches it (how sent messages are delivered).
   acceptsInput(o: { headless: boolean }): boolean;

@@ -3,9 +3,10 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
-import { ACTIVITY_STATES, AGENTS, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
+import { ACTIVITY_STATES, AGENTS, NODE_ID, PR_STATUSES, ROLES, type ActivityState, type Node, type Role } from "./model.js";
 import type { TaskSpec } from "./scheduler/tasks.js";
 import { redact, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "./timeline.js";
+import type { ChatEvent } from "./chat/drivers.js";
 
 // One agent session working on one task in its own worktree.
 export type Run = {
@@ -79,6 +80,15 @@ export type Store = {
   listProjects(): string[];
   // A run's state changes after a position, oldest first.
   readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
+  // Folds a chat session's events into its conversation; returns what they mean for the
+  // session: its new activity, and the question it waits on (null once answered).
+  recordChat(runId: string, session: string, events: ChatEvent[]): ChatOutcome;
+  // A chat session's conversation as timeline entries, in the order they happened.
+  readChat(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
+  chatUsage(runId: string, session?: string): ChatUsage | null;
+  // Keeps the agent's own lines as they came (a protocol message each).
+  recordProviderLines(runId: string, session: string, lines: string[]): number;
+  providerLines(runId: string, o: { after?: number; limit: number; session?: string }): { position: number; method: string; payload: string; at: string }[];
   // Entries after a position, oldest first; kinds narrows them (the messages view).
   readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   listCues(project: string): Cue[];
@@ -138,7 +148,10 @@ export type AutomationRun = { id: number; automationId: string; scheduledFor: st
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
-export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string };
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean };
+// A chat session's token use and context, as its agent last reported.
+export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
+export type ChatOutcome = { activity?: ActivityState; question?: { tool: string; detail: string; requestId: string } | null; conversationId?: string };
 export type RunEvent = { position: number; nodeId?: string; type: string; data: Record<string, unknown>; at: string };
 
 export type NodeUpdate = {
@@ -153,11 +166,13 @@ export type NodeUpdate = {
   // The agent running the session (changed by a switch), and its own conversation id.
   agent?: Node["agent"];
   agentSessionId?: string | null;
+  sessionMode?: Node["sessionMode"];
+  providerConversationId?: string | null;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
   status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt", prStatus: "pr_status",
-  agent: "agent", agentSessionId: "agent_session_id",
+  agent: "agent", agentSessionId: "agent_session_id", sessionMode: "session_mode", providerConversationId: "provider_conversation_id",
 };
 
 export class RunStoreError extends Error {
@@ -326,6 +341,92 @@ MIGRATIONS.push({ version: 9, sql: `
 ALTER TABLE runs ADD COLUMN issue INTEGER;
 ` });
 
+// Chat sessions: how each session runs, and the conversation of a chat session (its
+// turns, readable messages and activities), kept by Rivet.
+MIGRATIONS.push({ version: 17, sql: `
+ALTER TABLE nodes ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'terminal' CHECK (session_mode IN ('terminal', 'chat'));
+ALTER TABLE nodes ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
+CREATE TABLE chat_conversations (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('session', 'project')),
+  project TEXT NOT NULL,
+  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+  session TEXT,
+  latest_sequence INTEGER NOT NULL DEFAULT 0,
+  -- Token use and how full the context is, as the agent last said.
+  context_used INTEGER,
+  context_window INTEGER,
+  usage_input_tokens INTEGER,
+  usage_output_tokens INTEGER,
+  usage_cached_tokens INTEGER,
+  usage_total_tokens INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK ((scope = 'session' AND run_id IS NOT NULL AND session IS NOT NULL) OR (scope = 'project' AND run_id IS NULL))
+);
+CREATE UNIQUE INDEX chat_conversations_session ON chat_conversations (run_id, session) WHERE run_id IS NOT NULL;
+CREATE TABLE chat_turns (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  provider_turn_id TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'interrupted', 'failed')),
+  error_message TEXT NOT NULL DEFAULT '',
+  requested_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX chat_turns_conversation ON chat_turns (conversation_id, requested_at);
+CREATE UNIQUE INDEX chat_turns_provider ON chat_turns (conversation_id, provider_turn_id) WHERE provider_turn_id <> '';
+CREATE TABLE chat_messages (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES chat_turns(id) ON DELETE SET NULL,
+  sequence INTEGER NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  origin TEXT NOT NULL CHECK (origin IN ('human', 'automation', 'daemon', 'provider')),
+  text TEXT NOT NULL DEFAULT '',
+  -- A reply still being written: its text grows and revision goes up each time.
+  streaming INTEGER NOT NULL DEFAULT 0,
+  provider_item_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (conversation_id, sequence)
+);
+CREATE UNIQUE INDEX chat_messages_provider_item ON chat_messages (conversation_id, provider_item_id) WHERE provider_item_id <> '';
+CREATE TABLE chat_activities (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES chat_turns(id) ON DELETE SET NULL,
+  sequence INTEGER NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL CHECK (kind IN ('command', 'file_change', 'plan', 'reasoning', 'approval', 'usage', 'error', 'system')),
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'pending', 'resolved')),
+  summary TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  provider_item_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (conversation_id, sequence)
+);
+CREATE UNIQUE INDEX chat_activities_provider_item ON chat_activities (conversation_id, provider_item_id) WHERE provider_item_id <> '';
+CREATE UNIQUE INDEX chat_activities_request ON chat_activities (conversation_id, request_id) WHERE request_id <> '';
+CREATE INDEX chat_activities_pending ON chat_activities (conversation_id, kind, status);
+-- Every line the agent wrote, as it came: the evidence when Rivet's reading of it is wrong.
+-- Never shown as the conversation and never given back to an agent.
+CREATE TABLE chat_provider_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  provider_event_id TEXT NOT NULL DEFAULT '',
+  method TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  received_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX chat_provider_events_dedupe ON chat_provider_events (conversation_id, provider_event_id) WHERE provider_event_id <> '';
+CREATE INDEX chat_provider_events_replay ON chat_provider_events (conversation_id, id);
+` });
+
 // Every change to a run's state, in order, kept beside the tables that hold its current state.
 MIGRATIONS.push({ version: 16, sql: `
 CREATE TABLE events (
@@ -449,7 +550,7 @@ type NodeRow = {
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
   summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
   activity_at: string | null; finished_at: string | null; started_at: string | null; first_signal_at: string | null;
-  shared: string;
+  shared: string; session_mode: string; provider_conversation_id: string;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -471,8 +572,8 @@ export function openStore(data: string): Store {
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
       branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at,
-      started_at, first_signal_at, shared)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      started_at, first_signal_at, shared, session_mode, provider_conversation_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
   const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
@@ -548,7 +649,7 @@ export function openStore(data: string): Store {
           "[]", n.agent, n.branch, n.worktree, n.status, n.attempts,
           n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
-          "[]",
+          "[]", n.sessionMode ?? "terminal", n.providerConversationId ?? "",
         );
         // Created once, then only real changes.
         if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
@@ -581,6 +682,8 @@ export function openStore(data: string): Store {
         ...(n.finished_at !== null ? { finishedAt: n.finished_at } : {}),
         ...(n.started_at !== null ? { startedAt: n.started_at } : {}),
         ...(n.first_signal_at !== null ? { firstSignalAt: n.first_signal_at } : {}),
+        ...(n.session_mode === "chat" ? { sessionMode: "chat" as const } : {}),
+        ...(n.provider_conversation_id ? { providerConversationId: n.provider_conversation_id } : {}),
       }));
       if (!nodes[0]) throw new RunStoreError(`run ${runId} has no session`);
       return {
@@ -727,6 +830,10 @@ export function openStore(data: string): Store {
     },
 
     pruneTimeline(project, before) {
+      db.prepare(`DELETE FROM chat_conversations WHERE run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
       db.prepare(`DELETE FROM events WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
@@ -742,6 +849,159 @@ export function openStore(data: string): Store {
       type Row = { id: number; node_id: string | null; type: string; data: string; at: string };
       return (db.prepare("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?").all(runId, o.after ?? 0, o.limit) as Row[])
         .map((r) => ({ position: Number(r.id), type: r.type, data: JSON.parse(r.data) as Record<string, unknown>, at: r.at, ...(r.node_id !== null ? { nodeId: r.node_id } : {}) }));
+    },
+
+    recordChat(runId, session, events) {
+      const run = selectRun.get(runId) as { project: string } | undefined;
+      if (!run) throw new RunStoreError(`no run ${runId}`);
+      const now = new Date().toISOString();
+      const out: ChatOutcome = {};
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        let conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
+        if (!conv) {
+          conv = { id: randomBytes(8).toString("hex") };
+          db.prepare("INSERT INTO chat_conversations (id, scope, project, run_id, session, created_at, updated_at) VALUES (?, 'session', ?, ?, ?, ?, ?)")
+            .run(conv.id, run.project, runId, session, now, now);
+        }
+        const c = conv.id;
+        const nextSeq = () => Number((db.prepare("UPDATE chat_conversations SET latest_sequence = latest_sequence + 1, updated_at = ? WHERE id = ? RETURNING latest_sequence")
+          .get(now, c) as { latest_sequence: number }).latest_sequence);
+        const turnRow = (providerTurnId?: string) => providerTurnId
+          ? (db.prepare("SELECT id FROM chat_turns WHERE conversation_id = ? AND provider_turn_id = ?").get(c, providerTurnId) as { id: string } | undefined)?.id ?? null
+          : null;
+        for (const e of events) {
+          if (e.type === "conversation") {
+            out.conversationId = e.id;
+            if (session === NODE_ID) {
+              db.prepare("UPDATE nodes SET provider_conversation_id = ? WHERE run_id = ? AND id = ?").run(e.id, runId, NODE_ID);
+              logEvent(runId, NODE_ID, "chat.conversation", { id: e.id });
+              // Its agent keeps the conversation on disk too, so usage is counted from it as for a
+              // terminal session: complete even when a turn is cut short.
+              insertConversation.run(e.id, now, runId, NODE_ID);
+            }
+          } else if (e.type === "turn") {
+            const id = turnRow(e.turnId);
+            if (e.state === "running") {
+              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at) VALUES (?, ?, ?, 'running', ?, ?)")
+                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now);
+              out.activity = "active";
+            } else {
+              if (id) db.prepare("UPDATE chat_turns SET state = ?, error_message = ?, completed_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
+              out.activity = "idle";
+            }
+          } else if (e.type === "message") {
+            const text = redact(e.text);
+            const found = db.prepare("SELECT id FROM chat_messages WHERE conversation_id = ? AND provider_item_id = ?").get(c, e.itemId) as { id: string } | undefined;
+            const streaming = e.streaming ? 1 : 0;
+            if (found) db.prepare("UPDATE chat_messages SET text = ?, streaming = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, streaming, now, found.id);
+            else db.prepare(`INSERT INTO chat_messages (id, conversation_id, turn_id, sequence, role, origin, text, streaming, provider_item_id, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, e.role === "user" ? "daemon" : "provider", text, streaming, e.itemId, now, now);
+          } else if (e.type === "usage") {
+            // add: one turn's use on top of the totals; set: the agent's own totals. Context
+            // figures are always the latest.
+            const op = (col: string, v: number | undefined) => v === undefined ? "" : e.mode === "add" ? `${col} = COALESCE(${col}, 0) + ${Math.round(v)}` : `${col} = ${Math.round(v)}`;
+            const sets = [op("usage_input_tokens", e.input), op("usage_output_tokens", e.output), op("usage_cached_tokens", e.cached), op("usage_total_tokens", e.total),
+              e.contextUsed !== undefined ? `context_used = ${Math.round(e.contextUsed)}` : "", e.contextWindow !== undefined ? `context_window = ${Math.round(e.contextWindow)}` : ""].filter(Boolean);
+            if (sets.length) db.prepare(`UPDATE chat_conversations SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`).run(now, c);
+          } else {
+            const key = e.requestId ? "request_id" : "provider_item_id";
+            const keyValue = e.requestId ?? e.itemId ?? "";
+            const detail = e.output !== undefined || e.tool !== undefined ? JSON.stringify({ ...(e.tool ? { tool: e.tool } : {}), ...(e.output !== undefined ? { output: redact(e.output) } : {}) }) : "";
+            const found = keyValue ? db.prepare(`SELECT id, summary FROM chat_activities WHERE conversation_id = ? AND ${key} = ?`).get(c, keyValue) as { id: string; summary: string } | undefined : undefined;
+            const summary = redact(e.summary);
+            if (found) db.prepare("UPDATE chat_activities SET status = ?, summary = ?, detail_json = CASE WHEN ? = '' THEN detail_json ELSE ? END, revision = revision + 1, updated_at = ? WHERE id = ?")
+              .run(e.status, e.kind === "approval" && e.status === "resolved" ? `${found.summary} (${summary})` : summary || found.summary, detail, detail, now, found.id);
+            else db.prepare(`INSERT INTO chat_activities (id, conversation_id, turn_id, sequence, kind, status, summary, detail_json, request_id, provider_item_id, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.kind, e.status, summary, detail,
+                e.requestId ?? "", e.requestId ? "" : e.itemId ?? "", now, now);
+            if (e.kind === "approval" && e.status === "pending") {
+              out.activity = "blocked";
+              out.question = { tool: e.tool ?? "tool", detail: summary.replace(/^[^:]*: /, ""), requestId: e.requestId ?? "" };
+            } else if (e.kind === "approval" && e.status === "resolved") {
+              out.question = null;
+              out.activity = "active";
+            }
+          }
+        }
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+      return out;
+    },
+
+    chatUsage(runId, session = NODE_ID) {
+      const r = db.prepare(`SELECT usage_input_tokens AS input, usage_output_tokens AS output, usage_cached_tokens AS cached, usage_total_tokens AS total,
+        context_used AS used, context_window AS window FROM chat_conversations WHERE run_id = ? AND session = ?`).get(runId, session) as
+        { input: number | null; output: number | null; cached: number | null; total: number | null; used: number | null; window: number | null } | undefined;
+      if (!r || (r.total === null && r.used === null)) return null;
+      return { input: Number(r.input ?? 0), output: Number(r.output ?? 0), cached: Number(r.cached ?? 0), total: Number(r.total ?? 0),
+        ...(r.used !== null ? { contextUsed: Number(r.used) } : {}), ...(r.window !== null ? { contextWindow: Number(r.window) } : {}) };
+    },
+
+    recordProviderLines(runId, session, lines) {
+      const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
+      if (!conv) return 0;
+      const insert = db.prepare("INSERT OR IGNORE INTO chat_provider_events (conversation_id, provider_event_id, method, payload_json, received_at) VALUES (?, ?, ?, ?, ?)");
+      const now = new Date().toISOString();
+      let kept = 0;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const line of lines) {
+          let m: { method?: unknown; id?: unknown; result?: unknown; error?: unknown };
+          try { m = JSON.parse(line); } catch { continue; }
+          // A reply to Rivet's own call has no method: it is named after what it answers.
+          const method = typeof m.method === "string" ? m.method : m.error !== undefined ? "error" : "result";
+          kept += Number(insert.run(conv.id, "", method, redact(line), now).changes);
+        }
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+      return kept;
+    },
+
+    providerLines(runId, o) {
+      const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
+      if (!conv) return [];
+      type Row = { id: number; method: string; payload_json: string; received_at: string };
+      return (db.prepare("SELECT id, method, payload_json, received_at FROM chat_provider_events WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?")
+        .all(conv.id, o.after ?? 0, o.limit) as Row[]).map((r) => ({ position: Number(r.id), method: r.method, payload: r.payload_json, at: r.received_at }));
+    },
+
+    readChat(runId, o) {
+      const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
+      if (!conv) return { items: [], total: 0 };
+      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number };
+      const rows = db.prepare(`
+        SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at, streaming FROM chat_messages WHERE conversation_id = ?
+        UNION ALL
+        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0 FROM chat_activities WHERE conversation_id = ?
+        ORDER BY sequence`).all(conv.id, conv.id) as Row[];
+      let firstUser = true;
+      const all: TimelineItem[] = [];
+      for (const r of rows) {
+        const base = { position: Number(r.sequence), session: o.session ?? NODE_ID, at: r.at };
+        if (r.source === "message") {
+          const kind: TimelineKind = r.role === "assistant" ? "assistant" : firstUser ? "prompt" : "message";
+          if (r.role === "user") firstUser = false;
+          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}) });
+          continue;
+        }
+        const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};
+        if (r.kind === "command" || r.kind === "file_change") {
+          const failed = r.status === "failed" ? " (failed)" : "";
+          all.push({ ...base, kind: "tool", tool: detail.tool ?? (r.kind === "command" ? "shell" : "edit"), text: `${r.text}${failed}${detail.output ? `\n${detail.output}` : ""}` });
+        } else if (r.kind === "approval") all.push({ ...base, kind: "event", text: `asked to use ${r.text}${r.status === "pending" ? " (waiting for an answer)" : ""}` });
+        else if (r.kind !== "usage") all.push({ ...base, kind: "event", text: `${r.kind}: ${r.text}` });
+      }
+      const kinds = new Set(o.kinds ?? TIMELINE_KINDS);
+      const shown = all.filter((i) => kinds.has(i.kind));
+      const after = o.after ?? 0;
+      return { total: shown.length, items: shown.filter((i) => i.position > after).slice(0, o.limit) };
     },
 
     listProjects() {

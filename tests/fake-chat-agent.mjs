@@ -1,0 +1,80 @@
+// A stand-in for an agent's chat protocol in tests: "acp" speaks the Agent Client Protocol
+// (as Claude's adapter does), "codex" speaks Codex's app-server. Each prompt is answered
+// with "echo: <text>" and one command; words in it script the rest:
+//   ASK  - ask permission for "npm publish" first     RIVET - ask for "rivet status" (allowed)
+//   SLOW - take 3 s, so a message can steer or interrupt it
+import { createInterface } from "node:readline";
+
+const protocol = process.argv[2];
+const acp = protocol === "acp";
+const out = (m) => process.stdout.write(JSON.stringify(acp ? { jsonrpc: "2.0", ...m } : m) + "\n");
+let nextId = 100;
+const asked = new Map();
+const ask = (method, params) => new Promise((resolve) => { const id = nextId++; asked.set(id, resolve); out({ id, method, params }); });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let active = null; // { id, steered: [], cancelled }
+let turns = 0;
+
+function update(u) { out({ method: "session/update", params: { sessionId: "s1", update: u } }); }
+
+async function turn(text, finish) {
+  const t = { id: `turn-${++turns}`, steered: [], cancelled: false };
+  active = t;
+  if (!acp) out({ method: "turn/started", params: { threadId: "th1", turn: { id: t.id, status: "inProgress" } } });
+  const command = text.includes("RIVET") ? "rivet status" : text.includes("ASK") ? "npm publish" : null;
+  let allowed = true;
+  if (command) {
+    const answer = acp
+      ? await ask("session/request_permission", { sessionId: "s1", toolCall: { toolCallId: "tc0", name: "Bash", rawInput: { command }, title: command, kind: "execute" },
+        options: [{ optionId: "yes", kind: "allow_once" }, { optionId: "always", kind: "allow_always" }, { optionId: "no", kind: "reject_once" }] })
+      : await ask("item/commandExecution/requestApproval", { threadId: "th1", turnId: t.id, itemId: "c0", command: `powershell -Command '${command}'`, commandActions: [{ type: "unknown", command }] });
+    allowed = acp ? answer.outcome?.optionId !== "no" : answer.decision !== "decline";
+    if (!acp) out({ method: "serverRequest/resolved", params: { threadId: "th1", requestId: 100 + 0 } });
+  }
+  if (text.includes("SLOW")) for (let i = 0; i < 30 && !t.cancelled; i++) await sleep(100);
+  const said = `echo: ${text}${t.steered.length ? ` + ${t.steered.join(" + ")}` : ""}${allowed ? "" : " (declined)"}`;
+  if (acp) {
+    update({ sessionUpdate: "tool_call", toolCallId: `tc${turns}`, title: "Terminal", kind: "execute", status: "pending", rawInput: {}, _meta: { claudeCode: { toolName: "Bash" } } });
+    update({ sessionUpdate: "tool_call_update", toolCallId: `tc${turns}`, rawInput: { command: "ls" }, _meta: { claudeCode: { toolName: "Bash" } } });
+    update({ sessionUpdate: "tool_call_update", toolCallId: `tc${turns}`, status: "completed", rawOutput: "a.txt" });
+    update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(0, 6) } });
+    await sleep(200);
+    update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(6) } });
+    update({ sessionUpdate: "usage_update", used: 1000 * turns, size: 200000 });
+  } else {
+    out({ method: "item/started", params: { threadId: "th1", turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "inProgress" } } });
+    out({ method: "item/completed", params: { threadId: "th1", turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "completed", aggregatedOutput: "a.txt" } } });
+    out({ method: "item/agentMessage/delta", params: { threadId: "th1", turnId: t.id, itemId: `m${turns}`, delta: said.slice(0, 6) } });
+    await sleep(200);
+    out({ method: "item/agentMessage/delta", params: { threadId: "th1", turnId: t.id, itemId: `m${turns}`, delta: said.slice(6) } });
+    out({ method: "item/completed", params: { threadId: "th1", turnId: t.id, item: { type: "agentMessage", id: `m${turns}`, text: said } } });
+    out({ method: "thread/tokenUsage/updated", params: { threadId: "th1", turnId: t.id, tokenUsage: { total: { totalTokens: 150 * turns, inputTokens: 100 * turns, cachedInputTokens: 40 * turns, outputTokens: 50 * turns }, last: { totalTokens: 1000 * turns }, modelContextWindow: 200000 } } });
+    out({ method: "turn/completed", params: { threadId: "th1", turn: { id: t.id, status: t.cancelled ? "interrupted" : "completed" } } });
+  }
+  active = null;
+  finish(t.cancelled);
+}
+
+createInterface({ input: process.stdin }).on("line", (line) => {
+  if (!line.trim()) return;
+  const m = JSON.parse(line);
+  if (m.method === undefined) { asked.get(m.id)?.(m.result ?? {}); asked.delete(m.id); return; }
+  const reply = (result) => out({ id: m.id, result });
+  const p = m.params ?? {};
+  switch (m.method) {
+    case "initialize": return reply(acp ? { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } } } : { userAgent: "fake" });
+    case "initialized": return;
+    case "session/new": return reply({ sessionId: "s1" });
+    case "session/resume": return reply({});
+    case "session/set_config_option": return reply({ configOptions: [] });
+    case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));
+    case "_session/steering": if (active) { active.steered.push(p.prompt[0].text); return reply({ outcome: "injected" }); } return reply({ outcome: "promptRequired" });
+    case "session/cancel": if (active) active.cancelled = true; return;
+    case "thread/start": return reply({ thread: { id: "th1" } });
+    case "thread/resume": return reply({ thread: { id: p.threadId } });
+    case "turn/start": { reply({ turn: { id: `turn-${turns + 1}`, status: "inProgress" } }); return void turn(p.input[0].text, () => {}); }
+    case "turn/steer": if (active) { active.steered.push(p.input[0].text); return reply({ turnId: active.id }); } return out({ id: m.id, error: { code: -1, message: "no active turn" } });
+    case "turn/interrupt": if (active) active.cancelled = true; return reply({});
+    default: return out({ id: m.id, error: { code: -32601, message: "unknown" } });
+  }
+});

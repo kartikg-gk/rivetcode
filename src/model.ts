@@ -43,7 +43,14 @@ export type Node = {
   startedAt?: string;
   // The first hook of the current launch; unset means the agent has not been heard from.
   firstSignalAt?: string;
+  // How the session runs: in a terminal (the agent's own CLI) or as a chat (its protocol).
+  sessionMode?: SessionMode;
+  // A chat's conversation id at the agent, to resume it.
+  providerConversationId?: string;
 };
+
+export const SESSION_MODES = ["terminal", "chat"] as const;
+export type SessionMode = (typeof SESSION_MODES)[number];
 
 // Every run has exactly one node, under this id; its session is "<run>-agent".
 export const NODE_ID = "agent";

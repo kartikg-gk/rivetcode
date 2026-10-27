@@ -14,6 +14,8 @@ import { fromStream, readableOutput, type TimelineEntry } from "../timeline.js";
 import { outsidePaths } from "./tasks.js";
 import { conversationFile, runUsage } from "../usage.js";
 import { cleanRun } from "./runs.js";
+import { fileURLToPath } from "node:url";
+import { encodeConfig, type Control } from "../chat/host.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
 export const DEFAULT_PERMISSION = "accept-edits";
@@ -143,6 +145,15 @@ export function createScheduler(d: SchedulerDeps) {
 
   // resume: continue the agent's last conversation (the one its hooks reported) instead
   // of starting a new one.
+  // Sessions run as chats (through the agent's protocol, see src/chat): messages and
+  // answers go to them as control lines, and what they do comes from their host.
+  const chats = new Set<string>();
+  // Run from source (tests), the host is the built one.
+  const chatHostMain = () => {
+    const main = fileURLToPath(new URL("../cli/main.js", import.meta.url));
+    return existsSync(main) ? main : fileURLToPath(new URL("../../dist/cli/main.js", import.meta.url));
+  };
+
   async function launch(run: Run, prompt?: string, o: { resume?: boolean } = {}): Promise<string> {
     const node = run.node;
     const sessionId = sessionOf(run);
@@ -167,7 +178,8 @@ export function createScheduler(d: SchedulerDeps) {
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
-    const headless = worker ? config["worker.mode"] !== "interactive" : node.agent === "fake";
+    const chat = config["session.mode"] === "chat" && (node.agent === "claude" || node.agent === "codex");
+    const headless = chat || (worker ? config["worker.mode"] !== "interactive" : node.agent === "fake");
     const cfg = {
       sessionId, workspace: node.worktree, headless,
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
@@ -176,12 +188,25 @@ export function createScheduler(d: SchedulerDeps) {
       ...(run.spec?.denyTools?.length ? { disallowedTools: run.spec.denyTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
     };
-    const argv = o.resume
-      ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })
-      : await agent.launchCommand(cfg);
+    if (chat && o.resume && !node.providerConversationId) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
+    const argv = chat
+      ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-host", encodeConfig({
+        agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
+        ...(model ? { model } : {}), ...(o.resume ? { resume: node.providerConversationId! } : {}), ...(prompt !== undefined ? { prompt } : {}),
+      })]
+      : o.resume
+        ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })
+        : await agent.launchCommand(cfg);
     if (!argv) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
-    await agent.installHooks(node.worktree);
-    await agent.prepare?.({ workspace: node.worktree, headless });
+    if (chat) chats.add(sessionId);
+    else {
+      chats.delete(sessionId);
+      await agent.installHooks(node.worktree);
+      await agent.prepare?.({ workspace: node.worktree, headless });
+    }
+    if ((node.sessionMode ?? "terminal") !== (chat ? "chat" : "terminal")) {
+      await d.write(() => d.store.updateNode(run.id, node.id, { sessionMode: chat ? "chat" : "terminal" }));
+    }
     // Recorded before the process exists, so even an instant exit is attributed to it.
     const previous = d.launches.get(sessionId);
     d.launches.set(sessionId, launchId);
@@ -189,7 +214,7 @@ export function createScheduler(d: SchedulerDeps) {
       await d.runtime.start({
         sessionId, workspace: node.worktree, argv, launchId,
         ...(headless
-          ? { stdin: agent.acceptsInput({ headless: true }) ? "pipe" as const : "ignore" as const }
+          ? { stdin: chat || agent.acceptsInput({ headless: true }) ? "pipe" as const : "ignore" as const }
           : { terminal: { cols: 120, rows: 40 } }),
         env: {
           ...agentEnv({ runId: run.id, nodeId: node.id, project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
@@ -205,8 +230,9 @@ export function createScheduler(d: SchedulerDeps) {
       throw e;
     }
     doneReported.delete(sessionId);
-    if (prompt !== undefined) await note(run.id, NODE_ID, [{ kind: o.resume ? "message" : "prompt", text: prompt }]);
-    followStream(run.id, NODE_ID, sessionId, node.agent, headless);
+    // A chat's host records its own conversation.
+    if (prompt !== undefined && !chat) await note(run.id, NODE_ID, [{ kind: o.resume ? "message" : "prompt", text: prompt }]);
+    if (!chat) followStream(run.id, NODE_ID, sessionId, node.agent, headless);
     await d.write(() => d.store.markLaunched(run.id, node.id));
     await deliverQueued(run.id);
     return launchId;
@@ -233,6 +259,16 @@ export function createScheduler(d: SchedulerDeps) {
     // Typed into a permission question, a message would answer it: nothing goes in until
     // the question is answered (rivet answer).
     if (activity === "blocked") return;
+    // A chat's host takes every message at once and keeps its mode: it steers the turn in
+    // progress, waits for the next one, or stops the turn first.
+    if (chats.has(sessionId)) {
+      for (const m of queued) {
+        const control: Control = { type: "send", mode: m.mode, text: m.message };
+        try { await d.runtime.write(sessionId, JSON.stringify(control)); } catch { return; }
+        await d.write(() => d.store.markDelivered(m.id));
+      }
+      return;
+    }
     for (const m of queued) {
       // In order: a queued message waits for the agent to be idle, and so does what follows it.
       if (m.mode === "queue" && activity !== "idle" && activity !== "waiting_input") return;
@@ -284,6 +320,14 @@ export function createScheduler(d: SchedulerDeps) {
     const session = sessionOf(run);
     if (!d.runtime.isAlive(session)) throw new SchedulerError(409, `run ${runId} is not running`);
     if (run.node.activity !== "blocked") throw new SchedulerError(409, `run ${runId} is not waiting for a permission answer`);
+    if (chats.has(session)) {
+      const control: Control = { type: "answer", choice, ...(note?.trim() ? { note: note.trim() } : {}) };
+      await d.runtime.write(session, JSON.stringify(control));
+      setPending(runId, null);
+      await d.write(() => d.store.setActivity(runId, NODE_ID, "active"));
+      void deliverQueued(runId).catch(report);
+      return;
+    }
     const keys = ANSWER_KEYS[run.node.agent];
     if (!keys) throw new SchedulerError(409, `no answer keys for ${run.node.agent}`);
     try {
@@ -910,6 +954,8 @@ export function createScheduler(d: SchedulerDeps) {
     if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
     const from = run.node.agent;
     const conversation = run.node.agentSessionId ? conversationFile(from, run.node.agentSessionId) : null;
+    // A chat's whole conversation is Rivet's own record, readable with rivet read.
+    const history = run.node.sessionMode === "chat" ? `rivet read ${runId} --activity` : null;
     await stopSession(sessionOf(run));
     const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
     const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
@@ -921,7 +967,7 @@ export function createScheduler(d: SchedulerDeps) {
     });
     if (run.node.status !== "running") await transition(runId, "running");
     const switched = await load(runId);
-    await launch(switched, switchPrompt(switched, { agent: from, conversation, log, status }));
+    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status }));
     await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
   }
 
@@ -1006,7 +1052,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

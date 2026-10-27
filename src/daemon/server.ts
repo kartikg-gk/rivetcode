@@ -23,6 +23,39 @@ function checkEntries(raw: unknown): TimelineEntry[] {
     && typeof (e as { text: unknown }).text === "string" && ((e as { tool?: unknown }).tool === undefined || typeof (e as { tool?: unknown }).tool === "string"))
     .slice(0, 50);
 }
+// What a chat host reports, checked field by field; anything else is dropped.
+const CHAT_KINDS = ["command", "file_change", "plan", "reasoning", "approval", "usage", "error", "system"];
+const CHAT_STATUSES = ["running", "completed", "failed", "pending", "resolved"];
+const TURN_STATES = ["running", "completed", "interrupted", "failed"];
+const CHAT_TEXT_LIMIT = 100_000;
+function checkChatEvents(raw: unknown): ChatEvent[] {
+  if (!Array.isArray(raw)) return [];
+  const str = (v: unknown) => typeof v === "string";
+  const cut = (v: string) => v.slice(0, CHAT_TEXT_LIMIT);
+  const out: ChatEvent[] = [];
+  for (const e of raw.slice(0, 500) as Record<string, unknown>[]) {
+    if (!e || typeof e !== "object") continue;
+    if (e.type === "conversation" && str(e.id)) out.push({ type: "conversation", id: (e.id as string).slice(0, 200) });
+    else if (e.type === "turn" && str(e.turnId) && TURN_STATES.includes(e.state as string)) {
+      out.push({ type: "turn", turnId: e.turnId as string, state: e.state as "running", ...(str(e.error) ? { error: cut(e.error as string) } : {}) });
+    } else if (e.type === "message" && str(e.itemId) && str(e.text) && (e.role === "user" || e.role === "assistant")) {
+      out.push({ type: "message", itemId: e.itemId as string, role: e.role, text: cut(e.text as string), ...(str(e.turnId) ? { turnId: e.turnId as string } : {}), ...(e.streaming === true ? { streaming: true } : {}) });
+    } else if (e.type === "usage" && (e.mode === "add" || e.mode === "set")) {
+      const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? { ok: true as const, v } : null);
+      const fields = ["input", "output", "cached", "total", "contextUsed", "contextWindow"] as const;
+      out.push({ type: "usage", mode: e.mode, ...Object.fromEntries(fields.filter((f) => n(e[f])).map((f) => [f, e[f] as number])) });
+    } else if (e.type === "activity" && CHAT_KINDS.includes(e.kind as string) && CHAT_STATUSES.includes(e.status as string) && str(e.summary)) {
+      out.push({
+        type: "activity", kind: e.kind as "command", status: e.status as "running", summary: cut(e.summary as string),
+        ...(str(e.itemId) ? { itemId: e.itemId as string } : {}), ...(str(e.requestId) ? { requestId: e.requestId as string } : {}),
+        ...(str(e.tool) ? { tool: (e.tool as string).slice(0, 100) } : {}), ...(str(e.output) ? { output: cut(e.output as string) } : {}),
+        ...(str(e.turnId) ? { turnId: e.turnId as string } : {}),
+      });
+    }
+  }
+  return out;
+}
+import type { ChatEvent } from "../chat/drivers.js";
 import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
@@ -52,6 +85,7 @@ const CONFIG_KEYS = [
   "symlink",
   "setup",
   "timeline.keep",
+  "session.mode",
 ];
 // Days a finished run's timeline is kept unless timeline.keep says otherwise ("forever" keeps it).
 const TIMELINE_KEEP_DAYS = 30;
@@ -400,6 +434,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
       const payload = await body(req);
+      // A chat session reports through its host; its agent's own hooks would say it twice.
+      if (scheduler.isChat(sessionIdOf(runId, nodeId))) {
+        reply(res, 204);
+        return;
+      }
       // What the hook saw goes on the session's timeline (reviewers and partners too).
       // A session whose JSON stream Rivet reads gets only prompts from its hooks.
       const entries = checkEntries(payload.timeline)
@@ -441,6 +480,33 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
       // An agent that went idle can take what was queued for it.
       if (state === "idle" || state === "waiting_input") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
+      reply(res, 204);
+      return;
+    }
+    const chatRoute = /^\/api\/v1\/sessions\/([^/]+)\/chat$/.exec(path);
+    if (chatRoute) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId, nodeId } = session(chatRoute[1]);
+      const payload = await body(req);
+      const launchId = optionalString(payload.launchId, "launchId");
+      if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
+        reply(res, 204);
+        return;
+      }
+      const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events)));
+      const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
+      if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
+      const state = outcome.activity ?? null;
+      if (nodeId === "review" || nodeId === "partner" || state === null) {
+        reply(res, 204);
+        return;
+      }
+      const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
+      await write(() => store.recordSignal(runId, nodeId, state));
+      if (outcome.question) scheduler.setPending(runId, { tool: outcome.question.tool.slice(0, 100), detail: outcome.question.detail.slice(0, 500) });
+      else if (state !== "blocked") scheduler.setPending(runId, null);
+      if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
+      if (state === "idle") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
     }
@@ -535,7 +601,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const limit = num("limit", 50, 100);
       const maxChars = num("maxChars", 20_000, 50_000);
       const session = q.get("session") ?? undefined;
-      const page = await write(() => store.readTimeline(run.id, {
+      // A chat session's conversation is its timeline.
+      const chat = run.node.sessionMode === "chat" && (!session || session === NODE_ID);
+      const page = await write(() => (chat ? store.readChat : store.readTimeline)(run.id, {
         after: Number(q.get("after") ?? 0) || 0, limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
       }));
       const items = page.items.map((i) => (i.text.length > maxChars
@@ -545,6 +613,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         run: { id: run.id, name: run.name, role: run.role, agent: run.node.agent, status: run.node.status, activity: run.node.activity ?? null },
         view, total: page.total, items, ...(last !== undefined && page.items.length === limit ? { next: last } : {}),
       });
+      return;
+    }
+    // A chat session's agent lines as they came, for looking into what Rivet made of them.
+    const providerRoute = /^\/api\/v1\/runs\/([^/]+)\/provider-events$/.exec(path);
+    if (providerRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = providerRoute[1]!;
+      if (!(await write(() => store.loadRun(runId)).catch(() => null))) throw new HttpError(404, "unknown run");
+      const q = new URL(req.url ?? "", "http://x").searchParams;
+      const limit = Math.min(1000, Math.max(1, Number(q.get("limit") ?? 200) || 200));
+      const lines = await write(() => store.providerLines(runId, { after: Number(q.get("after") ?? 0) || 0, limit, ...(q.get("session") ? { session: q.get("session")! } : {}) }));
+      const last = lines.at(-1)?.position;
+      reply(res, 200, { lines, ...(last !== undefined && lines.length === limit ? { next: last } : {}) });
       return;
     }
     const eventsRoute = /^\/api\/v1\/runs\/([^/]+)\/events$/.exec(path);
@@ -721,7 +802,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), now: new Date(at).toISOString() });
+        const chatUsage = run.node.sessionMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), ...(chatUsage ? { chatUsage } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {
