@@ -876,6 +876,9 @@ export function openStore(data: string): Store {
             if (session === NODE_ID) {
               db.prepare("UPDATE nodes SET provider_conversation_id = ? WHERE run_id = ? AND id = ?").run(e.id, runId, NODE_ID);
               logEvent(runId, NODE_ID, "chat.conversation", { id: e.id });
+              // Its agent keeps the conversation on disk too, so usage is counted from it as for a
+              // terminal session: complete even when a turn is cut short.
+              insertConversation.run(e.id, now, runId, NODE_ID);
             }
           } else if (e.type === "turn") {
             const id = turnRow(e.turnId);

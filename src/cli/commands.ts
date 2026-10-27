@@ -479,10 +479,9 @@ export function renderRun(run: Run, live: boolean, now: number, silent = false):
 // Tokens, not money: on a subscription a price would not be what the run cost. The
 // price-weighted figure counts the run in plain input tokens, so cheap cache reads do
 // not dominate it.
-// A chat session's use as its agent reports it, and how full its context is.
+// A chat session's use as its agent reports it.
 export function chatUsageLine(u: { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number }): string {
-  const context = u.contextUsed !== undefined && u.contextWindow ? `; context ${u.contextUsed} of ${u.contextWindow} (${Math.round((100 * u.contextUsed) / u.contextWindow)}%)` : "";
-  return `usage: ${u.total} tokens (input ${u.input}, cached ${u.cached}, output ${u.output})${context}`;
+  return `usage: ${u.total} tokens as the agent reported them (input ${u.input}, cached ${u.cached}, output ${u.output})`;
 }
 
 export function usageLine(u: { conversations: number; tokens: TokenUse; inputEquivalent?: number }): string {
@@ -516,8 +515,12 @@ async function status(args: string[], io: CliIo): Promise<number> {
     chatUsage?: { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
   };
   for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.noSignal)) io.out(line);
-  if (result.chatUsage) io.out(chatUsageLine(result.chatUsage));
-  else if (result.usage && result.usage.conversations > 0) io.out(usageLine(result.usage));
+  if (result.usage && result.usage.conversations > 0) io.out(usageLine(result.usage));
+  else if (result.chatUsage && result.chatUsage.total > 0) io.out(chatUsageLine(result.chatUsage));
+  if (result.chatUsage?.contextUsed !== undefined && result.chatUsage.contextWindow) {
+    const c = result.chatUsage;
+    io.out(`context: ${c.contextUsed} of ${c.contextWindow} tokens (${Math.round((100 * c.contextUsed!) / c.contextWindow!)}%)`);
+  }
   if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.node.prStatus ?? "pr_open"})`);
   return 0;
 }
