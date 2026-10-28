@@ -10,6 +10,7 @@ import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
 import { prStatus, type GitHub } from "../github/github.js";
+import { handoffTurns } from "./prompts.js";
 import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
 import { fromStream, readableOutput, type TimelineEntry } from "../timeline.js";
@@ -982,6 +983,8 @@ export function createScheduler(d: SchedulerDeps) {
     const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
     const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
     notes.push(...await settleGit(run.node.worktree));
+    const said = await d.write(() => (run.node.sessionMode === "chat" ? d.store.readChat : d.store.readTimeline)(runId, { limit: 10_000, kinds: ["prompt", "message", "assistant"], session: NODE_ID }));
+    const turns = handoffTurns(said.items, from);
     await d.write(() => {
       d.store.updateNode(runId, NODE_ID, { agent: to, agentSessionId: null });
       const fresh = d.store.loadRun(runId);
@@ -990,7 +993,7 @@ export function createScheduler(d: SchedulerDeps) {
     });
     if (run.node.status !== "running") await transition(runId, "running");
     const switched = await load(runId);
-    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status, notes }));
+    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status, notes, turns }));
     await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
   }
 

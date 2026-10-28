@@ -148,7 +148,7 @@ export type AutomationRun = { id: number; automationId: string; scheduledFor: st
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
-export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean };
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string };
 // A chat session's token use and context, as its agent last reported.
 export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
 export type ChatOutcome = { activity?: ActivityState; question?: { tool: string; detail: string; requestId: string } | null; conversationId?: string };
@@ -343,6 +343,11 @@ ALTER TABLE runs ADD COLUMN issue INTEGER;
 
 // Chat sessions: how each session runs, and the conversation of a chat session (its
 // turns, readable messages and activities), kept by Rivet.
+// Which agent ran each chat turn, so a handoff credits every answer to the agent that gave it.
+MIGRATIONS.push({ version: 18, sql: `
+ALTER TABLE chat_turns ADD COLUMN agent TEXT NOT NULL DEFAULT '';
+` });
+
 MIGRATIONS.push({ version: 17, sql: `
 ALTER TABLE nodes ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'terminal' CHECK (session_mode IN ('terminal', 'chat'));
 ALTER TABLE nodes ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
@@ -527,7 +532,7 @@ function migrate(db: DatabaseSync): void {
     (db.prepare("SELECT version FROM schema_migrations").all() as { version: number }[]).map((r) => r.version),
   );
   const record = db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)");
-  for (const m of MIGRATIONS) {
+  for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
     if (applied.has(m.version)) continue;
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -883,8 +888,9 @@ export function openStore(data: string): Store {
           } else if (e.type === "turn") {
             const id = turnRow(e.turnId);
             if (e.state === "running") {
-              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at) VALUES (?, ?, ?, 'running', ?, ?)")
-                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now);
+              const agent = (db.prepare("SELECT agent FROM nodes WHERE run_id = ? AND id = ?").get(runId, NODE_ID) as { agent: string } | undefined)?.agent ?? "";
+              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent) VALUES (?, ?, ?, 'running', ?, ?, ?)")
+                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now, agent);
               out.activity = "active";
             } else {
               if (id) db.prepare("UPDATE chat_turns SET state = ?, error_message = ?, completed_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
@@ -975,11 +981,12 @@ export function openStore(data: string): Store {
     readChat(runId, o) {
       const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
       if (!conv) return { items: [], total: 0 };
-      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number };
+      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number; agent: string | null };
       const rows = db.prepare(`
-        SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at, streaming FROM chat_messages WHERE conversation_id = ?
+        SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at, streaming,
+          (SELECT agent FROM chat_turns t WHERE t.id = turn_id) AS agent FROM chat_messages WHERE conversation_id = ?
         UNION ALL
-        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0 FROM chat_activities WHERE conversation_id = ?
+        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0, NULL FROM chat_activities WHERE conversation_id = ?
         ORDER BY sequence`).all(conv.id, conv.id) as Row[];
       let firstUser = true;
       const all: TimelineItem[] = [];
@@ -988,7 +995,7 @@ export function openStore(data: string): Store {
         if (r.source === "message") {
           const kind: TimelineKind = r.role === "assistant" ? "assistant" : firstUser ? "prompt" : "message";
           if (r.role === "user") firstUser = false;
-          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}) });
+          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}) });
           continue;
         }
         const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};

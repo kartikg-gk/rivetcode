@@ -22,6 +22,20 @@ describe("pull request feedback for a worker", () => {
 });
 
 describe("taking over a worker from another agent", () => {
+  it("hands over each finished exchange, credited to the agent that answered", async () => {
+    const { handoffTurns } = await import("../src/scheduler/prompts.js");
+    const turns = handoffTurns([
+      { kind: "prompt", text: "do the task" }, { kind: "assistant", text: "thinking" }, { kind: "assistant", text: "done part 1", agent: "claude" },
+      { kind: "message", text: "also b" }, { kind: "assistant", text: "b done", agent: "codex" },
+      { kind: "message", text: "unanswered" }, { kind: "assistant", text: "half", streaming: true },
+    ], "codex");
+    expect(turns).toEqual([
+      { agent: "claude", request: "do the task", reply: "done part 1" },
+      { agent: "codex", request: "also b", reply: "b done" },
+    ]);
+    expect(handoffTurns(Array.from({ length: 30 }, (_, i) => [{ kind: "message", text: `q${i}` }, { kind: "assistant", text: "a" }]).flat(), "x")).toHaveLength(10);
+  });
+
   it("points a chat's new agent at the run's own record, a terminal's at the old agent's file", async () => {
     const { switchPrompt } = await import("../src/scheduler/prompts.js");
     const { sessionRun } = await import("./helpers.js");
