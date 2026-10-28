@@ -12,6 +12,7 @@ export type HostConfig = {
   permission: string;
   model?: string;
   resume?: string;
+  fork?: { providerId: string; turn?: string; agent: string; context: string };
   prompt?: string;
   // Commands the session may run without asking, as permission rules: Bash(git:*), Bash(npm test).
   allow: string[];
@@ -79,6 +80,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
     binary: config.binary, cwd: config.cwd, permission: config.permission, env: env as Record<string, string>, emit, raw: keepLine,
     ...(config.model ? { model: config.model } : {}),
     ...(config.resume ? { resume: config.resume } : {}),
+    ...(config.fork ? { fork: config.fork } : {}),
     decide: (a: Approval): Choice | undefined => {
       if (allowed(config.allow, a.command)) return "yes";
       questionOpen = a;
@@ -97,7 +99,8 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
     busy = true;
     try {
       while (queue.length) {
-        const text = queue.shift()!;
+        let text = queue.shift()!;
+        if (config.fork && said === 0) text += "\n\nThis conversation fork shares its source checkout and branch. Coordinate file edits with other sessions. The source run owns publishing; reporting done here completes the exploration only.";
         userMessage(text);
         await driver.prompt(text);
       }

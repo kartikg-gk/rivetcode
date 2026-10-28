@@ -6,8 +6,13 @@ export function workerPrompt(run: Run, retry?: string): string {
   const lines = [
     `Your task: ${run.task}`,
     "",
-    "You work alone in your own git worktree and branch; other agents may work on other tasks",
-    "in their own worktrees. Keep your changes to this task, and commit as you go.",
+    ...(run.sharedWorkspace ? [
+      `You share the checkout and branch owned by run ${run.sharedWorkspace}. Coordinate edits and commits with its other sessions.`,
+      "The source run owns publishing; reporting done here completes the exploration.",
+    ] : [
+      "You work alone in your own git worktree and branch; other agents may work on other tasks",
+      "in their own worktrees. Keep your changes to this task, and commit as you go.",
+    ]),
     `When the task is finished, run: rivet report --done --note "<one line summary>"`,
     `If you are stuck, run: rivet report --stuck --note "<what blocks you>"`,
     `If you need a decision, run: rivet report --needs-input --note "<question>"`,
@@ -21,7 +26,7 @@ export function workerPrompt(run: Run, retry?: string): string {
   // main repository's .git), so its commits fail; Rivet commits for it.
   if (run.node.agent === "codex") {
     lines.push("If git commit fails with \"Permission denied\" (your sandbox), leave the changes uncommitted:",
-      "Rivet commits them when you report done.");
+      run.sharedWorkspace ? "Leave those changes for the source session to commit." : "Rivet commits them when you report done.");
   }
   if (retry) lines.push("", "A previous attempt at this task failed:", retry, "", "Fix that and finish the task.");
   return lines.join("\n");

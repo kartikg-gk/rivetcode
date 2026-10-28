@@ -156,6 +156,7 @@ async function runSetup(repo: string, worktree: string, nodeId: string, steps: s
 
 // Removes a run's worktree. The branch stays (it holds the work); a dirty worktree stays too.
 export async function cleanRun(data: string, run: Run): Promise<{ removed: string[]; kept: string[] }> {
+  if (run.sharedWorkspace) return { removed: [], kept: [run.node.id] };
   try {
     await removeWorktree(data, run.repo, run.node.worktree);
     return { removed: [run.node.id], kept: [] };

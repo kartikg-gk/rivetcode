@@ -11,7 +11,7 @@ import { connect, type Rpc } from "./rpc.js";
 export type ActivityKind = "command" | "file_change" | "plan" | "reasoning" | "approval" | "usage" | "error" | "system";
 export type ActivityStatus = "running" | "completed" | "failed" | "pending" | "resolved";
 export type ChatEvent =
-  | { type: "conversation"; id: string }
+  | { type: "conversation"; id: string; forkStrategy?: "native" | "reconstructed" }
   | { type: "turn"; turnId: string; state: "running" | "completed" | "interrupted" | "failed"; error?: string }
   // streaming: the text so far of a reply still being written; the same item comes again,
   // longer, until a last time without it.
@@ -31,6 +31,7 @@ export type ChatOptions = {
   model?: string;
   permission: string;
   resume?: string;
+  fork?: { providerId: string; turn?: string; agent: string; context: string };
   env: Record<string, string>;
   emit(e: ChatEvent): void;
   // Every line the agent wrote, as it came, for the record.
@@ -200,11 +201,12 @@ export function claudeChat(o: ChatOptions): ChatDriver {
         ? await rpc.call("session/resume", { sessionId: o.resume, cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] }).then(() => ({ sessionId: o.resume! }))
         : await rpc.call("session/new", { cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] });
       sessionId = text(opened.sessionId);
-      o.emit({ type: "conversation", id: sessionId });
+      o.emit({ type: "conversation", id: sessionId, ...(o.fork && !o.resume ? { forkStrategy: "reconstructed" as const } : {}) });
       if (o.model) await rpc.call("session/set_config_option", { sessionId, configId: "model", value: o.model });
       await rpc.call("session/set_config_option", { sessionId, configId: "mode", value: CLAUDE_MODES[o.permission] ?? "default" });
     },
     async prompt(said) {
+      if (o.fork && !o.resume && turn === 0) said = o.fork.context + "\n\n" + said;
       activeTurn = `t${++turn}`;
       o.emit({ type: "turn", turnId: activeTurn, state: "running" });
       try {
@@ -252,6 +254,8 @@ function codexApproval(permission: string): { approvalPolicy: string; sandbox: s
 export function codexChat(o: ChatOptions): ChatDriver {
   const child = launch(override(o.env) ?? [o.binary, "app-server"], o.cwd, o.env);
   let threadId = "";
+  let forkStrategy: "native" | "reconstructed" | undefined;
+  let firstForkPrompt = true;
   let activeTurn = "";
   let turnEnded: (() => void) | null = null;
   // Turns already over: turn/start's reply can arrive after its turn ended.
@@ -270,6 +274,12 @@ export function codexChat(o: ChatOptions): ChatDriver {
           stream.done(id, text(it.text), turnId);
         }
         return;
+      case "mcpToolCall": {
+        const tool = `mcp:${text(it.server)}/${text(it.tool)}`;
+        o.emit({ type: "activity", itemId: id, kind: "command", status: !done ? "running" : it.error || it.status === "failed" ? "failed" : "completed", summary: tool, tool, turnId,
+          ...(done ? { output: text(it.error ?? it.result).slice(0, RESULT_LIMIT) } : {}) });
+        return;
+      }
       case "commandExecution": {
         const actions = Array.isArray(it.commandActions) ? (it.commandActions as { command?: string }[]) : [];
         const summary = actions.map((a) => a.command).filter(Boolean).join(" && ") || text(it.command);
@@ -361,13 +371,27 @@ export function codexChat(o: ChatOptions): ChatDriver {
       await rpc.call("initialize", { clientInfo: { name: "rivet", version: "0.1.0" } });
       rpc.notify("initialized");
       const params = { cwd: o.cwd, ...settings, ...(o.env.RIVET_SESSION_ID ? { config: { mcp_servers: { rivet: mcpLaunch(o.env) } } } : {}), ...(o.model ? { model: o.model } : {}) };
-      const r = o.resume
-        ? await rpc.call("thread/resume", { threadId: o.resume, ...params })
-        : await rpc.call("thread/start", params);
+      let r: Record<string, unknown>;
+      if (!o.resume && o.fork?.agent === "codex" && o.fork.providerId && o.fork.turn) {
+        try {
+          r = await rpc.call("thread/fork", { threadId: o.fork.providerId, lastTurnId: o.fork.turn, ...params });
+          forkStrategy = "native";
+        } catch (e) {
+          if (!(e instanceof Error) || !("code" in e) || e.code !== -32601) throw e;
+          r = await rpc.call("thread/start", params);
+          forkStrategy = "reconstructed";
+        }
+      } else {
+        r = o.resume ? await rpc.call("thread/resume", { threadId: o.resume, ...params }) : await rpc.call("thread/start", params);
+        if (o.fork && !o.resume) forkStrategy = "reconstructed";
+      }
       threadId = text((r.thread as { id?: string } | undefined)?.id) || o.resume || "";
-      o.emit({ type: "conversation", id: threadId });
+      if (forkStrategy === "native" && (!threadId || threadId === o.fork?.providerId)) throw new Error("provider fork returned no independent thread id");
+      o.emit({ type: "conversation", id: threadId, ...(forkStrategy ? { forkStrategy } : {}) });
     },
     async prompt(said) {
+      if (firstForkPrompt && forkStrategy === "reconstructed" && o.fork) said = o.fork.context + "\n\n" + said;
+      firstForkPrompt = false;
       const ended = new Promise<void>((resolve) => { turnEnded = resolve; });
       let id = "";
       try {

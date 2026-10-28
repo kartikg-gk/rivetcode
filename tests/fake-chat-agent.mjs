@@ -14,22 +14,23 @@ const ask = (method, params) => new Promise((resolve) => { const id = nextId++; 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let active = null; // { id, steered: [], cancelled }
 let turns = 0;
+let threadId = "th1";
 
 function update(u) { out({ method: "session/update", params: { sessionId: "s1", update: u } }); }
 
 async function turn(text, finish) {
   const t = { id: `turn-${++turns}`, steered: [], cancelled: false };
   active = t;
-  if (!acp) out({ method: "turn/started", params: { threadId: "th1", turn: { id: t.id, status: "inProgress" } } });
+  if (!acp) out({ method: "turn/started", params: { threadId, turn: { id: t.id, status: "inProgress" } } });
   const command = text.includes("RIVET") ? "rivet status" : text.includes("ASK") ? "npm publish" : null;
   let allowed = true;
   if (command) {
     const answer = acp
       ? await ask("session/request_permission", { sessionId: "s1", toolCall: { toolCallId: "tc0", name: "Bash", rawInput: { command }, title: command, kind: "execute" },
         options: [{ optionId: "yes", kind: "allow_once" }, { optionId: "always", kind: "allow_always" }, { optionId: "no", kind: "reject_once" }] })
-      : await ask("item/commandExecution/requestApproval", { threadId: "th1", turnId: t.id, itemId: "c0", command: `powershell -Command '${command}'`, commandActions: [{ type: "unknown", command }] });
+      : await ask("item/commandExecution/requestApproval", { threadId, turnId: t.id, itemId: "c0", command: `powershell -Command '${command}'`, commandActions: [{ type: "unknown", command }] });
     allowed = acp ? answer.outcome?.optionId !== "no" : answer.decision !== "decline";
-    if (!acp) out({ method: "serverRequest/resolved", params: { threadId: "th1", requestId: 100 + 0 } });
+    if (!acp) out({ method: "serverRequest/resolved", params: { threadId, requestId: 100 + 0 } });
   }
   if (text.includes("SLOW")) for (let i = 0; i < 30 && !t.cancelled; i++) await sleep(100);
   const said = `echo: ${text}${t.steered.length ? ` + ${t.steered.join(" + ")}` : ""}${allowed ? "" : " (declined)"}`;
@@ -42,14 +43,14 @@ async function turn(text, finish) {
     update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(6) } });
     update({ sessionUpdate: "usage_update", used: 1000 * turns, size: 200000 });
   } else {
-    out({ method: "item/started", params: { threadId: "th1", turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "inProgress" } } });
-    out({ method: "item/completed", params: { threadId: "th1", turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "completed", aggregatedOutput: "a.txt" } } });
-    out({ method: "item/agentMessage/delta", params: { threadId: "th1", turnId: t.id, itemId: `m${turns}`, delta: said.slice(0, 6) } });
+    out({ method: "item/started", params: { threadId, turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "inProgress" } } });
+    out({ method: "item/completed", params: { threadId, turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "completed", aggregatedOutput: "a.txt" } } });
+    out({ method: "item/agentMessage/delta", params: { threadId, turnId: t.id, itemId: `m${turns}`, delta: said.slice(0, 6) } });
     await sleep(200);
-    out({ method: "item/agentMessage/delta", params: { threadId: "th1", turnId: t.id, itemId: `m${turns}`, delta: said.slice(6) } });
-    out({ method: "item/completed", params: { threadId: "th1", turnId: t.id, item: { type: "agentMessage", id: `m${turns}`, text: said } } });
-    out({ method: "thread/tokenUsage/updated", params: { threadId: "th1", turnId: t.id, tokenUsage: { total: { totalTokens: 150 * turns, inputTokens: 100 * turns, cachedInputTokens: 40 * turns, outputTokens: 50 * turns }, last: { totalTokens: 1000 * turns }, modelContextWindow: 200000 } } });
-    out({ method: "turn/completed", params: { threadId: "th1", turn: { id: t.id, status: t.cancelled ? "interrupted" : "completed" } } });
+    out({ method: "item/agentMessage/delta", params: { threadId, turnId: t.id, itemId: `m${turns}`, delta: said.slice(6) } });
+    out({ method: "item/completed", params: { threadId, turnId: t.id, item: { type: "agentMessage", id: `m${turns}`, text: said } } });
+    out({ method: "thread/tokenUsage/updated", params: { threadId, turnId: t.id, tokenUsage: { total: { totalTokens: 150 * turns, inputTokens: 100 * turns, cachedInputTokens: 40 * turns, outputTokens: 50 * turns }, last: { totalTokens: 1000 * turns }, modelContextWindow: 200000 } } });
+    out({ method: "turn/completed", params: { threadId, turn: { id: t.id, status: t.cancelled ? "interrupted" : "completed" } } });
   }
   active = null;
   finish(t.cancelled);
@@ -76,7 +77,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     case "_session/steering": if (active) { active.steered.push(p.prompt[0].text); return reply({ outcome: "injected" }); } return reply({ outcome: "promptRequired" });
     case "session/cancel": if (active) active.cancelled = true; return;
     case "thread/start": return reply({ thread: { id: "th1" } });
-    case "thread/resume": return reply({ thread: { id: p.threadId } });
+    case "thread/fork":
+      if (process.env.RIVET_TEST_NO_FORK) return out({ id: m.id, error: { code: -32601, message: "unsupported fork" } });
+      if (!p.lastTurnId) return out({ id: m.id, error: { code: -32600, message: "missing stable anchor" } });
+      threadId = "forked-" + p.threadId; return reply({ thread: { id: threadId } });
+    case "thread/resume": threadId = p.threadId; return reply({ thread: { id: p.threadId } });
     case "turn/start": { reply({ turn: { id: `turn-${turns + 1}`, status: "inProgress" } }); return void turn(p.input[0].text, () => {}); }
     case "turn/steer": if (active) { active.steered.push(p.input[0].text); return reply({ turnId: active.id }); } return out({ id: m.id, error: { code: -1, message: "no active turn" } });
     case "turn/interrupt": if (active) active.cancelled = true; return reply({});
