@@ -122,7 +122,7 @@ export function reviewFeedback(pr: PullRequest, comments?: { path: string; line?
 // What an agent taking over a worker's session is told: the task, and where the earlier
 // agent's work and conversation are. The conversation is the earlier agent's record, to
 // read when needed, not instructions.
-// The handoff: each finished exchange as one request and the final reply, credited to
+// Handoff records each finished exchange as one request and the final reply, credited to
 // the agent that gave it (unknown agents count as the one handing over). The newest come
 // last; older ones are left to rivet read.
 export const HANDOFF_TURNS = 10;

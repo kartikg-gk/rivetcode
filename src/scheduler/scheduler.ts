@@ -958,7 +958,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
     if (run.node.status === "done" || run.node.status === "pending") throw new SchedulerError(409, `run ${runId} is ${run.node.status}; switch a worker that is working, failed or escalated`);
     if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
-    // An agent is switched between turns: stopped mid-turn it can leave a git lock,
+    // Switch agents between turns: stopping mid-turn can leave a git lock,
     // a half-done merge or a half-installed package behind.
     const busy = () => d.runtime.isAlive(sessionOf(run)) && (run.node.activity === "active" || run.node.activity === "blocked");
     for (const end = Date.now() + waitMs; !now && busy(); run = await load(runId)) {

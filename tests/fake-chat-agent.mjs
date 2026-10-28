@@ -61,6 +61,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.method === undefined) { asked.get(m.id)?.(m.result ?? {}); asked.delete(m.id); return; }
   const reply = (result) => out({ id: m.id, result });
   const p = m.params ?? {};
+  if (process.env.RIVET_TEST_MCP === "1" && ["session/new", "session/resume", "thread/start", "thread/resume"].includes(m.method)) {
+    const server = acp ? p.mcpServers?.find((s) => s.name === "rivet") : p.config?.mcp_servers?.rivet;
+    const session = acp ? server?.env?.find((e) => e.name === "RIVET_SESSION_ID")?.value : server?.env?.RIVET_SESSION_ID;
+    if (!server?.command || server.args?.at(-1) !== "mcp" || session !== "r1-agent") return out({ id: m.id, error: { code: -1, message: "missing Rivet MCP registration" } });
+  }
   switch (m.method) {
     case "initialize": return reply(acp ? { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } } } : { userAgent: "fake" });
     case "initialized": return;

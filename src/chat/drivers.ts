@@ -1,3 +1,4 @@
+import { mcpLaunch } from "../mcp/launch.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -196,8 +197,8 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       const init = await rpc.call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
       const caps = (init.agentCapabilities ?? {}) as { sessionCapabilities?: { resume?: unknown } };
       const opened = o.resume && caps.sessionCapabilities?.resume !== undefined
-        ? await rpc.call("session/resume", { sessionId: o.resume, cwd: o.cwd, mcpServers: [] }).then(() => ({ sessionId: o.resume! }))
-        : await rpc.call("session/new", { cwd: o.cwd, mcpServers: [] });
+        ? await rpc.call("session/resume", { sessionId: o.resume, cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] }).then(() => ({ sessionId: o.resume! }))
+        : await rpc.call("session/new", { cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] });
       sessionId = text(opened.sessionId);
       o.emit({ type: "conversation", id: sessionId });
       if (o.model) await rpc.call("session/set_config_option", { sessionId, configId: "model", value: o.model });
@@ -239,7 +240,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   };
 }
 
-// The mapping for a chat session: edits stay in the worktree and the agent asks when it
+// Chat permissions: edits stay in the worktree and the agent asks when it
 // wants more; otherwise no sandbox and no questions, as in the terminal.
 function codexApproval(permission: string): { approvalPolicy: string; sandbox: string } {
   if (permission === "read-only") return { approvalPolicy: "never", sandbox: "read-only" };
@@ -359,7 +360,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
     async start() {
       await rpc.call("initialize", { clientInfo: { name: "rivet", version: "0.1.0" } });
       rpc.notify("initialized");
-      const params = { cwd: o.cwd, ...settings, ...(o.model ? { model: o.model } : {}) };
+      const params = { cwd: o.cwd, ...settings, ...(o.env.RIVET_SESSION_ID ? { config: { mcp_servers: { rivet: mcpLaunch(o.env) } } } : {}), ...(o.model ? { model: o.model } : {}) };
       const r = o.resume
         ? await rpc.call("thread/resume", { threadId: o.resume, ...params })
         : await rpc.call("thread/start", params);

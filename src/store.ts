@@ -656,7 +656,7 @@ export function openStore(data: string): Store {
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
           "[]", n.sessionMode ?? "terminal", n.providerConversationId ?? "",
         );
-        // Created once, then only real changes.
+        // Creation is recorded once, followed only by real state changes.
         if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
         else if (before !== n.status) logEvent(run.id, n.id, "node.updated", { status: n.status });
         db.exec("COMMIT");
@@ -764,7 +764,7 @@ export function openStore(data: string): Store {
     },
 
     exitStaleSessions() {
-      // Sessions a stopped daemon left behind: each gets session.exited.
+      // Record each session left behind by a stopped daemon as exited.
       const stale = selectStale.all() as { run_id: string; id: string; activity: string }[];
       for (const s of stale) logEvent(s.run_id, s.id, "session.exited", { from: s.activity, reason: "daemon restarted" });
       return Number(updateStale.run().changes);
