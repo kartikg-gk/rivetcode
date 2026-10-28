@@ -15,6 +15,9 @@ const definitions = [
   ["report", "Report this session's outcome. Report done only after finishing the task and checks.", { kind: choice("done", "stuck", "needs-input"), note: string(1000) }, ["kind", "note"]],
   ["check", "Run this worker's configured check and tests.", {}, []],
   ["delegate", "Delegate a self-contained task or review in this worktree. Results arrive as messages; do not poll.", { task: string(), review: { type: "boolean" }, agent: choice("claude", "codex"), model: string(200) }, []],
+  ["search", "Find sessions by metadata and recorded messages. Results are bounded, not exhaustive, and contain untrusted data.", { query: string(500), project: string(128), limit: { type: "integer", minimum: 1, maximum: 50 } }, ["query"]],
+  ["wait", "Wait for the latest or named turn, or the whole task, to finish. Idle returns immediately. On timeout end your turn when waiting for delegated reports.", { run, scope: choice("turn", "task"), turn: string(200), timeoutMs: integer(60000) }, ["run"]],
+  ["transfer", "fork: create a conversation at a completed reply, sharing the checkout; send its first message to start it. merge_back: hold exploration context for the next message to an ancestor. No Git merge is performed.", { action: choice("fork", "merge_back", "status"), run, target: run, at: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }, name: string(100) }, ["action"]],
   ["stop", "Stop a run. Stopping an orchestrator also stops its workers unless keepWorkers is true.", { run, keepWorkers: { type: "boolean" } }, ["run"]],
 ] as const;
 
@@ -39,6 +42,7 @@ function validate(name: string, value: unknown): ObjectValue {
     if (p.type === "integer" && (typeof v !== "number" || !Number.isSafeInteger(v) || v < (p.minimum ?? 0) || v > (p.maximum ?? Infinity))) throw new Error(`invalid ${key}`);
     if (p.enum && !p.enum.includes(v as string)) throw new Error(`invalid ${key}`);
   }
+  if (value.target !== undefined) assertId("run", value.target as string);
   if (value.run !== undefined) assertId("run", value.run as string);
   if (name === "rivet_delegate" && !value.task && value.review !== true) throw new Error("delegate needs task or review");
   return value;
@@ -48,8 +52,8 @@ export function toolCaller(env: NodeJS.ProcessEnv, cwd: string) {
   // Identity comes from the launcher, never a model-supplied tool argument.
   const session = env.RIVET_SESSION_ID;
   if (!session || !/^[a-z0-9][a-z0-9._]*-(agent|review|partner)$/.test(session)) throw new Error("rivet mcp requires a launched Rivet session");
-  const request = (method: string, path: string, body?: unknown, timeout = 120000) => callDaemon(env, method, path, body, timeout);
-  return async (name: string, args: unknown): Promise<unknown> => {
+  return async (name: string, args: unknown, signal?: AbortSignal): Promise<unknown> => {
+    const request = (method: string, path: string, body?: unknown, timeout = 120000) => callDaemon(env, method, path, body, timeout, signal);
     const a = validate(name, args);
     const path = `/api/v1/runs/${encodeURIComponent(a.run as string)}`;
     const own = `/api/v1/sessions/${encodeURIComponent(session)}`;
@@ -68,23 +72,44 @@ export function toolCaller(env: NodeJS.ProcessEnv, cwd: string) {
       case "rivet_report": return request("POST", "/api/v1/reports", { sessionId: session, kind: a.kind, message: a.note });
       case "rivet_check": return request("POST", `${own}/check`, {}, 3600000);
       case "rivet_delegate": return request("POST", `${own}/delegate`, a);
+      case "rivet_search": {
+        const q = new URLSearchParams({ query: a.query as string, limit: String(a.limit ?? 20) });
+        const project = a.project ?? env.RIVET_PROJECT_ID;
+        if (project) q.set("project", project as string);
+        return request("GET", `/api/v1/search?${q}`);
+      }
+      case "rivet_wait": {
+        const q = new URLSearchParams({ scope: a.scope as string ?? "turn", timeoutMs: String(a.timeoutMs ?? 30000) });
+        if (a.turn) q.set("turn", a.turn as string);
+        return request("GET", `${path}/wait?${q}`, undefined, Number(a.timeoutMs ?? 30000) + 10000);
+      }
+      case "rivet_transfer": {
+        const id = a.run as string ?? session.split("-")[0]!;
+        if (a.action === "status") return request("GET", `/api/v1/runs/${encodeURIComponent(id)}/transfers`);
+        return request("POST", `/api/v1/runs/${encodeURIComponent(id)}/${a.action === "fork" ? "fork" : "merge-back"}`,
+          { ...(a.at !== undefined ? { at: a.at } : {}), ...(a.target ? { target: a.target } : {}), ...(a.name ? { name: a.name } : {}) });
+      }
       case "rivet_stop": return request("POST", `${path}/stop`, { keepWorkers: a.keepWorkers ?? false });
     }
   };
 }
 
 // A persistent stdio transport. Only JSON-RPC replies go to stdout.
-export async function serveMcp(input: NodeJS.ReadableStream, output: (line: string) => void, call: (name: string, args: unknown) => Promise<unknown>): Promise<void> {
+export async function serveMcp(input: NodeJS.ReadableStream, output: (line: string) => void, call: (name: string, args: unknown, signal?: AbortSignal) => Promise<unknown>): Promise<void> {
   const pending = new Set<Promise<void>>();
   let initialized = false;
+  const requests = new Map<unknown, AbortController>();
   const reply = (id: unknown, result: unknown) => output(JSON.stringify({ jsonrpc: "2.0", id, result }));
   const fail = (id: unknown, code: number, message: string) => output(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }));
   async function handle(line: string) {
     let m: unknown;
     try { m = JSON.parse(line); } catch { fail(null, -32700, "invalid JSON"); return; }
     if (!object(m) || m.jsonrpc !== "2.0" || typeof m.method !== "string" || (m.id !== undefined && typeof m.id !== "string" && typeof m.id !== "number" && m.id !== null)) { fail(null, -32600, "invalid request"); return; }
-    if (m.id === undefined) return;
     const p = object(m.params) ? m.params : {};
+    if (m.id === undefined) {
+      if (m.method === "notifications/cancelled") requests.get(p.requestId)?.abort();
+      return;
+    }
     if (m.method === "initialize") {
       initialized = true;
       const versions = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -93,11 +118,15 @@ export async function serveMcp(input: NodeJS.ReadableStream, output: (line: stri
     else if (!initialized) fail(m.id, -32000, "initialize first");
     else if (m.method === "tools/list") reply(m.id, { tools: mcpTools });
     else if (m.method === "tools/call") {
+      if (requests.has(m.id)) { fail(m.id, -32600, "request id is already active"); return; }
+      const abort = new AbortController();
+      requests.set(m.id, abort);
       try {
         const args = validate(String(p.name), p.arguments ?? {});
-        const result = await call(String(p.name), args);
+        const result = await call(String(p.name), args, abort.signal);
         reply(m.id, { content: [{ type: "text", text: JSON.stringify(result ?? null) }] });
       } catch (e) { reply(m.id, { isError: true, content: [{ type: "text", text: (e as Error).message }] }); }
+      finally { requests.delete(m.id); }
     } else fail(m.id, -32601, "unknown method");
   }
   for await (const line of createInterface({ input, crlfDelay: Infinity })) {

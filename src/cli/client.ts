@@ -35,6 +35,7 @@ export async function callDaemon(
   path: string,
   body: unknown,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const info = await readRunFile(runFileFrom(env));
   if (!info) throw new DaemonDownError();
@@ -44,9 +45,10 @@ export async function callDaemon(
       method,
       headers: body === undefined ? {} : { "content-type": "application/json" },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
     });
   } catch {
+    if (signal?.aborted) throw signal.reason;
     throw new DaemonDownError();
   }
   const text = await response.text();

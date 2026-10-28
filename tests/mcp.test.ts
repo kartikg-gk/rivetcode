@@ -46,6 +46,19 @@ describe("MCP transport", () => {
     expect(r[2].error.message).toBe("initialize first");
     expect(r.slice(5).every((m) => m.result.isError)).toBe(true);
   });
+  it("cancels a waiting tool call by request id", async () => {
+    const input = new PassThrough(); const replies: any[] = [];
+    const served = serveMcp(input, (line) => replies.push(JSON.parse(line)), async (_name, _args, signal) => {
+      signal!.throwIfAborted();
+      await new Promise((_, reject) => signal!.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }));
+    });
+    input.write(JSON.stringify(frame(1, "initialize")) + "\n");
+    input.write(JSON.stringify(frame(2, "tools/call", { name: "rivet_wait", arguments: { run: "r1" } })) + "\n");
+    await new Promise((resolve) => setImmediate(resolve));
+    input.end(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2 } }) + "\n");
+    await served;
+    expect(replies.find((r) => r.id === 2).result).toMatchObject({ isError: true, content: [{ type: "text", text: "cancelled" }] });
+  });
   it("allows a short call to finish while a long call is pending", async () => {
     const input = new PassThrough(); const replies: any[] = [];
     let finish!: () => void;
