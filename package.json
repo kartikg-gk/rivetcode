@@ -1,7 +1,6 @@
 {
   "name": "rivet",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -10,7 +9,8 @@
     "prepare": "npm run build",
     "build": "tsc -p tsconfig.build.json && node -e \"require('node:fs').copyFileSync('src/agents/fake-agent.mjs','dist/agents/fake-agent.mjs')\"",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke:package": "node scripts/package-smoke.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
@@ -24,5 +24,15 @@
     "@agentclientprotocol/claude-agent-acp": "0.96.0",
     "node-pty": "^1.1.0",
     "yaml": "^2.8.1"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "description": "Local orchestration for coding agents with isolated worktrees, conversation tools and pull request feedback.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kartikg-gk/rivet-code1.git"
   }
 }
