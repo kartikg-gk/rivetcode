@@ -54,6 +54,47 @@ describe("durable conversation lineage", () => {
     expect(store.workspaceForks("r1")).toContain(child.runId);
     store.detachFork(child.runId); expect(store.workspaceForks("r1")).not.toContain(child.runId);
   });
+  it("expires only finished fork snapshots in the selected project and preserves lineage", async () => {
+    const s = await seed();
+    const active = forkConversation(s, "r1", {});
+    const expired = forkConversation(s, "r1", {});
+    const recent = forkConversation(s, "r1", {});
+    const boundary = forkConversation(s, "r1", {});
+    const staleRunning = forkConversation(s, "r1", {});
+    s.updateNode(expired.runId, "agent", { status: "done", finishedAt: "2000-01-01T00:00:00.000Z" });
+    s.updateNode(recent.runId, "agent", { status: "done", finishedAt: "2002-01-01T00:00:00.000Z" });
+    s.updateNode(boundary.runId, "agent", { status: "done", finishedAt: "2001-01-01T00:00:00.000Z" });
+    s.updateNode(staleRunning.runId, "agent", { status: "running", finishedAt: "2000-01-01T00:00:00.000Z" });
+    const other = sessionRun(data!, { id: "r2", project: "other", agent: "codex" }); other.node.sessionMode = "chat";
+    s.saveRun(other); exchange(s, "r2", "other-turn", "other project");
+    const otherFork = forkConversation(s, "r2", {});
+    s.updateNode(otherFork.runId, "agent", { status: "done", finishedAt: "2000-01-01T00:00:00.000Z" });
+    s.updateNode("r1", "agent", { status: "done", finishedAt: "2000-01-01T00:00:00.000Z" });
+    s.pruneTimeline("proj", "2001-01-01T00:00:00.000Z");
+    expect(s.readChat("r1", { limit: 100 }).items).toEqual([]);
+    expect(s.getFork(expired.runId)).toMatchObject({ sourceRun: "r1", rootRun: "r1", position: 2, providerId: "native-parent", items: [] });
+    for (const f of [active, recent, boundary, staleRunning, otherFork]) expect(s.getFork(f.runId)?.items).toHaveLength(2);
+    s.close(); store = openStore(data!);
+    expect(store.getFork(expired.runId)?.items).toEqual([]);
+    expect(store.workspaceForks("r1")).toContain(expired.runId);
+    expect(store.readChat(active.runId, { limit: 100 }).items).toHaveLength(2);
+  });
+  it("honors forever and applies a changed retention setting on the daemon's next sweep", async () => {
+    const s = await seed(); const child = forkConversation(s, "r1", {});
+    s.updateNode(child.runId, "agent", { status: "done", finishedAt: "2000-01-01T00:00:00.000Z" });
+    s.setConfig("proj", "timeline.keep", "forever"); s.close(); store = undefined;
+    daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0, pruneMs: 10 });
+    store = openStore(data!);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.getFork(child.runId)?.items).toHaveLength(2);
+    store.setConfig("proj", "timeline.keep", "0");
+    const end = Date.now() + 2000;
+    while (store.getFork(child.runId)?.items.length) {
+      if (Date.now() > end) throw new Error("snapshot retention sweep did not run");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(store.getFork(child.runId)).toMatchObject({ sourceRun: "r1", position: 2, items: [] });
+  });
   it("transfers only new exploration, deduplicates retries and refuses unrelated targets", async () => {
     const s = await seed(); const child = forkConversation(s, "r1", {});
     exchange(s, child.runId, "c1", "first finding");

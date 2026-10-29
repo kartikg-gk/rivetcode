@@ -924,6 +924,15 @@ export function openStore(data: string): Store {
     },
 
     pruneTimeline(project, before) {
+      // Copies of inherited history follow the finished fork's own retention window.
+      // Keep lineage/provider anchors so pruning never changes checkout ownership.
+      db.prepare(`UPDATE thread_forks SET data_json = json_set(data_json, '$.items', json('[]'))
+        WHERE json_array_length(data_json, '$.items') > 0 AND run_id IN (
+          SELECT r.id FROM runs r WHERE r.project = ?
+            AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+            AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id
+              AND (n.finished_at IS NULL OR n.finished_at >= ? OR n.status IN ('pending', 'running'))))`)
+        .run(project, before);
       db.prepare(`DELETE FROM chat_conversations WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
