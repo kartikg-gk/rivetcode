@@ -252,6 +252,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!repo) throw new Error(`origin is not a GitHub repository (${remote || "no origin"}); set github.repo`);
     return githubClient({ repo, token: await githubToken(process.env, remote) });
   });
+  const branchChanges = new Set<string>();
+  let wakeTimer: NodeJS.Timeout | undefined;
   const waitAbort = new AbortController();
   const scheduler = createScheduler({
     data, runFile, store, write, runtime, agents, launches, github,
@@ -348,6 +350,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       process.off("SIGTERM", onSignal);
       if (automationTimer) clearInterval(automationTimer);
       if (pruneTimer) clearInterval(pruneTimer);
+      if (wakeTimer) clearInterval(wakeTimer);
       waitAbort.abort();
       await cleanup.close();
       await scheduler.shutdown();
@@ -512,7 +515,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 204);
         return;
       }
-      const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events)));
+      const batchId = optionalString(payload.batchId, "batchId");
+      if (batchId && batchId.length > 128) throw new HttpError(400, "batchId is too long");
+      const accepted = payload.accepted === undefined ? [] : payload.accepted;
+      if (!Array.isArray(accepted) || accepted.length > 1000 || accepted.some((id) => !Number.isSafeInteger(id) || id < 1)) throw new HttpError(400, "invalid accepted message IDs");
+      const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events), batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
       const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
       if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
       const state = outcome.activity ?? null;
@@ -588,13 +595,14 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (send) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(send[1]);
+      if (branchChanges.has(runId)) throw new HttpError(409,"conversation branch is changing");
       const payload = await body(req);
       if (typeof payload.message !== "string") throw new HttpError(400, "message must be a string");
       const from = optionalString(payload.from, "from");
       const mode = (optionalString(payload.mode, "mode") ?? "steer") as SendMode;
       if (!SEND_MODES.includes(mode)) throw new HttpError(400, `mode must be one of ${SEND_MODES.join(", ")}`);
       if ((await write(() => store.getFork(runId)))?.detached) throw new HttpError(409, "fork was detached from its shared checkout");
-      const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from, mode));
+      const id = await write(() => {if (branchChanges.has(runId)) throw new HttpError(409,"conversation branch is changing");return store.queueMessage(runId, nodeId, payload.message as string, from, mode);});
       if (id === null) throw new HttpError(404, "unknown session");
       if (nodeId === NODE_ID) await scheduler.startForkMessage(runId);
       const target = sessionIdOf(runId, nodeId);
@@ -624,6 +632,64 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
       reply(res, 200, await write(() => { store.loadRun(transferStatus[1]!); return { transfers: store.listContextTransfers(transferStatus[1]!) }; }));
       return;
+    }
+    const reconcileRoute = /^\/api\/v1\/runs\/([^/]+)\/reconcile$/.exec(path);
+    if (reconcileRoute) {
+      if (req.method !== "POST") throw new HttpError(405,"method not allowed");
+      const run = await write(()=>store.loadRun(reconcileRoute[1]!));
+      if (run.node.sessionMode !== "chat" || run.node.agent !== "codex") throw new HttpError(409,"provider history refresh is supported for Codex chat only");
+      if (run.node.activity !== "idle") throw new HttpError(409,"wait for idle before reconciliation");
+      await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"reconcile"}));
+      reply(res,202,{requested:true,runId:run.id});return;
+    }
+    const branchRoute = /^\/api\/v1\/runs\/([^/]+)\/(branches|rollback|edit)$/.exec(path);
+    if (branchRoute) {
+      const id = branchRoute[1]!;
+      if (req.method === "GET" && branchRoute[2] === "branches") {
+        reply(res,200,{untrusted:true,branches:await write(()=>store.branches(id))}); return;
+      }
+      if (req.method !== "POST") throw new HttpError(405,"method not allowed");
+      const payload = await body(req);
+      if (branchChanges.has(id)) throw new HttpError(409,"conversation branch is changing");
+      branchChanges.add(id);
+      try {
+      const source = await write(()=>store.loadRun(id));
+      if ((await write(()=>store.getFork(id)))?.detached) throw new HttpError(409,"fork is detached");
+      if (source.node.sessionMode !== "chat") throw new HttpError(409,"conversation editing requires chat mode");
+      if (["active","blocked"].includes(source.node.activity ?? "")) throw new HttpError(409,"wait for the active turn or answer its permission request first");
+      if ((await write(()=>store.undeliveredMessages(id,NODE_ID))).length) throw new HttpError(409,"settle pending messages before changing conversation branches");
+      const history = await write(()=>store.readChat(id,{limit:5001}).items);
+      if (history.length > 5000) throw new HttpError(409,"conversation exceeds the branch snapshot limit");
+      let prefix = history;
+      let replacement: string | undefined;
+      const restore = branchRoute[2] === "branches" ? optionalString(payload.branch,"branch") : undefined;
+      if (branchRoute[2] === "rollback") {
+        const turns = payload.turns;
+        if (!Number.isSafeInteger(turns) || (turns as number) < 1) throw new HttpError(400,"turns must be a positive integer");
+        const prompts = history.filter(i=>i.kind === "prompt" || i.kind === "message");
+        const boundary = prompts.at(-(turns as number));
+        if (!boundary) throw new HttpError(400,"not enough turns to roll back");
+        prefix = history.filter(i=>i.position < boundary.position);
+      } else if (branchRoute[2] === "edit") {
+        const prompt = history.find(i=>i.position === payload.at && ["prompt","message"].includes(i.kind));
+        replacement = optionalString(payload.message,"message");
+        if (!prompt || !replacement) throw new HttpError(400,"edit needs a user-message position and replacement message");
+        prefix = history.filter(i=>i.position < prompt.position);
+      } else if (!restore) throw new HttpError(400,"branch is required");
+      if (restore) {
+        const target = await write(()=>store.branches(id).find(b=>b.id===restore));
+        if (!target) throw new HttpError(404,"unknown conversation branch");
+        if (target.active) {reply(res,200,{runId:id,branch:target.id,strategy:"unchanged"});return;}
+        if (target.agent !== source.node.agent) throw new HttpError(409,"switch to the branch's provider before restoring it");
+      }
+      if (source.spec?.denyTools?.length) throw new HttpError(409,"this task's denyTools cannot be enforced in chat mode");
+      await scheduler.stopSession(sessionIdOf(id,NODE_ID));
+      const branch = await write(()=>store.changeBranch(id,prefix,history,restore));
+      if (replacement) await write(()=>store.queueMessage(id,NODE_ID,replacement,undefined,"queue"));
+      const fresh = await write(()=>store.loadRun(id));
+      await scheduler.launch(fresh,undefined,fresh.node.providerConversationId ? {resume:true} : {});
+      reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "reconstructed",filesystem:"current checkout; historical files are not restored"}); return;
+      } finally {branchChanges.delete(id);}
     }
     const conversationRoute = /^\/api\/v1\/runs\/([^/]+)\/(fork|merge-back)$/.exec(path);
     if (conversationRoute) {
@@ -656,6 +722,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const timeoutMs = Number(q.get("timeoutMs") ?? 30000);
       if (!["turn", "task"].includes(scope) || !Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60000) throw new HttpError(400, "invalid wait scope or timeout (0-60000 ms)");
       if (!(await write(() => store.listRuns().includes(runId)))) throw new HttpError(404, "unknown run");
+      const wakeSession = q.get("wakeSession");
+      const wakeCaller = wakeSession ? session(wakeSession) : undefined;
+      if (wakeCaller && (await write(() => store.loadRun(wakeCaller.runId).project !== store.loadRun(runId).project))) throw new HttpError(400, "wake target must be in the same project");
+      if (wakeCaller?.runId === runId) throw new HttpError(400, "cannot wake a session waiting on itself");
       if (q.get("turn")) {
         try { await write(() => store.waitTurn(runId, q.get("turn")!)); } catch { throw new HttpError(404, "unknown turn"); }
       }
@@ -665,9 +735,14 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       try {
         const result = await waitForRun(async (turn) => write(() => {
           const run = store.loadRun(runId);
-          return { status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstSignalAt };
+          return { retrying: run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2), status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstSignalAt };
         }), { scope: scope as "turn" | "task", timeoutMs, ...(q.get("turn") ? { turn: q.get("turn")! } : {}) }, AbortSignal.any([abort.signal, waitAbort.signal]));
-        if (!abort.signal.aborted) reply(res, 200, result);
+        let next: string | undefined;
+        if (result.timedOut && wakeCaller) {
+          await write(() => store.subscribeWait(runId,wakeCaller.runId,wakeCaller.nodeId,scope,result.turnId ?? ""));
+          next = "Completion wakes this session, so end your turn. Do not poll.";
+        }
+        if (!abort.signal.aborted) reply(res, 200, { ...result, ...(next ? { next } : {}) });
       } catch (e) { if (waitAbort.signal.aborted && !abort.signal.aborted) reply(res, 503, { error: "daemon stopping" }); else if (!abort.signal.aborted) throw e; } finally { res.off("close", closed); }
       return;
     }
@@ -1000,6 +1075,35 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
+    let checkingWakes = false;
+    wakeTimer = setInterval(() => {
+      if (checkingWakes || stopping) return;
+      checkingWakes = true;
+      void (async () => {
+        const callers = await write(() => {
+          const ready = new Set<string>();
+          for (const subscription of store.waitSubscriptions()) {
+            const run = store.loadRun(subscription.target);
+            const retrying = run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2);
+            const taskDone = ["done","failed","escalated"].includes(run.node.status) && !retrying;
+            let turn: {id:string;state:string}|undefined;
+            try { turn = subscription.turn ? store.waitTurn(run.id,subscription.turn) : store.waitTurn(run.id); }
+            catch {
+              store.completeWait(subscription.id,`Wait ended for run ${run.id}: the selected turn moved to an archived conversation branch. Read branch history for details.`);
+              ready.add(subscription.caller);continue;
+            }
+            const turnDone = turn && !["running","queued"].includes(turn.state) && (!runtime.isAlive(sessionIdOf(run.id,NODE_ID)) || !!run.node.firstSignalAt);
+            if (taskDone || (subscription.scope === "turn" && turnDone)) {
+              store.completeWait(subscription.id,`Wait completed for run ${run.id}: ${subscription.scope === "task" ? run.node.status : turn?.state ?? run.node.status}. Read its history for details.`);
+              ready.add(subscription.caller);
+            }
+          }
+          return [...ready];
+        });
+        for (const caller of callers) await scheduler.deliver(caller);
+      })().catch((e) => opts.onError?.(e)).finally(() => { checkingWakes = false; });
+    },250);
+    wakeTimer.unref();
     automationTimer = setInterval(() => { void runDueAutomations().catch((e) => opts.onError?.(e)); }, opts.automationMs ?? 30_000);
     automationTimer.unref();
     pruneTimer = setInterval(() => { void pruneTimelines().catch((e) => opts.onError?.(e)); }, opts.pruneMs ?? 3_600_000);

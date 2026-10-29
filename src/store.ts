@@ -31,7 +31,11 @@ export type Run = {
   node: Node;
 };
 
+export type ConversationBranch = { id: string; parent: string | null; items: TimelineItem[]; snapshot: TimelineItem[]; provider: string; agent: string; active: boolean };
 export type Store = {
+  activeBranch(runId: string): ConversationBranch | undefined;
+  branches(runId: string): ConversationBranch[];
+  changeBranch(runId: string, prefix: TimelineItem[], history: TimelineItem[], restore?: string): string;
   saveRun(run: Run, fork?: ForkRecord): void;
   getFork(runId: string): ForkRecord | undefined;
   detachFork(runId: string): void;
@@ -42,6 +46,9 @@ export type Store = {
   listContextTransfers(runId: string): { id: string; sourceRun: string; targetRun: string; through: number; delivery: string }[];
   lastTransferPosition(source: string, target: string): number;
   transferContext(source: string, target: string, through: number, text: string): { id: string; duplicate: boolean };
+  subscribeWait(target: string, caller: string, session: string, scope: string, turn: string): string;
+  waitSubscriptions(): { id: string; target: string; caller: string; session: string; scope: string; turn: string }[];
+  completeWait(id: string, message: string): void;
   loadRun(runId: string): Run;
   listRuns(project?: string): string[];
   // state null keeps the current activity (a hook that only reports the agent's own session id).
@@ -94,7 +101,7 @@ export type Store = {
   readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
   // Folds a chat session's events into its conversation; returns what they mean for the
   // session: its new activity, and the question it waits on (null once answered).
-  recordChat(runId: string, session: string, events: ChatEvent[]): ChatOutcome;
+  recordChat(runId: string, session: string, events: ChatEvent[], receipt?: { id: string; accepted: number[] }): ChatOutcome;
   // A chat session's conversation as timeline entries, in the order they happened.
   readChat(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   chatUsage(runId: string, session?: string): ChatUsage | null;
@@ -356,6 +363,19 @@ ALTER TABLE runs ADD COLUMN issue INTEGER;
 
 // Chat sessions: how each session runs, and the conversation of a chat session (its
 // turns, readable messages and activities), kept by Rivet.
+MIGRATIONS.push({ version: 25, sql: `
+CREATE TABLE conversation_branches (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, parent TEXT, items TEXT NOT NULL, snapshot TEXT NOT NULL, provider TEXT NOT NULL, agent TEXT NOT NULL, active INTEGER NOT NULL);
+CREATE UNIQUE INDEX conversation_branch_active ON conversation_branches(run_id) WHERE active = 1;
+` });
+
+MIGRATIONS.push({ version: 24, sql: `
+CREATE TABLE wait_subscriptions (id TEXT PRIMARY KEY, target TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, caller TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session TEXT NOT NULL, scope TEXT NOT NULL, turn TEXT NOT NULL, UNIQUE(target,caller,session,scope,turn));
+` });
+
+MIGRATIONS.push({ version: 23, sql: `
+CREATE TABLE chat_receipts (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session TEXT NOT NULL, id TEXT NOT NULL, outcome TEXT NOT NULL, PRIMARY KEY(run_id, session, id));
+` });
+
 MIGRATIONS.push({ version: 22, sql: `
 ALTER TABLE chat_turns ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
 ` });
@@ -693,6 +713,10 @@ export function openStore(data: string): Store {
     }
   }
 
+  function branches(runId: string): ConversationBranch[] {
+    return (db.prepare("SELECT * FROM conversation_branches WHERE run_id=? ORDER BY rowid").all(runId) as {id:string;parent:string|null;items:string;snapshot:string;provider:string;agent:string;active:number}[]).map(r=>({...r,items:JSON.parse(r.items) as TimelineItem[],snapshot:JSON.parse(r.snapshot) as TimelineItem[],active:!!r.active}));
+  }
+  const prefixFor = (runId: string) => branches(runId).find(b=>b.active)?.items ?? forkRecord(runId)?.items ?? [];
   const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
   const selectActivity = db.prepare("SELECT activity FROM nodes WHERE run_id = ? AND id = ?");
   const selectStatus = db.prepare("SELECT status FROM nodes WHERE run_id = ? AND id = ?");
@@ -948,12 +972,60 @@ export function openStore(data: string): Store {
         .run(project, before).changes);
     },
 
+    activeBranch(runId) {return branches(runId).find(b=>b.active);},
+    branches,
+    changeBranch(runId, prefix, history, restore) {
+      const node = db.prepare("SELECT provider_conversation_id AS provider, agent FROM nodes WHERE run_id=? AND id='agent'").get(runId) as {provider:string;agent:string};
+      const target = restore ? branches(runId).find(b=>b.id===restore) : undefined;
+      if (restore && !target) throw new RunStoreError("unknown conversation branch");
+      if (target?.active) return target.id;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        let current = branches(runId).find(b=>b.active);
+        if (!current) {
+          const id = randomBytes(8).toString("hex");
+          db.prepare("INSERT INTO conversation_branches VALUES (?,?,NULL,?,?,?,?,1)").run(id,runId,JSON.stringify(forkRecord(runId)?.items ?? []),JSON.stringify(history),node.provider,node.agent);
+          current = branches(runId).find(b=>b.active)!;
+        }
+        db.prepare("UPDATE conversation_branches SET snapshot=?,provider=?,agent=?,active=0 WHERE id=?").run(JSON.stringify(history),node.provider,node.agent,current.id);
+        db.prepare("UPDATE chat_conversations SET session=? WHERE run_id=? AND session='agent'").run('branch-'+current.id,runId);
+        const id = target?.id ?? randomBytes(8).toString("hex");
+        if (target) {
+          if (target.agent !== node.agent) throw new RunStoreError("switch to the branch's provider before restoring it");
+          db.prepare("UPDATE conversation_branches SET active=1 WHERE id=?").run(id);
+          db.prepare("UPDATE chat_conversations SET session='agent' WHERE run_id=? AND session=?").run(runId,'branch-'+id);
+        } else db.prepare("INSERT INTO conversation_branches VALUES (?,?,?,?,?,?,?,1)").run(id,runId,current.id,JSON.stringify(prefix),JSON.stringify(prefix),'',node.agent);
+        db.prepare("UPDATE nodes SET provider_conversation_id=?,status='running',finished_at=NULL,activity='idle' WHERE run_id=? AND id='agent'").run(target?.provider ?? '',runId);
+        logEvent(runId,NODE_ID,"conversation.branch",{id,parent:current.id,strategy:target ? "restore" : "reconstructed"});
+        db.exec("COMMIT");return id;
+      } catch(e) {db.exec("ROLLBACK");throw e;}
+    },
+    subscribeWait(target, caller, session, scope, turn) {
+      db.prepare("INSERT OR IGNORE INTO wait_subscriptions VALUES (?,?,?,?,?,?)").run(randomBytes(8).toString("hex"),target,caller,session,scope,turn);
+      return (db.prepare("SELECT id FROM wait_subscriptions WHERE target=? AND caller=? AND session=? AND scope=? AND turn=?").get(target,caller,session,scope,turn) as {id:string}).id;
+    },
+    waitSubscriptions() { return db.prepare("SELECT * FROM wait_subscriptions").all() as {id:string;target:string;caller:string;session:string;scope:string;turn:string}[]; },
+    completeWait(id, message) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const row = db.prepare("SELECT * FROM wait_subscriptions WHERE id=?").get(id) as {caller:string;session:string} | undefined;
+        if (row) {
+          insertMessage.run(row.caller,row.session,"rivet",redact(message),new Date().toISOString(),"queue");
+          db.prepare("DELETE FROM wait_subscriptions WHERE id=?").run(id);
+          logEvent(row.caller,row.session,"wait.completed",{id});
+        }
+        db.exec("COMMIT");
+      } catch(e) {db.exec("ROLLBACK");throw e;}
+    },
     getFork(runId) { return forkRecord(runId); },
-    inherited(runId) { return forkRecord(runId)?.items ?? []; },
+    inherited(runId) { return prefixFor(runId); },
     detachFork(runId) {
       const fork = forkRecord(runId);
       if (!fork) return;
+      if (fork.detached) return;
       fork.detached = true;
+      db.prepare("UPDATE nodes SET status = CASE WHEN status IN ('pending', 'running') THEN 'escalated' ELSE status END, finished_at = coalesce(finished_at, ?), activity = 'exited' WHERE run_id = ?")
+        .run(new Date().toISOString(), runId);
       db.prepare("UPDATE thread_forks SET data_json = ? WHERE run_id = ?").run(JSON.stringify(fork), runId);
       logEvent(runId, NODE_ID, "conversation.detached");
     },
@@ -1002,6 +1074,7 @@ export function openStore(data: string): Store {
       const q = query.trim().toLowerCase();
       if (!q) return [];
       const limit = Math.min(50, Math.max(1, o.limit));
+      const metadataLimit = limit > 1 ? limit - Math.max(1, Math.floor(limit / 5)) : limit;
       const indexed = Array.from(q).length >= 3 && !q.includes('\0');
       const phrase = '"' + q.replace(/"/g, '""') + '"';
       const messageFilter = indexed ? "AND m.rowid IN (SELECT rowid FROM chat_search WHERE chat_search MATCH ? ORDER BY rowid DESC LIMIT 10000)" : "AND m.rowid >= (SELECT coalesce(max(rowid),0) - 20000 FROM chat_messages)";
@@ -1013,7 +1086,7 @@ export function openStore(data: string): Store {
         r.name || ' ' || r.task || ' branch: ' || n.branch || ' project: ' || r.project || coalesce(' PR: #' || p.number || ' ' || p.url, '') AS snippet FROM runs r JOIN nodes n ON n.run_id = r.id
         LEFT JOIN pull_requests p ON p.run_id = r.id
         WHERE instr(lower(r.name || ' ' || r.task || ' ' || n.branch || ' ' || r.project || ' ' || coalesce('#' || p.number || ' ' || p.url, '')), ?) > 0
-        ${project} ORDER BY r.created_at DESC LIMIT ?`).all(q, ...args, limit) as Hit[];
+        ${project} ORDER BY r.created_at DESC LIMIT ?`).all(q, ...args, metadataLimit) as Hit[];
       if (hits.length < limit) {
         const messages = db.prepare(`SELECT r.id AS runId, r.project, r.name AS title,
           m.role AS source, m.text AS snippet, m.sequence AS position, m.created_at AS at
@@ -1043,7 +1116,11 @@ export function openStore(data: string): Store {
         .map((r) => ({ position: Number(r.id), type: r.type, data: JSON.parse(r.data) as Record<string, unknown>, at: r.at, ...(r.node_id !== null ? { nodeId: r.node_id } : {}) }));
     },
 
-    recordChat(runId, session, events) {
+    recordChat(runId, session, events, receipt) {
+      if (receipt) {
+        const prior = db.prepare("SELECT outcome FROM chat_receipts WHERE run_id = ? AND session = ? AND id = ?").get(runId, session, receipt.id) as { outcome: string } | undefined;
+        if (prior) return JSON.parse(prior.outcome) as ChatOutcome;
+      }
       const run = selectRun.get(runId) as { project: string } | undefined;
       if (!run) throw new RunStoreError(`no run ${runId}`);
       const now = new Date().toISOString();
@@ -1057,7 +1134,7 @@ export function openStore(data: string): Store {
             .run(conv.id, run.project, runId, session, now, now);
         }
         const c = conv.id;
-        const inheritedMax = forkRecord(runId)?.position ?? 0;
+        const inheritedMax = prefixFor(runId).at(-1)?.position ?? 0;
         db.prepare("UPDATE chat_conversations SET latest_sequence = max(latest_sequence, ?) WHERE id = ?").run(inheritedMax, c);
         const nextSeq = () => Number((db.prepare("UPDATE chat_conversations SET latest_sequence = latest_sequence + 1, updated_at = ? WHERE id = ? RETURNING latest_sequence")
           .get(now, c) as { latest_sequence: number }).latest_sequence);
@@ -1092,7 +1169,15 @@ export function openStore(data: string): Store {
               out.activity = "idle";
             }
           } else if (e.type === "message") {
-            const text = redact(e.text);
+            let text = redact(e.text);
+            if (e.role === "user" && !e.itemId.startsWith("rivet-") && !db.prepare("SELECT 1 FROM chat_messages WHERE conversation_id=? AND provider_item_id=?").get(c,e.itemId)) {
+              const hostPrompts = db.prepare("SELECT id,text FROM chat_messages WHERE conversation_id=? AND role='user' AND provider_item_id LIKE 'rivet-%' ORDER BY sequence").all(c) as {id:string;text:string}[];
+              const host = hostPrompts.find(p=>text === p.text || text.endsWith("\n\n"+p.text));
+              if (host) {
+                db.prepare("UPDATE chat_messages SET provider_item_id=?,turn_id=? WHERE id=?").run(e.itemId,turnRow(e.turnId),host.id);
+                text = host.text;
+              }
+            }
             const found = db.prepare("SELECT id FROM chat_messages WHERE conversation_id = ? AND provider_item_id = ?").get(c, e.itemId) as { id: string } | undefined;
             const streaming = e.streaming ? 1 : 0;
             if (found) db.prepare("UPDATE chat_messages SET text = ?, streaming = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, streaming, now, found.id);
@@ -1124,6 +1209,10 @@ export function openStore(data: string): Store {
               out.activity = "active";
             }
           }
+        }
+        if (receipt) {
+          for (const id of receipt.accepted) db.prepare("UPDATE outbox SET delivered_at = coalesce(delivered_at, ?) WHERE id = ? AND run_id = ? AND node_id = ?").run(now, id, runId, session);
+          db.prepare("INSERT INTO chat_receipts(run_id,session,id,outcome) VALUES (?,?,?,?)").run(runId, session, receipt.id, JSON.stringify(out));
         }
         db.exec("COMMIT");
       } catch (e) {
@@ -1175,7 +1264,7 @@ export function openStore(data: string): Store {
 
     readChat(runId, o) {
       const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
-      const inherited = o.session && o.session !== NODE_ID ? [] : forkRecord(runId)?.items ?? [];
+      const inherited = o.session && o.session !== NODE_ID ? [] : prefixFor(runId);
       if (!conv) {
         const shown = inherited.filter((i) => !o.kinds || o.kinds.includes(i.kind));
         return { total: shown.length, items: shown.filter((i) => i.position > (o.after ?? 0)).slice(0, o.limit) };

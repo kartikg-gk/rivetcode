@@ -43,6 +43,10 @@ const USAGE = `usage: rivet <command>
                                         bounded wait for completion (default latest turn, 30000 ms)
   fork <run> [--at <position>] [--name <label>]
                                         fork history at a stable reply; share checkout; start with send
+  branches <run> [--select <branch>]  inspect or select preserved conversation branches
+  rollback <run> --turns <n>          branch before the last n user prompts; keep current files
+  edit <run> --at <position> --message <text>  replace a user prompt on a new branch
+  reconcile <run>                    request a provider history refresh (Codex chat)
   transfers <run>                      inspect pending, queued and delivered context transfers
   merge-back <fork> [--target <ancestor>] [--at <position>]
                                         queue the fork's exploration context into its ancestor
@@ -894,6 +898,21 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const { runHost } = await import("../chat/host.js");
         return await runHost(JSON.parse(Buffer.from(args[0] ?? "", "base64url").toString("utf8")), io.env);
       }
+      case "reconcile": {
+        if (args.length !== 1) throw new UsageError("reconcile needs one run ID");
+        io.out(JSON.stringify(await callDaemon(io.env,"POST",`/api/v1/runs/${encodeURIComponent(args[0]!)}/reconcile`,{},COMMAND_TIMEOUT_MS)));return 0;
+      }
+      case "branches":
+      case "rollback":
+      case "edit": {
+        const { flags, rest } = parseFlags(args,["turns","at","message","select"]);
+        if (rest.length !== 1) throw new UsageError("conversation operation needs one run ID");
+        const route = `/api/v1/runs/${encodeURIComponent(rest[0]!)}/${command}`;
+        const selecting = flags.get("select");
+        const method = command === "branches" && !selecting ? "GET" : "POST";
+        const payload = command === "rollback" ? {turns:Number(flags.get("turns"))} : command === "edit" ? {at:Number(flags.get("at")),message:flags.get("message")} : {branch:selecting};
+        io.out(JSON.stringify(await callDaemon(io.env,method,route,method === "GET" ? undefined : payload,COMMAND_TIMEOUT_MS))); return 0;
+      }
       case "transfers": {
         if (args.length !== 1) throw new UsageError("transfers needs one run id");
         io.out(JSON.stringify(await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(args[0]!)}/transfers`, undefined, COMMAND_TIMEOUT_MS))); return 0;
@@ -913,6 +932,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (rest.length !== 1) throw new UsageError("wait needs one run id");
         const q = new URLSearchParams({ scope: String(flags.get("scope") ?? "turn"), timeoutMs: String(flags.get("timeout") ?? 30000) });
         if (typeof flags.get("turn") === "string") q.set("turn", flags.get("turn") as string);
+        if (io.env.RIVET_SESSION_ID) q.set("wakeSession",io.env.RIVET_SESSION_ID);
         const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/wait?${q}`, undefined, 70000);
         io.out(JSON.stringify(result)); return 0;
       }

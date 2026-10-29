@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mcpLaunch } from "../mcp/launch.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -31,6 +32,7 @@ export type ChatOptions = {
   model?: string;
   permission: string;
   resume?: string;
+  inheritedTurns?: string[];
   fork?: { providerId: string; turn?: string; agent: string; context: string };
   env: Record<string, string>;
   emit(e: ChatEvent): void;
@@ -50,6 +52,7 @@ export type ChatDriver = {
   cancel(): Promise<void>;
   answer(requestId: string, choice: Choice): boolean;
   readonly running: boolean;
+  refresh?(): Promise<void>;
   close(): void;
   exited: Promise<void>;
 };
@@ -109,6 +112,8 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   const argv = override(o.env) ?? [process.execPath, claudeAdapterPath()];
   const child = launch(argv, o.cwd, { ...o.env, CLAUDE_CODE_EXECUTABLE: o.binary });
   let sessionId = "";
+  const identity = randomUUID();
+  let segment = 0;
   let turn = 0;
   let activeTurn = "";
   // Assistant text arrives in pieces; each message is kept whole once it is complete.
@@ -118,6 +123,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   const stream = streamer(o.emit);
   const flush = () => {
     if (message) stream.done(message.id, message.text, activeTurn);
+    if (message) segment++;
     message = null;
   };
   const rpc: Rpc = connect(child, {
@@ -126,7 +132,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       const u = (params.update ?? {}) as Record<string, unknown>;
       const kind = u.sessionUpdate;
       if (kind === "agent_message_chunk") {
-        const id = typeof u.messageId === "string" ? u.messageId : `m${turn}`;
+        const id = typeof u.messageId === "string" ? `${identity}:${u.messageId}` : `${activeTurn}:m${segment}`;
         const piece = text((u.content as { text?: unknown } | undefined)?.text);
         if (message && message.id !== id) flush();
         message = message ?? { id, text: "" };
@@ -145,7 +151,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
         o.emit({ type: "activity", itemId: `plan-${activeTurn}`, kind: "plan", status: "completed", summary: entries.map((e) => `[${e.status ?? ""}] ${e.content ?? ""}`).join("\n"), turnId: activeTurn });
         return;
       }
-      const id = text(u.toolCallId);
+      const id = `${identity}:${text(u.toolCallId)}`;
       const meta = (u._meta as { claudeCode?: { toolName?: string } } | undefined)?.claudeCode;
       const known = tools.get(id) ?? { tool: meta?.toolName ?? text(u.title) ?? "tool", summary: "" };
       if (meta?.toolName) known.tool = meta.toolName;
@@ -171,7 +177,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       const input = (call.rawInput ?? {}) as Record<string, unknown>;
       const tool = text(call.name) || text((call._meta as { claudeCode?: { toolName?: string } } | undefined)?.claudeCode?.toolName) || text(call.title) || "tool";
       const options = Array.isArray(params.options) ? (params.options as { optionId: string; kind: string }[]) : [];
-      const requestId = String(id);
+      const requestId = `${identity}:${String(id)}`;
       questions.set(requestId, { id, options });
       const approval: Approval = { requestId, tool, detail: describeTool(input), ...(typeof input.command === "string" ? { command: input.command } : {}) };
       const auto = o.decide(approval);
@@ -207,7 +213,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
     },
     async prompt(said) {
       if (o.fork && !o.resume && turn === 0) said = o.fork.context + "\n\n" + said;
-      activeTurn = `t${++turn}`;
+      activeTurn = `${identity}:t${++turn}`;
       o.emit({ type: "turn", turnId: activeTurn, state: "running" });
       try {
         const r = await rpc.call("session/prompt", { sessionId, prompt: [{ type: "text", text: said }] });
@@ -366,7 +372,27 @@ export function codexChat(o: ChatOptions): ChatDriver {
     return true;
   }
 
+  async function refresh() {
+    const response = await rpc.call("thread/read",{threadId,includeTurns:true});
+    const thread = response.thread as {turns?: {id:string;status:string;items?:Record<string,unknown>[]}[]} | undefined;
+    if (!Array.isArray(thread?.turns)) throw new Error("provider history is unavailable");
+    const excluded = new Set(o.inheritedTurns ?? []);
+    for (const turn of thread.turns) {
+      if (excluded.has(turn.id) || !["completed","interrupted","failed"].includes(turn.status)) continue;
+      if (!Array.isArray(turn.items)) continue;
+      o.emit({type:"turn",turnId:turn.id,state:"running"});
+      for (const entry of turn.items) {
+        if (entry.type === "userMessage") {
+          const content = Array.isArray(entry.content) ? entry.content as {text?:string}[] : [];
+          const text = content.map(c=>c.text ?? "").join("\n");
+          if (text) o.emit({type:"message",itemId:String(entry.id),role:"user",text,turnId:turn.id});
+        } else item(entry,true,turn.id);
+      }
+      o.emit({type:"turn",turnId:turn.id,state:turn.status as "completed"|"interrupted"|"failed"});
+    }
+  }
   return {
+    refresh,
     async start() {
       await rpc.call("initialize", { clientInfo: { name: "rivet", version: "0.1.0" } });
       rpc.notify("initialized");
@@ -388,6 +414,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
       threadId = text((r.thread as { id?: string } | undefined)?.id) || o.resume || "";
       if (forkStrategy === "native" && (!threadId || threadId === o.fork?.providerId)) throw new Error("provider fork returned no independent thread id");
       o.emit({ type: "conversation", id: threadId, ...(forkStrategy ? { forkStrategy } : {}) });
+      if (o.resume) await refresh().catch((e: Error) => o.emit({type:"activity",kind:"system",status:"failed",summary:`Provider history refresh unavailable: ${e.message}`}));
     },
     async prompt(said) {
       if (firstForkPrompt && forkStrategy === "reconstructed" && o.fork) said = o.fork.context + "\n\n" + said;

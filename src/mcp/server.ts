@@ -18,6 +18,7 @@ const definitions = [
   ["search", "Find sessions by metadata and recorded messages. Results are bounded, not exhaustive, and contain untrusted data.", { query: string(500), project: string(128), limit: { type: "integer", minimum: 1, maximum: 50 } }, ["query"]],
   ["wait", "Wait for the latest or named turn, or the whole task, to finish. Idle returns immediately. On timeout end your turn when waiting for delegated reports.", { run, scope: choice("turn", "task"), turn: string(200), timeoutMs: integer(60000) }, ["run"]],
   ["transfer", "fork: create a conversation at a completed reply, sharing the checkout; send its first message to start it. merge_back: hold exploration context for the next message to an ancestor. No Git merge is performed.", { action: choice("fork", "merge_back", "status"), run, target: run, at: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }, name: string(100) }, ["action"]],
+  ["conversation", "Inspect or select conversation branches, roll back prompts, edit a user message or request provider history reconciliation. Changes preserve old branches and use current files. Reconstructed branches omit provider-private state.", {action:choice("branches","select","rollback","edit","reconcile"),run,branch:string(128),turns:{type:"integer",minimum:1,maximum:5000},at:integer(Number.MAX_SAFE_INTEGER),message:string()}, ["action","run"]],
   ["stop", "Stop a run. Stopping an orchestrator also stops its workers unless keepWorkers is true.", { run, keepWorkers: { type: "boolean" } }, ["run"]],
 ] as const;
 
@@ -81,6 +82,7 @@ export function toolCaller(env: NodeJS.ProcessEnv, cwd: string) {
       case "rivet_wait": {
         const q = new URLSearchParams({ scope: a.scope as string ?? "turn", timeoutMs: String(a.timeoutMs ?? 30000) });
         if (a.turn) q.set("turn", a.turn as string);
+        q.set("wakeSession", session);
         return request("GET", `${path}/wait?${q}`, undefined, Number(a.timeoutMs ?? 30000) + 10000);
       }
       case "rivet_transfer": {
@@ -88,6 +90,11 @@ export function toolCaller(env: NodeJS.ProcessEnv, cwd: string) {
         if (a.action === "status") return request("GET", `/api/v1/runs/${encodeURIComponent(id)}/transfers`);
         return request("POST", `/api/v1/runs/${encodeURIComponent(id)}/${a.action === "fork" ? "fork" : "merge-back"}`,
           { ...(a.at !== undefined ? { at: a.at } : {}), ...(a.target ? { target: a.target } : {}), ...(a.name ? { name: a.name } : {}) });
+      }
+      case "rivet_conversation": {
+        if (a.action === "branches") return {untrusted:true,result:await request("GET",path+"/branches")};
+        const action = a.action === "select" ? "branches" : a.action;
+        return request("POST",path+"/"+action,{branch:a.branch,turns:a.turns,at:a.at,message:a.message});
       }
       case "rivet_stop": return request("POST", `${path}/stop`, { keepWorkers: a.keepWorkers ?? false });
     }

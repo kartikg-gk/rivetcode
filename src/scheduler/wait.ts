@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 
 export type WaitSnapshot = {
-  status: string; activity?: string; live: boolean; pending?: boolean;
+  status: string; activity?: string; live: boolean; pending?: boolean; retrying?: boolean;
   turn?: { id: string; state: string };
   pendingRequest?: { tool: string; detail: string } | null;
 };
@@ -13,7 +13,7 @@ export async function waitForRun(read: (turn?: string) => Promise<WaitSnapshot>,
   for (;;) {
     signal.throwIfAborted();
     if (!turn && !snapshot.pending) turn = snapshot.turn?.id;
-    const taskEnded = ["done", "failed", "escalated"].includes(snapshot.status);
+    const taskEnded = ["done", "failed", "escalated"].includes(snapshot.status) && !snapshot.retrying;
     const turnEnded = turn
       ? snapshot.turn?.id === turn && !["queued", "running"].includes(snapshot.turn.state)
       : !snapshot.live || !["active", "blocked", "waiting_input"].includes(snapshot.activity ?? "idle");

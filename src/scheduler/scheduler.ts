@@ -164,6 +164,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (d.runtime.isAlive(sessionId)) throw new SchedulerError(409, "session is already running");
     if (!existsSync(node.worktree)) throw new SchedulerError(409, `worktree is missing: ${node.worktree}`);
     const fork = await d.write(() => d.store.getFork(run.id));
+    const branch = await d.write(() => d.store.activeBranch(run.id));
     if (fork?.detached) throw new SchedulerError(409, "fork was detached from its shared checkout");
     const agent = d.agents(node.agent);
     const launchId = newLaunchId();
@@ -184,7 +185,8 @@ export function createScheduler(d: SchedulerDeps) {
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
-    const chat = (config["session.mode"] === "chat" || !!fork) && (node.agent === "claude" || node.agent === "codex");
+    const chat = (config["session.mode"] === "chat" || !!fork || !!branch) && (node.agent === "claude" || node.agent === "codex");
+    if (chat && run.spec?.denyTools?.length) throw new SchedulerError(409, "task denyTools cannot be enforced by this chat provider; use terminal mode or remove the unsupported restriction explicitly");
     const headless = chat || (worker ? config["worker.mode"] !== "interactive" : node.agent === "fake");
     const cfg = {
       sessionId, workspace: node.worktree, headless,
@@ -197,8 +199,8 @@ export function createScheduler(d: SchedulerDeps) {
     if (chat && o.resume && !node.providerConversationId) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
     const argv = chat
       ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-host", encodeConfig({
-        agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
-        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
+        inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
+        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.providerConversationId ? { fork: { providerId: "", agent: node.agent, context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
       })]
       : o.resume
         ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })
@@ -269,9 +271,9 @@ export function createScheduler(d: SchedulerDeps) {
     // progress, waits for the next one, or stops the turn first.
     if (chats.has(sessionId)) {
       for (const m of queued) {
-        const control: Control = { type: "send", mode: m.mode, text: m.message };
+        const control: Control = { type: "send", mode: m.mode, text: m.message, messageId: m.id };
         try { await d.runtime.write(sessionId, JSON.stringify(control)); } catch { return; }
-        await d.write(() => d.store.markDelivered(m.id));
+        // Chat delivery is acknowledged by a completed provider turn, not a pipe write.
       }
       return;
     }
@@ -409,6 +411,17 @@ export function createScheduler(d: SchedulerDeps) {
     const run = await load(runId);
     if (run.node.status !== "running" || run.node.finishedAt) return;
     if (run.sharedWorkspace) {
+      if (run.spec?.paths?.length) {
+        const tracked = await filesChanged(run);
+        const modified = await git(["diff","--name-only","HEAD"],run.node.worktree);
+        const untracked = await git(["ls-files","--others","--exclude-standard"],run.node.worktree);
+        const outside = outsidePaths([...tracked,...modified.split(/\r?\n/),...untracked.split(/\r?\n/)].filter(Boolean),run.spec.paths);
+        if (outside.length) {await workFailed(runId,`shared checkout has changes outside allowed paths: ${outside.join(", ")}`);return;}
+      }
+      if (run.spec?.doneWhen) {
+        const result = await verify(run);
+        if (!result.ok) {await workFailed(runId,result.why);return;}
+      }
       await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString() }));
       await transition(runId, "done", "fork exploration completed in shared checkout; use merge-back to transfer context");
       return;

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { forkConversation, mergeConversation } from "../src/scheduler/conversations.js";
+import { contextText, forkConversation, mergeConversation } from "../src/scheduler/conversations.js";
 import { waitForRun, type WaitSnapshot } from "../src/scheduler/wait.js";
 import { openStore, type Store } from "../src/store.js";
 import { cleanupResult, makeDataDir, makeRepo, removeRepo, sessionRun } from "./helpers.js";
@@ -210,6 +210,13 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
   expect(await runCli(["merge-back", child], io)).toBe(0);
   expect(await tools("rivet_transfer", { action: "status", run: child })).toMatchObject({ transfers: [expect.objectContaining({ delivery: "pending" })] });
   expect((await api("POST", `/runs/${child}/merge-back`, {})).value.duplicate).toBe(true);
+  const rolled = await api("POST",`/runs/${child}/rollback`,{turns:1});
+  expect(rolled.status).toBe(202);
+  expect(rolled.value.strategy).toBe("reconstructed");
+  const branches = (await api("GET",`/runs/${child}/branches`)).value.branches;
+  expect(branches).toHaveLength(2);
+  expect(branches.some((b:any)=>!b.active && b.snapshot.some((i:any)=>i.text.includes("new finding")))).toBe(true);
+  expect((await api("POST",`/runs/${child}/branches`,{branch:branches.find((b:any)=>!b.active).id})).status).toBe(202);
   expect((await api("POST", `/runs/${child}/clean`, {})).value.detached).toBe(true);
   expect((await api("POST", `/sessions/${child}-agent/send`, { message: "again" })).status).toBe(409);
   const waiting = api("GET", "/runs/r1/wait?scope=task&timeoutMs=60000");
@@ -217,3 +224,116 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
   await daemon.stop();
   expect((await waiting).status).toBe(503);
 }, 30000);
+
+describe("conversation recovery and branch lifecycle", () => {
+  it("preserves restrictions and settles detached forks for retention", async () => {
+    const s = await seed(); const source=s.loadRun("r1");
+    source.spec={minutes:5,tokens:1000,paths:["src/**"],denyTools:["Bash(npm publish:*)"]};s.saveRun(source);
+    const child=forkConversation(s,"r1",{});
+    expect(s.loadRun(child.runId).spec).toEqual(source.spec);
+    s.detachFork(child.runId);
+    expect(s.loadRun(child.runId).node).toMatchObject({status:"escalated",activity:"exited"});
+    expect(s.loadRun(child.runId).node.finishedAt).toBeTruthy();
+    s.pruneTimeline("proj","2099-01-01T00:00:00.000Z");
+    expect(s.inherited(child.runId)).toEqual([]);
+  });
+  it("retries a batch without counting additive usage twice and scopes delivery receipts",async()=>{
+    const s=await seed();s.queueMessage("r1","agent","continue");
+    const id=s.undeliveredMessages("r1","agent")[0].id;
+    const events:ChatEvent[]=[{type:"usage",mode:"add",total:150,input:100}];
+    s.recordChat("r1","agent",events,{id:"batch-one",accepted:[id]});
+    s.recordChat("r1","agent",events,{id:"batch-one",accepted:[id]});
+    expect(s.chatUsage("r1")?.total).toBe(150);
+    expect(s.undeliveredMessages("r1","agent")).toEqual([]);
+    s.close();store=openStore(data!);
+    store.recordChat("r1","agent",events,{id:"batch-one",accepted:[id]});
+    expect(store.chatUsage("r1")?.total).toBe(150);
+  });
+  it("archives old branches and restores their conversation without losing replies",async()=>{
+    const s=await seed();const original=s.readChat("r1",{limit:100}).items;
+    const branch=s.changeBranch("r1",[],original);
+    expect(s.readChat("r1",{limit:100}).items).toEqual([]);
+    exchange(s,"r1","new-branch-turn","replacement reply");
+    const root=s.branches("r1").find(b=>b.id!==branch)!;
+    s.changeBranch("r1",[],s.readChat("r1",{limit:100}).items,root.id);
+    expect(s.readChat("r1",{limit:100}).items.map(i=>i.text)).toEqual(original.map(i=>i.text));
+    expect(s.branches("r1").find(b=>b.id===branch)?.snapshot.some(i=>i.text==="replacement reply")).toBe(true);
+    s.close();store=openStore(data!);
+    expect(store.activeBranch("r1")?.id).toBe(root.id);
+  });
+  it("persists wait subscriptions and creates exactly one durable notification",async()=>{
+    const s=await seed();s.saveRun(sessionRun(data!,{id:"r2"}));
+    const id=s.subscribeWait("r1","r2","agent","task","");
+    expect(s.subscribeWait("r1","r2","agent","task","")).toBe(id);
+    s.close();store=openStore(data!);expect(store.waitSubscriptions()).toHaveLength(1);
+    store.completeWait(id,"finished");store.completeWait(id,"finished");
+    expect(store.undeliveredMessages("r2","agent")).toHaveLength(1);
+    expect(store.waitSubscriptions()).toEqual([]);
+  });
+  it("does not finish a task wait while an automatic retry is pending",async()=>{
+    let calls=0;
+    const result=await waitForRun(async()=>({status:++calls===1?"failed":"done",retrying:calls===1,live:false}),{scope:"task",timeoutMs:1000},new AbortController().signal);
+    expect(result.status).toBe("done");expect(calls).toBe(2);
+  });
+  it("keeps message results when metadata fills most of the search cap",async()=>{
+    const s=await seed();
+    for(const id of ["r2","r3"])s.saveRun(sessionRun(data!,{id,task:"original marker"}));
+    expect(s.searchRuns("original marker",{limit:2}).some(h=>h.source!=="metadata")).toBe(true);
+  });
+  it("allocates fresh Claude turn and reply identities after a resume",async()=>{
+    const s=await seed();
+    for(const text of ["first resumed reply","second resumed reply"]){
+      const driver=claudeChat({binary:"unused",cwd:process.cwd(),permission:"default",resume:"same-provider",env:{RIVET_CHAT_COMMAND:JSON.stringify([process.execPath,fileURLToPath(new URL("./fake-chat-agent.mjs",import.meta.url)),"acp"])},emit:e=>s.recordChat("r1","agent",[e]),decide:()=>undefined});
+      try {await driver.start();await driver.prompt(text);} finally {driver.close();await driver.exited;}
+    }
+    const replies=s.readChat("r1",{limit:100}).items.filter(i=>i.kind==="assistant").map(i=>i.text);
+    expect(replies).toContain("echo: first resumed reply");expect(replies).toContain("echo: second resumed reply");
+  });
+});
+
+it("queues a wake after timeout while the caller is offline",async()=>{
+  const s=await seed();s.saveRun(sessionRun(data!,{id:"r2"}));
+  s.updateNode("r1","agent",{status:"running"});
+  daemon=await startDaemon({data:data!,runFile:join(data!,"running.json"),port:0});
+  const response=await fetch(`http://127.0.0.1:${daemon.port}/api/v1/runs/r1/wait?scope=task&timeoutMs=0&wakeSession=r2-agent`);
+  expect(response.status).toBe(200);expect(await response.json()).toMatchObject({timedOut:true,next:expect.any(String)});
+  s.updateNode("r1","agent",{status:"done"});
+  const end=Date.now()+3000;
+  while(!s.undeliveredMessages("r2","agent").length){if(Date.now()>end)throw Error("missing wake");await new Promise(r=>setTimeout(r,25));}
+  expect(s.undeliveredMessages("r2","agent")).toHaveLength(1);
+  expect(s.waitSubscriptions()).toEqual([]);
+});
+it("budgets long context and states which source positions were excerpted",()=>{
+  const result=contextText([{position:1,session:"agent",at:new Date().toISOString(),kind:"assistant",text:"x".repeat(80000)}],"Source run r1");
+  expect(result.length).toBeLessThan(60000);expect(result).toContain("excerpt");expect(result).toContain("position 1");expect(result).toContain("Coverage: 1");
+});
+
+it("reconciles native history on resume without duplicating user prompts or final replies",async()=>{
+  const s=await seed();
+  s.recordChat("r1","agent",[{type:"message",role:"user",itemId:"rivet-test-user",text:"recover me"}]);
+  for(let attempt=0;attempt<2;attempt++){
+    const driver=codexChat({binary:"unused",cwd:process.cwd(),permission:"default",resume:"native-parent",env:{RIVET_CHAT_COMMAND:JSON.stringify([process.execPath,fileURLToPath(new URL("./fake-chat-agent.mjs",import.meta.url)),"codex"]),RIVET_TEST_HISTORY:"1"},emit:e=>s.recordChat("r1","agent",[e]),decide:()=>undefined});
+    try {await driver.start();}finally{driver.close();await driver.exited;}
+  }
+  const items=s.readChat("r1",{limit:100}).items;
+  expect(items.filter(i=>i.text==="recover me")).toHaveLength(1);
+  expect(items.filter(i=>i.text==="recovered answer")).toHaveLength(1);
+  expect(s.waitTurn("r1","recovered-turn")?.state).toBe("completed");
+});
+
+it("keeps repeated live user prompts as separate messages",async()=>{
+  const s=await seed();
+  s.recordChat("r1","agent",[{type:"message",role:"user",itemId:"rivet-first",text:"same prompt"}]);
+  s.recordChat("r1","agent",[{type:"message",role:"user",itemId:"rivet-second",text:"same prompt"}]);
+  expect(s.readChat("r1",{limit:100}).items.filter(i=>i.text==="same prompt")).toHaveLength(2);
+});
+
+it("does not remap a replayed native prompt onto a later identical user prompt",async()=>{
+  const s=await seed();
+  const message=(itemId:string):ChatEvent=>({type:"message",itemId,role:"user",text:"repeat"});
+  s.recordChat("r1","agent",[message("rivet-first")]);
+  s.recordChat("r1","agent",[message("native-first")]);
+  s.recordChat("r1","agent",[message("rivet-second")]);
+  expect(()=>s.recordChat("r1","agent",[message("native-first")])).not.toThrow();
+  expect(s.readChat("r1",{limit:100}).items.filter(i=>i.text==="repeat")).toHaveLength(2);
+});

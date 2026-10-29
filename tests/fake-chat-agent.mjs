@@ -76,6 +76,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));
     case "_session/steering": if (active) { active.steered.push(p.prompt[0].text); return reply({ outcome: "injected" }); } return reply({ outcome: "promptRequired" });
     case "session/cancel": if (active) active.cancelled = true; return;
+    case "thread/read": return reply({thread:{id:threadId,turns:process.env.RIVET_TEST_HISTORY === "1" ? [{id:"recovered-turn",status:"completed",items:[{type:"userMessage",id:"recovered-user",content:[{type:"text",text:"recover me"}]},{type:"agentMessage",id:"recovered-answer",text:"recovered answer"}]}] : []}});
     case "thread/start": return reply({ thread: { id: "th1" } });
     case "thread/fork":
       if (process.env.RIVET_TEST_NO_FORK) return out({ id: m.id, error: { code: -32601, message: "unsupported fork" } });
