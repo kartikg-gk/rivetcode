@@ -31,3 +31,9 @@ it("uses ACP compaction only after the provider advertises it",async()=>{
  const driver=claudeChat({binary:"unused",cwd:process.cwd(),permission:"default",env:{...env("acp"),RIVET_TEST_COMPACT:"1"},emit(e){if(e.type==="message"&&!e.streaming)replies.push(e.text);},decide:()=>undefined});
  try{await driver.start();await driver.prompt("warmup");await driver.compact!();expect(replies).toContain("echo: /compact");}finally{driver.close();await driver.exited;}
 });
+
+it("loads advertised ACP history on resume and deduplicates repeated refreshes",async()=>{
+ const events:import("../src/chat/drivers.js").ChatEvent[]=[];
+ const driver=claudeChat({binary:"unused",cwd:process.cwd(),permission:"default",resume:"existing-session",env:{...env("acp"),RIVET_TEST_LOAD:"1"},emit:e=>events.push(e),decide:()=>undefined});
+ try{await driver.start();await driver.refresh!();expect(events.filter(e=>e.type==="history")).toHaveLength(2);expect(events.find(e=>e.type==="history")).toMatchObject({providerId:"existing-session",items:[{role:"user",text:"recover me"},{role:"assistant",text:"recovered answer"}]});}finally{driver.close();await driver.exited;}
+});

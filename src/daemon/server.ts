@@ -44,6 +44,11 @@ function checkChatEvents(raw: unknown): ChatEvent[] {
       out.push({ type: "turn", turnId: e.turnId as string, state: e.state as "running", ...(str(e.error) ? { error: cut(e.error as string) } : {}) });
     } else if (e.type === "message" && str(e.itemId) && str(e.text) && (e.role === "user" || e.role === "assistant")) {
       out.push({ type: "message", itemId: e.itemId as string, role: e.role, text: cut(e.text as string), ...(str(e.turnId) ? { turnId: e.turnId as string } : {}), ...(e.streaming === true ? { streaming: true } : {}) });
+    } else if(e.type==="history"){
+      if(!str(e.providerId)||!Array.isArray(e.items)||e.items.length>5000)throw new HttpError(400,"invalid provider history");
+      const items=e.items as {role:unknown;text:unknown}[];
+      if(items.some(item=>!item||!["user","assistant"].includes(String(item.role))||!str(item.text))||items.reduce((size,item)=>size+String(item.text).length,0)>200000)throw new HttpError(400,"provider history exceeds import bounds");
+      out.push({type:"history",providerId:e.providerId as string,items:items as {role:"user"|"assistant";text:string}[]});
     } else if (e.type === "usage" && (e.mode === "add" || e.mode === "set")) {
       const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? { ok: true as const, v } : null);
       const fields = ["input", "output", "cached", "total", "contextUsed", "contextWindow"] as const;
@@ -681,7 +686,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (reconcileRoute) {
       if (req.method !== "POST") throw new HttpError(405,"method not allowed");
       const run = await write(()=>store.loadRun(reconcileRoute[1]!));
-      if (run.node.sessionMode !== "chat" || run.node.agent !== "codex") throw new HttpError(409,"provider history refresh is supported for Codex chat only");
+      if (run.node.sessionMode !== "chat" || !["claude","codex"].includes(run.node.agent)) throw new HttpError(409,"provider history refresh requires a supported chat provider");
       if (run.node.activity !== "idle") throw new HttpError(409,"wait for idle before reconciliation");
       await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"reconcile"}));
       reply(res,202,{requested:true,runId:run.id});return;

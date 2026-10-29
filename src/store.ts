@@ -1,5 +1,5 @@
 import {journalStore,recoveryStatus,snapshotStore,verifyJournal} from "./recovery.js";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1212,6 +1212,25 @@ export function openStore(data: string): Store {
             if (found) db.prepare("UPDATE chat_messages SET text = ?, streaming = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, streaming, now, found.id);
             else db.prepare(`INSERT INTO chat_messages (id, conversation_id, turn_id, sequence, role, origin, text, streaming, provider_item_id, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, e.role === "user" ? "daemon" : "provider", text, streaming, e.itemId, now, now);
+          } else if(e.type==="history") {
+            const existing=db.prepare("SELECT id,role,text,streaming,provider_item_id AS providerId FROM chat_messages WHERE conversation_id=? ORDER BY sequence").all(c) as {id:string;role:string;text:string;streaming:number;providerId:string}[];
+            const used=new Set<string>();
+            for(const [index,item] of e.items.entries()){
+              const whole=redact(item.text);
+              const providerId="acp-history-"+createHash("sha256").update(JSON.stringify([e.providerId,index,item.role,whole])).digest("hex");
+              const exact=existing.find(row=>!used.has(row.id)&&row.providerId===providerId);
+              const matched=exact??existing.find(row=>!used.has(row.id)&&row.role===item.role&&(row.text===whole || item.role==="user"&&whole.endsWith("\n\n"+row.text) || item.role==="assistant"&&row.streaming===1&&row.text.length>0&&whole.startsWith(row.text)));
+              if(matched){
+                used.add(matched.id);
+                if(matched.streaming)db.prepare("UPDATE chat_messages SET text=?,streaming=0,revision=revision+1,updated_at=? WHERE id=?").run(whole,now,matched.id);
+              }else{
+                const id=randomBytes(8).toString("hex");
+                db.prepare("INSERT INTO chat_messages(id,conversation_id,sequence,role,origin,text,streaming,provider_item_id,created_at,updated_at) VALUES (?,?,?,?,'provider',?,0,?,?,?)").run(id,c,nextSeq(),item.role,whole,providerId,now,now);
+                existing.push({id,role:item.role,text:whole,streaming:0,providerId});used.add(id);
+              }
+            }
+            out.activity="idle";
+            logEvent(runId,session,"chat.history-reconciled",{items:e.items.length,provider:e.providerId,positionPolicy:"append missing entries; preserve existing positions"});
           } else if (e.type === "usage") {
             // add: one turn's use on top of the totals; set: the agent's own totals. Context
             // figures are always the latest.

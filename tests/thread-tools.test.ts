@@ -347,3 +347,15 @@ it("surfaces unsupported chat restrictions instead of leaving a run marked runni
   expect(response.status).toBe(409);
   expect(s.loadRun(child.runId).node).toMatchObject({status:"escalated",summary:expect.stringContaining("denyTools")});
 });
+
+it("reconciles ACP gaps and partial replies without renumbering existing history",async()=>{
+ const s=await seed();
+ s.recordChat("r1","agent",[{type:"message",itemId:"rivet-live-prompt",role:"user",text:"recover me"},{type:"message",itemId:"partial-answer",role:"assistant",text:"recov",streaming:true}]);
+ const before=s.readChat("r1",{limit:100}).items.find(i=>i.text==="recov")!.position;
+ const history:ChatEvent={type:"history",providerId:"acp-session",items:[{role:"user",text:"recover me"},{role:"assistant",text:"recovered answer"},{role:"assistant",text:"missing later answer"}]};
+ s.recordChat("r1","agent",[history]);s.recordChat("r1","agent",[history]);
+ const items=s.readChat("r1",{limit:100}).items;
+ expect(items.filter(i=>i.text==="recover me")).toHaveLength(1);expect(items.filter(i=>i.text==="missing later answer")).toHaveLength(1);
+ expect(items.find(i=>i.text==="recovered answer")).toMatchObject({position:before});
+ expect(items.find(i=>i.text==="recovered answer")?.streaming).not.toBe(true);
+});

@@ -52,7 +52,7 @@ const USAGE = `usage: rivet <command>
   branches <run> [--select <branch>]  inspect or select preserved conversation branches
   rollback <run> --turns <n>          branch before the last n user prompts; keep current files
   edit <run> --at <position> --message <text>  replace a user prompt on a new branch
-  reconcile <run>                    request a provider history refresh (Codex chat)
+  reconcile <run>                    request provider history refresh when supported
   transfers <run>                      inspect pending, queued and delivered context transfers
   merge-back <fork> [--target <ancestor>] [--at <position>]
                                         queue the fork's exploration context into its ancestor

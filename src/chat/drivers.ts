@@ -13,6 +13,7 @@ export type ActivityKind = "command" | "file_change" | "plan" | "reasoning" | "a
 export type ActivityStatus = "running" | "completed" | "failed" | "pending" | "resolved";
 export type ChatEvent =
   | { type: "conversation"; id: string; forkStrategy?: "native" | "reconstructed" }
+  | { type: "history"; providerId:string; items:{role:"user"|"assistant";text:string}[] }
   | { type: "turn"; turnId: string; state: "running" | "completed" | "interrupted" | "failed"; error?: string }
   // streaming: the text so far of a reply still being written; the same item comes again,
   // longer, until a last time without it.
@@ -113,6 +114,19 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   const argv = override(o.env) ?? [process.execPath, claudeAdapterPath()];
   const child = launch(argv, o.cwd, { ...o.env, CLAUDE_CODE_EXECUTABLE: o.binary });
   let sessionId = "";
+  let canLoad=false,loading=false;
+  let loaded:{role:"user"|"assistant";text:string}[]=[];
+  let loadedMessage:{role:"user"|"assistant";text:string;id:string}|undefined;
+  const flushLoaded=()=>{if(loadedMessage?.text)loaded.push({role:loadedMessage.role,text:loadedMessage.text});loadedMessage=undefined;};
+  const servers=()=>o.env.RIVET_SESSION_ID ? [{name:"rivet",...mcpLaunch(o.env),env:Object.entries(mcpLaunch(o.env).env).map(([name,value])=>({name,value}))}]:[];
+  async function loadHistory(id:string) {
+    if(!canLoad)throw new Error("provider does not advertise history loading");
+    loading=true;loaded=[];loadedMessage=undefined;
+    try {await rpc.call("session/load",{sessionId:id,cwd:o.cwd,mcpServers:servers()});flushLoaded();}
+    finally {loading=false;}
+    if(loaded.length>5000 || loaded.reduce((sum,item)=>sum+item.text.length,0)>200000)throw new Error("provider history exceeds the bounded import limit");
+    return loaded;
+  }
   const identity = randomUUID();
   let segment = 0;
   let turn = 0;
@@ -135,6 +149,17 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       const kind = u.sessionUpdate;
       if(kind==="available_commands_update"){
         commands.clear();for(const command of Array.isArray(u.availableCommands)?u.availableCommands as {name?:string}[]:[])if(command.name)commands.add(command.name);return;
+      }
+      if(loading){
+        if(kind==="agent_message_chunk"||kind==="user_message_chunk"){
+          const role=kind==="user_message_chunk"?"user":"assistant";
+          const content=u.content as {type?:string;text?:string}|undefined;
+          if(content?.type && content.type!=="text")return;
+          const id=typeof u.messageId==="string"?u.messageId:"";
+          if(loadedMessage&&(loadedMessage.role!==role||id&&loadedMessage.id!==id))flushLoaded();
+          loadedMessage??={role,text:"",id};loadedMessage.text+=text(content?.text);return;
+        }
+        flushLoaded();return;
       }
       if (kind === "agent_message_chunk") {
         const id = typeof u.messageId === "string" ? `${identity}:${u.messageId}` : `${activeTurn}:m${segment}`;
@@ -205,16 +230,23 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   }
 
   const driver:ChatDriver = {
+    async refresh(){const items=await loadHistory(sessionId);if(o.model)await rpc.call("session/set_config_option",{sessionId,configId:"model",value:o.model});await rpc.call("session/set_config_option",{sessionId,configId:"mode",value:CLAUDE_MODES[o.permission]??"default"});o.emit({type:"history",providerId:sessionId,items});},
     async compact(){if(!commands.has("compact")||!turn)throw new Error("provider compaction is not advertised or the conversation has no turns");await driver.prompt("/compact");},
     async start() {
       const init = await rpc.call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
-      const caps = (init.agentCapabilities ?? {}) as { sessionCapabilities?: { resume?: unknown } };
-      if(o.resume&&caps.sessionCapabilities?.resume===undefined)throw new Error("provider does not support resuming this conversation; refusing to start a new one silently");
-      const opened = o.resume && caps.sessionCapabilities?.resume !== undefined
-        ? await rpc.call("session/resume", { sessionId: o.resume, cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] }).then(() => ({ sessionId: o.resume! }))
-        : await rpc.call("session/new", { cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] });
-      sessionId = text(opened.sessionId);
-      o.emit({ type: "conversation", id: sessionId, ...(o.fork && !o.resume ? { forkStrategy: "reconstructed" as const } : {}) });
+      const caps=(init.agentCapabilities??{}) as {loadSession?:boolean;sessionCapabilities?:{resume?:unknown}};
+      canLoad=caps.loadSession===true;
+      if(o.resume&&!canLoad&&caps.sessionCapabilities?.resume===undefined)throw new Error("provider does not support resuming this conversation; refusing to start a new one silently");
+      let history:{role:"user"|"assistant";text:string}[]|undefined;
+      if(o.resume){
+        sessionId=o.resume;
+        if(canLoad)history=await loadHistory(sessionId);
+        else await rpc.call("session/resume",{sessionId,cwd:o.cwd,mcpServers:servers()});
+      }else{
+        const opened=await rpc.call("session/new",{cwd:o.cwd,mcpServers:servers()});sessionId=text(opened.sessionId);
+      }
+      o.emit({type:"conversation",id:sessionId,...(o.fork&&!o.resume?{forkStrategy:"reconstructed" as const}:{})});
+      if(history)o.emit({type:"history",providerId:sessionId,items:history});
       if (o.model) await rpc.call("session/set_config_option", { sessionId, configId: "model", value: o.model });
       await rpc.call("session/set_config_option", { sessionId, configId: "mode", value: CLAUDE_MODES[o.permission] ?? "default" });
     },
