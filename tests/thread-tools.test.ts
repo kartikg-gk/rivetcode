@@ -337,3 +337,13 @@ it("does not remap a replayed native prompt onto a later identical user prompt",
   expect(()=>s.recordChat("r1","agent",[message("native-first")])).not.toThrow();
   expect(s.readChat("r1",{limit:100}).items.filter(i=>i.text==="repeat")).toHaveLength(2);
 });
+
+it("surfaces unsupported chat restrictions instead of leaving a run marked running",async()=>{
+  const s=await seed();repo=await makeRepo();
+  const source=s.loadRun("r1");source.repo=repo;source.node.worktree=repo;source.spec={denyTools:["Bash(npm publish:*)"]};s.saveRun(source);
+  const child=forkConversation(s,"r1",{});
+  daemon=await startDaemon({data:data!,runFile:join(data!,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});
+  const response=await fetch(`http://127.0.0.1:${daemon.port}/api/v1/sessions/${child.runId}-agent/send`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({message:"continue"})});
+  expect(response.status).toBe(409);
+  expect(s.loadRun(child.runId).node).toMatchObject({status:"escalated",summary:expect.stringContaining("denyTools")});
+});

@@ -186,7 +186,11 @@ export function createScheduler(d: SchedulerDeps) {
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
     const chat = (config["session.mode"] === "chat" || !!fork || !!branch) && (node.agent === "claude" || node.agent === "codex");
-    if (chat && run.spec?.denyTools?.length) throw new SchedulerError(409, "task denyTools cannot be enforced by this chat provider; use terminal mode or remove the unsupported restriction explicitly");
+    if (chat && run.spec?.denyTools?.length) {
+      const summary = "task denyTools cannot be enforced by this chat provider; use terminal mode or remove the unsupported restriction explicitly";
+      await d.write(() => d.store.updateNode(run.id,NODE_ID,{status:"escalated",summary}));
+      throw new SchedulerError(409,summary);
+    }
     const headless = chat || (worker ? config["worker.mode"] !== "interactive" : node.agent === "fake");
     const cfg = {
       sessionId, workspace: node.worktree, headless,
