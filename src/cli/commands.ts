@@ -541,8 +541,18 @@ async function runAction(action: "resume" | "clean", args: string[], io: CliIo):
   if (action === "resume") {
     io.out(`run ${runId} resumed`);
   } else {
-    const { removed, kept } = result as { removed: string[]; kept: string[] };
-    io.out(removed.length ? "removed its worktree (the branch stays)" : kept.length ? "kept its worktree: it has uncommitted work" : "nothing to remove");
+    const jobId = (result as { id: string }).id;
+    let job: { state: string; result?: { removed: string[]; kept: string[]; detached?: boolean }; error?: { status: number; message: string } };
+    const deadline = Date.now() + COMMAND_TIMEOUT_MS;
+    do {
+      job = await callDaemon(io.env, "GET", `/api/v1/cleanup/${encodeURIComponent(jobId)}`, undefined, COMMAND_TIMEOUT_MS) as typeof job;
+      if (["completed", "failed"].includes(job.state)) break;
+      if (Date.now() >= deadline) throw new DaemonError(408, `cleanup ${jobId} is still running; inspect /api/v1/cleanup/${jobId}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (true);
+    if (job.error) throw new DaemonError(job.error.status, job.error.message);
+    const { removed, kept, detached } = job.result!;
+    io.out(detached ? "detached this fork; the shared worktree stays" : removed.length ? "removed its worktree (the branch stays)" : kept.length ? "kept its worktree: it has uncommitted work or attached forks" : "nothing to remove");
   }
   return 0;
 }
@@ -868,6 +878,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
   try {
     if (AUTOSTART.has(command ?? "")) await ensureDaemon(io);
     switch (command) {
+      case "--version":
+      case "version": {
+        const pkg = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
+        io.out(pkg.version); return 0;
+      }
       case "mcp": {
         const { serveMcp, toolCaller } = await import("../mcp/server.js");
         await serveMcp(process.stdin, io.out, toolCaller(io.env, io.cwd));

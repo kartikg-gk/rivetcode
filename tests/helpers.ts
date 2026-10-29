@@ -41,3 +41,15 @@ export function sessionRun(data: string, o: { id?: string; project?: string; rol
     },
   };
 }
+
+export async function cleanupResult(base: string, id: string): Promise<{ removed: string[]; kept: string[]; detached?: boolean }> {
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    const response = await fetch(`${base}/api/v1/cleanup/${id}`);
+    const job = await response.json() as { state: string; result: { removed: string[]; kept: string[]; detached?: boolean }; error?: { message: string } };
+    if (job.error) throw new Error(job.error.message);
+    if (job.state === "completed") return job.result;
+    if (Date.now() > deadline) throw new Error("cleanup timed out");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}

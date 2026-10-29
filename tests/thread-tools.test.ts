@@ -5,7 +5,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { forkConversation, mergeConversation } from "../src/scheduler/conversations.js";
 import { waitForRun, type WaitSnapshot } from "../src/scheduler/wait.js";
 import { openStore, type Store } from "../src/store.js";
-import { makeDataDir, makeRepo, removeRepo, sessionRun } from "./helpers.js";
+import { cleanupResult, makeDataDir, makeRepo, removeRepo, sessionRun } from "./helpers.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { getAgent } from "../src/agents/agent.js";
 import { claudeChat, codexChat, type ChatEvent } from "../src/chat/drivers.js";
@@ -184,7 +184,9 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
   daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
   const api = async (method: string, path: string, body?: unknown) => {
     const r = await fetch(`http://127.0.0.1:${daemon!.port}/api/v1${path}`, { method, headers: { "content-type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
-    return { status: r.status, value: await r.json() as any };
+    const value = await r.json() as any;
+    if (path.endsWith("/clean") && r.status === 202) return { status: 200, value: await cleanupResult(`http://127.0.0.1:${daemon!.port}`, value.id) };
+    return { status: r.status, value };
   };
   const out: string[] = [];
   const io: CliIo = { env: { RIVET_SESSION_ID: "r1-agent", RIVET_PROJECT_ID: "proj", RIVET_RUN_FILE: join(data!, "running.json") }, cwd: repo, readStdin: async () => "", out: (l) => out.push(l), err: (l) => { throw new Error(l); } };

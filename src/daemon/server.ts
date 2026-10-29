@@ -1,3 +1,4 @@
+import { cleanupQueue } from "./cleanup.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
 import { existsSync } from "node:fs";
 import { waitForRun } from "../scheduler/wait.js";
@@ -258,6 +259,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     onError: (error) => { opts.onError?.(error); },
   });
 
+  const cleanup = cleanupQueue(async (runId) => {
+    const run = await write(() => store.loadRun(runId));
+    await scheduler.stopSession(sessionIdOf(run.id, run.node.id));
+    if (run.sharedWorkspace) {
+      await write(() => store.detachFork(run.id));
+      return { removed: [], kept: [run.node.id], detached: true };
+    }
+    return scheduler.cleanWorkspace(run);
+  });
+
   // Creates a run with the project's settings and starts its agent.
   async function newRun(o: Omit<NewRun, "data" | "defaultAgentFor" | "copyFor" | "setupFor">): Promise<Run> {
     const run = await prepareRun({
@@ -338,6 +349,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (automationTimer) clearInterval(automationTimer);
       if (pruneTimer) clearInterval(pruneTimer);
       waitAbort.abort();
+      await cleanup.close();
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
@@ -852,6 +864,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 200, { ...found, enabled, nextRunAt });
       return;
     }
+    const cleanupRoute = /^\/api\/v1\/cleanup\/([a-f0-9]+)$/.exec(path);
+    if (cleanupRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const job = cleanup.get(cleanupRoute[1]!);
+      if (!job) throw new HttpError(404, "unknown cleanup job");
+      reply(res, 200, job); return;
+    }
     const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review|switch))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
@@ -914,11 +933,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 202, { runId: run.id });
         return;
       }
-      await scheduler.stopSession(sessionIdOf(run.id, run.node.id));
-      if (run.sharedWorkspace) {
-        await write(() => store.detachFork(run.id));
-        reply(res, 200, { removed: [], kept: [run.node.id], detached: true });
-      } else reply(res, 200, await scheduler.cleanWorkspace(run));
+      if (stopping) throw new HttpError(503, "daemon stopping");
+      reply(res, 202, cleanup.submit(run.id));
       return;
     }
     const projectRadar = /^\/api\/v1\/projects\/([^/]+)\/radar$/.exec(path);
