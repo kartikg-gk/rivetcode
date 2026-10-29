@@ -10,4 +10,3 @@ export function mcpLaunch(env: Record<string, string>) {
     env: Object.fromEntries(Object.entries(env).filter(([k]) => ["RIVET_SESSION_ID", "RIVET_PROJECT_ID", "RIVET_DATA_DIR", "RIVET_RUN_FILE", "RIVET_LAUNCH_ID"].includes(k))),
   };
 }
-
