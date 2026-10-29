@@ -1,4 +1,5 @@
-import { randomBytes } from "node:crypto";
+import {journalStore,recoveryStatus,snapshotStore,verifyJournal} from "./recovery.js";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -27,11 +28,34 @@ export type Run = {
   issue?: number;
   // A task file's own definition of done, limits and guardrails for this run.
   spec?: TaskSpec;
+  sharedWorkspace?: string;
   node: Node;
 };
 
+export type ConversationBranch = { id: string; parent: string | null; items: TimelineItem[]; snapshot: TimelineItem[]; provider: string; agent: string; active: boolean; strategy:string };
 export type Store = {
-  saveRun(run: Run): void;
+  organizeRun(runId:string,patch:{name?:string;archived?:boolean;group?:string}):void;
+  organization(runId:string):{archivedAt:string|null;group:string};
+  journalEntries(after:number,limit:number):{sequence:number;schemaVersion:number;operation:string;recordedAt:string;hash:string;bytes:number}[];
+  recoveryStatus(): ReturnType<typeof recoveryStatus>;
+  verifyJournal(): ReturnType<typeof verifyJournal>;
+  snapshot(path:string): ReturnType<typeof snapshotStore>;
+  activeBranch(runId: string): ConversationBranch | undefined;
+  branches(runId: string): ConversationBranch[];
+  changeBranch(runId: string, prefix: TimelineItem[], history: TimelineItem[], restore?: string): string;
+  saveRun(run: Run, fork?: ForkRecord): void;
+  getFork(runId: string): ForkRecord | undefined;
+  detachFork(runId: string): void;
+  workspaceForks(owner: string): string[];
+  inherited(runId: string): TimelineItem[];
+  contextTransfer(source: string, target: string, through: number): { id: string; delivered: boolean; attached: boolean } | undefined;
+  pendingContextSize(target: string): number;
+  listContextTransfers(runId: string): { id: string; sourceRun: string; targetRun: string; through: number; delivery: string }[];
+  lastTransferPosition(source: string, target: string): number;
+  transferContext(source: string, target: string, through: number, text: string): { id: string; duplicate: boolean };
+  subscribeWait(target: string, caller: string, session: string, scope: string, turn: string): string;
+  waitSubscriptions(): { id: string; target: string; caller: string; session: string; scope: string; turn: string }[];
+  completeWait(id: string, message: string): void;
   loadRun(runId: string): Run;
   listRuns(project?: string): string[];
   // state null keeps the current activity (a hook that only reports the agent's own session id).
@@ -79,10 +103,12 @@ export type Store = {
   // Every project that has runs.
   listProjects(): string[];
   // A run's state changes after a position, oldest first.
+  searchRuns(query: string, o: { project?: string; limit: number }): { runId: string; project: string; title: string; source: string; snippet: string; position?: number }[];
+  waitTurn(runId: string, turn?: string): { id: string; state: string } | undefined;
   readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
   // Folds a chat session's events into its conversation; returns what they mean for the
   // session: its new activity, and the question it waits on (null once answered).
-  recordChat(runId: string, session: string, events: ChatEvent[]): ChatOutcome;
+  recordChat(runId: string, session: string, events: ChatEvent[], receipt?: { id: string; accepted: number[] }): ChatOutcome;
   // A chat session's conversation as timeline entries, in the order they happened.
   readChat(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   chatUsage(runId: string, session?: string): ChatUsage | null;
@@ -148,7 +174,8 @@ export type AutomationRun = { id: number; automationId: string; scheduledFor: st
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
-export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string };
+export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; items: TimelineItem[] };
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; turnId?: string; providerConversationId?: string };
 // A chat session's token use and context, as its agent last reported.
 export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
 export type ChatOutcome = { activity?: ActivityState; question?: { tool: string; detail: string; requestId: string } | null; conversationId?: string };
@@ -343,6 +370,71 @@ ALTER TABLE runs ADD COLUMN issue INTEGER;
 
 // Chat sessions: how each session runs, and the conversation of a chat session (its
 // turns, readable messages and activities), kept by Rivet.
+MIGRATIONS.push({version:28,sql:`ALTER TABLE conversation_branches ADD COLUMN strategy TEXT NOT NULL DEFAULT 'original';`});
+MIGRATIONS.push({version:27,sql:`CREATE TABLE run_organization(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, archived_at TEXT, group_name TEXT NOT NULL DEFAULT '');`});
+MIGRATIONS.push({version:26,sql:`CREATE TABLE recovery_journal(sequence INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, operation TEXT NOT NULL, recorded_at TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT NOT NULL, changes BLOB NOT NULL);`});
+
+MIGRATIONS.push({ version: 25, sql: `
+CREATE TABLE conversation_branches (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, parent TEXT, items TEXT NOT NULL, snapshot TEXT NOT NULL, provider TEXT NOT NULL, agent TEXT NOT NULL, active INTEGER NOT NULL);
+CREATE UNIQUE INDEX conversation_branch_active ON conversation_branches(run_id) WHERE active = 1;
+` });
+
+MIGRATIONS.push({ version: 24, sql: `
+CREATE TABLE wait_subscriptions (id TEXT PRIMARY KEY, target TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, caller TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session TEXT NOT NULL, scope TEXT NOT NULL, turn TEXT NOT NULL, UNIQUE(target,caller,session,scope,turn));
+` });
+
+MIGRATIONS.push({ version: 23, sql: `
+CREATE TABLE chat_receipts (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session TEXT NOT NULL, id TEXT NOT NULL, outcome TEXT NOT NULL, PRIMARY KEY(run_id, session, id));
+` });
+
+MIGRATIONS.push({ version: 22, sql: `
+ALTER TABLE chat_turns ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
+` });
+
+MIGRATIONS.push({ version: 21, sql: `
+ALTER TABLE context_transfers ADD COLUMN attached INTEGER NOT NULL DEFAULT 0 CHECK (attached IN (0,1));
+` });
+
+MIGRATIONS.push({ version: 20, sql: `
+CREATE VIRTUAL TABLE chat_search USING fts5(text, content='chat_messages', content_rowid='rowid', tokenize='trigram');
+INSERT INTO chat_search(rowid, text) SELECT rowid, text FROM chat_messages WHERE streaming = 0;
+CREATE TRIGGER chat_search_insert AFTER INSERT ON chat_messages WHEN new.streaming = 0 BEGIN
+  INSERT INTO chat_search(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER chat_search_update AFTER UPDATE OF text, streaming ON chat_messages BEGIN
+  INSERT INTO chat_search(chat_search, rowid, text) SELECT 'delete', old.rowid, old.text WHERE old.streaming = 0;
+  INSERT INTO chat_search(rowid, text) SELECT new.rowid, new.text WHERE new.streaming = 0;
+END;
+CREATE TRIGGER chat_search_delete AFTER DELETE ON chat_messages WHEN old.streaming = 0 BEGIN
+  INSERT INTO chat_search(chat_search, rowid, text) VALUES ('delete', old.rowid, old.text);
+END;
+CREATE VIRTUAL TABLE timeline_search USING fts5(text, content='timeline', content_rowid='id', tokenize='trigram');
+INSERT INTO timeline_search(rowid, text) SELECT id, text FROM timeline WHERE session = 'agent' AND kind IN ('prompt', 'message', 'assistant');
+CREATE TRIGGER timeline_search_insert AFTER INSERT ON timeline WHEN new.session = 'agent' AND new.kind IN ('prompt','message','assistant') BEGIN
+  INSERT INTO timeline_search(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER timeline_search_delete AFTER DELETE ON timeline WHEN old.session = 'agent' AND old.kind IN ('prompt','message','assistant') BEGIN
+  INSERT INTO timeline_search(timeline_search, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+` });
+
+MIGRATIONS.push({ version: 19, sql: `
+CREATE TABLE thread_forks (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  source_run TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+  root_run TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+  data_json TEXT NOT NULL
+);
+CREATE TABLE context_transfers (
+  id TEXT PRIMARY KEY,
+  source_run TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+  target_run TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+  through_position INTEGER NOT NULL,
+  message_id INTEGER NOT NULL REFERENCES outbox(id),
+  created_at TEXT NOT NULL,
+  UNIQUE(source_run, target_run, through_position)
+);
+` });
 // Which agent ran each chat turn, so a handoff credits every answer to the agent that gave it.
 MIGRATIONS.push({ version: 18, sql: `
 ALTER TABLE chat_turns ADD COLUMN agent TEXT NOT NULL DEFAULT '';
@@ -595,7 +687,8 @@ export function openStore(data: string): Store {
   const insertMessage = db.prepare(`INSERT INTO outbox (run_id, node_id, from_session, message, created_at, mode)
     VALUES (?, ?, ?, ?, ?, ?)`);
   const selectUndelivered = db.prepare(`SELECT id, message, mode FROM outbox
-    WHERE run_id = ? AND node_id = ? AND delivered_at IS NULL ORDER BY id`);
+    WHERE run_id = ? AND node_id = ? AND delivered_at IS NULL
+      AND id NOT IN (SELECT message_id FROM context_transfers WHERE attached = 0) ORDER BY id`);
   const updateDelivered = db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
   const updateSignal = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
     activity_at = CASE WHEN ? IS NULL THEN activity_at ELSE ? END,
@@ -611,16 +704,30 @@ export function openStore(data: string): Store {
     WHERE run_id = ? ORDER BY seen_at, node_id`);
   const updateStale = db.prepare("UPDATE nodes SET activity = 'exited' WHERE activity IS NOT NULL AND activity <> 'exited'");
 
-  function check(run: Run): void {
+  function forkRecord(runId: string): ForkRecord | undefined {
+    const row = db.prepare("SELECT data_json FROM thread_forks WHERE run_id = ?").get(runId) as { data_json: string } | undefined;
+    return row ? JSON.parse(row.data_json) as ForkRecord : undefined;
+  }
+  function check(run: Run, fork?: ForkRecord): void {
     assertId("run", run.id);
     assertProjectId(run.project);
     assertId("node", run.node.id);
     // Later steps run git on this branch, so it must be the node's own.
-    if (run.node.branch !== branchName(run.id, run.node.id)) {
+    const owner = (fork ?? forkRecord(run.id))?.rootRun;
+    if (owner) {
+      const original = (selectNodes.all(owner) as NodeRow[])[0];
+      const originalRun = selectRun.get(owner) as RunRow | undefined;
+      if (!original || original.worktree !== run.node.worktree || !originalRun || originalRun.repo !== run.repo || originalRun.project !== run.project) throw new RunStoreError("fork checkout must match its owner");
+    }
+    if (run.node.branch !== branchName(owner ?? run.id, run.node.id)) {
       throw new RunStoreError(`run ${run.id} has unexpected branch ${run.node.branch}`);
     }
   }
 
+  function branches(runId: string): ConversationBranch[] {
+    return (db.prepare("SELECT * FROM conversation_branches WHERE run_id=? ORDER BY rowid").all(runId) as {id:string;parent:string|null;items:string;snapshot:string;provider:string;agent:string;active:number;strategy:string}[]).map(r=>({...r,items:JSON.parse(r.items) as TimelineItem[],snapshot:JSON.parse(r.snapshot) as TimelineItem[],active:!!r.active}));
+  }
+  const prefixFor = (runId: string) => branches(runId).find(b=>b.active)?.items ?? forkRecord(runId)?.items ?? [];
   const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
   const selectActivity = db.prepare("SELECT activity FROM nodes WHERE run_id = ? AND id = ?");
   const selectStatus = db.prepare("SELECT status FROM nodes WHERE run_id = ? AND id = ?");
@@ -634,14 +741,30 @@ export function openStore(data: string): Store {
     return (selectActivity.get(runId, nodeId) as { activity: string | null } | undefined)?.activity;
   }
 
-  return {
-    saveRun(run) {
+  const store: Store = {
+    journalEntries:(after,limit)=>db.prepare("SELECT sequence,schema_version AS schemaVersion,operation,recorded_at AS recordedAt,hash,length(changes) AS bytes FROM recovery_journal WHERE sequence>? ORDER BY sequence LIMIT ?").all(after,limit) as {sequence:number;schemaVersion:number;operation:string;recordedAt:string;hash:string;bytes:number}[],
+    recoveryStatus:()=>recoveryStatus(db,data),
+    verifyJournal:()=>verifyJournal(db),
+    snapshot:path=>snapshotStore(db,path),
+    organization(runId) {
+      const row=db.prepare("SELECT archived_at AS archivedAt,group_name AS 'group' FROM run_organization WHERE run_id=?").get(runId) as {archivedAt:string|null;group:string}|undefined;
+      return row??{archivedAt:null,group:""};
+    },
+    organizeRun(runId,patch) {
+      if(!selectRun.get(runId))throw new RunStoreError("unknown run");
+      if(patch.name!==undefined){db.prepare("UPDATE runs SET name=? WHERE id=?").run(patch.name,runId);db.prepare("UPDATE nodes SET title=? WHERE run_id=? AND id='agent'").run(patch.name,runId);}
+      db.prepare("INSERT OR IGNORE INTO run_organization(run_id) VALUES (?)").run(runId);
+      if(patch.archived!==undefined)db.prepare("UPDATE run_organization SET archived_at=? WHERE run_id=?").run(patch.archived?new Date().toISOString():null,runId);
+      if(patch.group!==undefined)db.prepare("UPDATE run_organization SET group_name=? WHERE run_id=?").run(patch.group,runId);
+      logEvent(runId,NODE_ID,"thread.organized",patch);
+    },
+    saveRun(run, fork) {
       try {
-        check(run);
+        check(run, fork);
       } catch (e) {
         throw e instanceof RunStoreError ? e : new RunStoreError((e as Error).message);
       }
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         const before = selectRun.get(run.id) ? (selectStatus.get(run.id, run.node.id) as { status: string } | undefined)?.status ?? null : undefined;
         upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null, run.spec ? JSON.stringify(run.spec) : null);
@@ -656,12 +779,16 @@ export function openStore(data: string): Store {
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
           "[]", n.sessionMode ?? "terminal", n.providerConversationId ?? "",
         );
-        // Created once, then only real changes.
+        if (fork) {
+          db.prepare("INSERT INTO thread_forks (run_id, source_run, root_run, data_json) VALUES (?, ?, ?, ?)").run(run.id, fork.sourceRun, fork.rootRun, JSON.stringify(fork));
+          logEvent(run.id, n.id, "conversation.forked", { source: fork.sourceRun, position: fork.position });
+        }
+        // Creation is recorded once, followed only by real state changes.
         if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
         else if (before !== n.status) logEvent(run.id, n.id, "node.updated", { status: n.status });
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
       } catch (e) {
-        db.exec("ROLLBACK");
+        db.exec("ROLLBACK TO store_write; RELEASE store_write");
         throw new RunStoreError(`could not save run ${run.id}: ${(e as Error).message}`);
       }
     },
@@ -698,6 +825,7 @@ export function openStore(data: string): Store {
         ...(r.model !== null ? { model: r.model } : {}),
         ...(r.issue !== null ? { issue: Number(r.issue) } : {}),
         ...(r.spec !== null ? { spec: JSON.parse(r.spec) as TaskSpec } : {}),
+        ...(forkRecord(runId) ? { sharedWorkspace: forkRecord(runId)!.rootRun } : {}),
         node: nodes[0],
       };
     },
@@ -747,9 +875,21 @@ export function openStore(data: string): Store {
 
     queueMessage(runId, nodeId, message, from, mode = "steer") {
       if (!sessionExists.get(runId, nodeId)) return null;
-      const id = Number(insertMessage.run(runId, nodeId, from ?? null, message, new Date().toISOString(), mode).lastInsertRowid);
-      logEvent(runId, nodeId, "message.queued", { id, mode, from: from ?? null });
-      return id;
+      db.exec("SAVEPOINT store_write");
+      try {
+        const pending = nodeId === NODE_ID ? db.prepare("SELECT t.id, t.message_id, o.message FROM context_transfers t JOIN outbox o ON o.id = t.message_id WHERE t.target_run = ? AND t.attached = 0 ORDER BY t.created_at, t.id").all(runId) as { id: string; message_id: number; message: string }[] : [];
+        const text = pending.length ? pending.map((p) => p.message).join("\n\n") + "\n\nNew user message:\n" + message : message;
+        if (pending.length && text.length > 100000) throw new RunStoreError("message plus pending context exceeds 100000 characters; use a shorter message");
+        const now = new Date().toISOString();
+        const id = Number(insertMessage.run(runId, nodeId, from ?? null, text, now, mode).lastInsertRowid);
+        for (const p of pending) {
+          db.prepare("UPDATE context_transfers SET message_id = ?, attached = 1 WHERE id = ?").run(id, p.id);
+          db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ?").run(now, p.message_id);
+        }
+        logEvent(runId, nodeId, "message.queued", { id, mode, from: from ?? null, ...(pending.length ? { transfers: pending.map((p) => p.id) } : {}) });
+        db.exec("RELEASE store_write");
+        return id;
+      } catch (e) { db.exec("ROLLBACK TO store_write; RELEASE store_write"); throw e; }
     },
 
     undeliveredMessages(runId, nodeId) {
@@ -764,7 +904,7 @@ export function openStore(data: string): Store {
     },
 
     exitStaleSessions() {
-      // Sessions a stopped daemon left behind: each gets session.exited.
+      // Record each session left behind by a stopped daemon as exited.
       const stale = selectStale.all() as { run_id: string; id: string; activity: string }[];
       for (const s of stale) logEvent(s.run_id, s.id, "session.exited", { from: s.activity, reason: "daemon restarted" });
       return Number(updateStale.run().changes);
@@ -835,6 +975,15 @@ export function openStore(data: string): Store {
     },
 
     pruneTimeline(project, before) {
+      // Copies of inherited history follow the finished fork's own retention window.
+      // Keep lineage/provider anchors so pruning never changes checkout ownership.
+      db.prepare(`UPDATE thread_forks SET data_json = json_set(data_json, '$.items', json('[]'))
+        WHERE json_array_length(data_json, '$.items') > 0 AND run_id IN (
+          SELECT r.id FROM runs r WHERE r.project = ?
+            AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+            AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id
+              AND (n.finished_at IS NULL OR n.finished_at >= ? OR n.status IN ('pending', 'running'))))`)
+        .run(project, before);
       db.prepare(`DELETE FROM chat_conversations WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
@@ -850,18 +999,161 @@ export function openStore(data: string): Store {
         .run(project, before).changes);
     },
 
+    activeBranch(runId) {return branches(runId).find(b=>b.active);},
+    branches,
+    changeBranch(runId, prefix, history, restore) {
+      const node = db.prepare("SELECT provider_conversation_id AS provider, agent FROM nodes WHERE run_id=? AND id='agent'").get(runId) as {provider:string;agent:string};
+      const target = restore ? branches(runId).find(b=>b.id===restore) : undefined;
+      if (restore && !target) throw new RunStoreError("unknown conversation branch");
+      if (target?.active) return target.id;
+      db.exec("SAVEPOINT store_write");
+      try {
+        let current = branches(runId).find(b=>b.active);
+        if (!current) {
+          const id = randomBytes(8).toString("hex");
+          db.prepare("INSERT INTO conversation_branches(id,run_id,parent,items,snapshot,provider,agent,active) VALUES (?,?,NULL,?,?,?,?,1)").run(id,runId,JSON.stringify(forkRecord(runId)?.items ?? []),JSON.stringify(history),node.provider,node.agent);
+          current = branches(runId).find(b=>b.active)!;
+        }
+        db.prepare("UPDATE conversation_branches SET snapshot=?,provider=?,agent=?,active=0 WHERE id=?").run(JSON.stringify(history),node.provider,node.agent,current.id);
+        db.prepare("UPDATE chat_conversations SET session=? WHERE run_id=? AND session='agent'").run('branch-'+current.id,runId);
+        const id = target?.id ?? randomBytes(8).toString("hex");
+        if (target) {
+          if (target.agent !== node.agent) throw new RunStoreError("switch to the branch's provider before restoring it");
+          db.prepare("UPDATE conversation_branches SET active=1 WHERE id=?").run(id);
+          db.prepare("UPDATE chat_conversations SET session='agent' WHERE run_id=? AND session=?").run(runId,'branch-'+id);
+        } else db.prepare("INSERT INTO conversation_branches(id,run_id,parent,items,snapshot,provider,agent,active) VALUES (?,?,?,?,?,?,?,1)").run(id,runId,current.id,JSON.stringify(prefix),JSON.stringify(prefix),'',node.agent);
+        db.prepare("UPDATE nodes SET provider_conversation_id=?,status='running',finished_at=NULL,activity='idle' WHERE run_id=? AND id='agent'").run(target?.provider ?? '',runId);
+        if(!target)db.prepare("UPDATE conversation_branches SET strategy='pending' WHERE id=?").run(id);
+        logEvent(runId,NODE_ID,"conversation.branch",{id,parent:current.id,strategy:target ? "restore" : "reconstructed"});
+        db.exec("RELEASE store_write");return id;
+      } catch(e) {db.exec("ROLLBACK TO store_write; RELEASE store_write");throw e;}
+    },
+    subscribeWait(target, caller, session, scope, turn) {
+      db.prepare("INSERT OR IGNORE INTO wait_subscriptions VALUES (?,?,?,?,?,?)").run(randomBytes(8).toString("hex"),target,caller,session,scope,turn);
+      return (db.prepare("SELECT id FROM wait_subscriptions WHERE target=? AND caller=? AND session=? AND scope=? AND turn=?").get(target,caller,session,scope,turn) as {id:string}).id;
+    },
+    waitSubscriptions() { return db.prepare("SELECT * FROM wait_subscriptions").all() as {id:string;target:string;caller:string;session:string;scope:string;turn:string}[]; },
+    completeWait(id, message) {
+      db.exec("SAVEPOINT store_write");
+      try {
+        const row = db.prepare("SELECT * FROM wait_subscriptions WHERE id=?").get(id) as {caller:string;session:string} | undefined;
+        if (row) {
+          insertMessage.run(row.caller,row.session,"rivet",redact(message),new Date().toISOString(),"queue");
+          db.prepare("DELETE FROM wait_subscriptions WHERE id=?").run(id);
+          logEvent(row.caller,row.session,"wait.completed",{id});
+        }
+        db.exec("RELEASE store_write");
+      } catch(e) {db.exec("ROLLBACK TO store_write; RELEASE store_write");throw e;}
+    },
+    getFork(runId) { return forkRecord(runId); },
+    inherited(runId) { return prefixFor(runId); },
+    detachFork(runId) {
+      const fork = forkRecord(runId);
+      if (!fork) return;
+      if (fork.detached) return;
+      fork.detached = true;
+      db.prepare("UPDATE nodes SET status = CASE WHEN status IN ('pending', 'running') THEN 'escalated' ELSE status END, finished_at = coalesce(finished_at, ?), activity = 'exited' WHERE run_id = ?")
+        .run(new Date().toISOString(), runId);
+      db.prepare("UPDATE thread_forks SET data_json = ? WHERE run_id = ?").run(JSON.stringify(fork), runId);
+      logEvent(runId, NODE_ID, "conversation.detached");
+    },
+    workspaceForks(owner) {
+      return (db.prepare("SELECT run_id FROM thread_forks WHERE root_run = ? AND coalesce(json_extract(data_json, '$.detached'), 0) = 0").all(owner) as { run_id: string }[]).map((r) => r.run_id);
+    },
+    contextTransfer(source, target, through) {
+      const row = db.prepare("SELECT t.id, t.attached, o.delivered_at FROM context_transfers t JOIN outbox o ON o.id = t.message_id WHERE t.source_run = ? AND t.target_run = ? AND t.through_position = ?").get(source, target, through) as { id: string; attached: number; delivered_at: string | null } | undefined;
+      return row ? { id: row.id, delivered: row.delivered_at !== null, attached: !!row.attached } : undefined;
+    },
+    pendingContextSize(target) {
+      return Number((db.prepare("SELECT coalesce(sum(length(o.message)), 0) AS size FROM context_transfers t JOIN outbox o ON o.id = t.message_id WHERE t.target_run = ? AND t.attached = 0").get(target) as { size: number }).size);
+    },
+    listContextTransfers(runId) {
+      return db.prepare("SELECT t.id, t.source_run AS sourceRun, t.target_run AS targetRun, t.through_position AS through, CASE WHEN o.delivered_at IS NOT NULL THEN 'delivered' WHEN t.attached = 1 THEN 'queued' ELSE 'pending' END AS delivery FROM context_transfers t JOIN outbox o ON o.id = t.message_id WHERE t.source_run = ? OR t.target_run = ? ORDER BY t.created_at, t.id").all(runId, runId) as { id: string; sourceRun: string; targetRun: string; through: number; delivery: string }[];
+    },
+    lastTransferPosition(source, target) {
+      return Number((db.prepare("SELECT coalesce(max(through_position), 0) AS position FROM context_transfers WHERE source_run = ? AND target_run = ?").get(source, target) as { position: number }).position);
+    },
+    transferContext(source, target, through, text) {
+      const id = randomBytes(8).toString("hex");
+      db.exec("SAVEPOINT store_write");
+      try {
+        const previous = db.prepare("SELECT id FROM context_transfers WHERE source_run = ? AND target_run = ? AND through_position = ?").get(source, target, through) as { id: string } | undefined;
+        if (previous) { db.exec("RELEASE store_write"); return { id: previous.id, duplicate: true }; }
+        const now = new Date().toISOString();
+        const message = db.prepare("INSERT INTO outbox (run_id, node_id, message, from_session, created_at, mode) VALUES (?, 'agent', ?, ?, ?, 'queue')").run(target, redact(text), `${source}-agent`, now);
+        db.prepare("INSERT INTO context_transfers (id, source_run, target_run, through_position, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(id, source, target, through, Number(message.lastInsertRowid), now);
+        logEvent(source, NODE_ID, "context.merge_back", { id, target, through });
+        logEvent(target, NODE_ID, "context.received", { id, source, through });
+        db.exec("RELEASE store_write");
+        return { id, duplicate: false };
+      } catch (e) { db.exec("ROLLBACK TO store_write; RELEASE store_write"); throw e; }
+    },
+    waitTurn(runId, turn) {
+      const row = db.prepare(`SELECT t.provider_turn_id AS id, t.state FROM chat_turns t
+        JOIN chat_conversations c ON c.id = t.conversation_id
+        WHERE c.run_id = ? AND c.session = 'agent' ${turn ? 'AND t.provider_turn_id = ?' : ''}
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1`).get(runId, ...(turn ? [turn] : [])) as { id: string; state: string } | undefined;
+      if (turn && !row) throw new RunStoreError(`unknown turn ${turn}`);
+      return row;
+    },
+
+    searchRuns(query, o) {
+      const q = query.trim().toLowerCase();
+      if (!q) return [];
+      const limit = Math.min(50, Math.max(1, o.limit));
+      const metadataLimit = limit > 1 ? limit - Math.max(1, Math.floor(limit / 5)) : limit;
+      const indexed = Array.from(q).length >= 3 && !q.includes('\0');
+      const phrase = '"' + q.replace(/"/g, '""') + '"';
+      const messageFilter = indexed ? "AND m.rowid IN (SELECT rowid FROM chat_search WHERE chat_search MATCH ? ORDER BY rowid DESC LIMIT 10000)" : "AND m.rowid >= (SELECT coalesce(max(rowid),0) - 20000 FROM chat_messages)";
+      const timelineFilter = indexed ? "AND t.id IN (SELECT rowid FROM timeline_search WHERE timeline_search MATCH ? ORDER BY rowid DESC LIMIT 10000)" : "AND t.id >= (SELECT coalesce(max(id),0) - 20000 FROM timeline)";
+      const project = o.project ? 'AND r.project = ?' : '';
+      const args = o.project ? [o.project] : [];
+      type Hit = { runId: string; project: string; title: string; source: string; snippet: string; position?: number };
+      const hits = db.prepare(`SELECT r.id AS runId, r.project, r.name AS title, 'metadata' AS source,
+        r.name || ' ' || r.task || ' branch: ' || n.branch || ' project: ' || r.project || coalesce(' PR: #' || p.number || ' ' || p.url, '') AS snippet FROM runs r JOIN nodes n ON n.run_id = r.id
+        LEFT JOIN pull_requests p ON p.run_id = r.id
+        WHERE instr(lower(r.name || ' ' || r.task || ' ' || n.branch || ' ' || r.project || ' ' || coalesce('#' || p.number || ' ' || p.url, '')), ?) > 0
+        ${project} ORDER BY r.created_at DESC LIMIT ?`).all(q, ...args, metadataLimit) as Hit[];
+      if (hits.length < limit) {
+        const messages = db.prepare(`SELECT r.id AS runId, r.project, r.name AS title,
+          m.role AS source, m.text AS snippet, m.sequence AS position, m.created_at AS at
+          FROM chat_messages m JOIN chat_conversations c ON c.id = m.conversation_id
+          JOIN runs r ON r.id = c.run_id
+          WHERE c.session = 'agent' AND m.streaming = 0 AND instr(lower(m.text), ?) > 0 ${messageFilter} ${project}
+          UNION ALL
+          SELECT r.id, r.project, r.name, CASE WHEN t.kind = 'assistant' THEN 'assistant' ELSE 'user' END,
+          t.text, t.id, t.at FROM timeline t JOIN runs r ON r.id = t.run_id
+          JOIN nodes n ON n.run_id = r.id
+          WHERE n.session_mode <> 'chat' AND t.session = 'agent' AND t.kind IN ('prompt','message','assistant')
+          AND instr(lower(t.text), ?) > 0 ${timelineFilter} ${project}
+          ORDER BY at DESC LIMIT ?`).all(q, ...(indexed ? [phrase] : []), ...args, q, ...(indexed ? [phrase] : []), ...args, limit - hits.length) as Hit[];
+        hits.push(...messages);
+      }
+      return hits.map((h) => {
+        const text = redact(h.snippet);
+        const at = Math.max(0, text.toLowerCase().indexOf(q) - 80);
+        return { runId: h.runId, project: h.project, title: redact(h.title), source: h.source,
+          snippet: `${at ? '…' : ''}${text.slice(at, at + 320)}${text.length > at + 320 ? '…' : ''}`,
+          ...(h.position === undefined ? {} : { position: h.position }) };
+      });
+    },
     readEvents(runId, o) {
       type Row = { id: number; node_id: string | null; type: string; data: string; at: string };
       return (db.prepare("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?").all(runId, o.after ?? 0, o.limit) as Row[])
         .map((r) => ({ position: Number(r.id), type: r.type, data: JSON.parse(r.data) as Record<string, unknown>, at: r.at, ...(r.node_id !== null ? { nodeId: r.node_id } : {}) }));
     },
 
-    recordChat(runId, session, events) {
+    recordChat(runId, session, events, receipt) {
+      if (receipt) {
+        const prior = db.prepare("SELECT outcome FROM chat_receipts WHERE run_id = ? AND session = ? AND id = ?").get(runId, session, receipt.id) as { outcome: string } | undefined;
+        if (prior) return JSON.parse(prior.outcome) as ChatOutcome;
+      }
       const run = selectRun.get(runId) as { project: string } | undefined;
       if (!run) throw new RunStoreError(`no run ${runId}`);
       const now = new Date().toISOString();
       const out: ChatOutcome = {};
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         let conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
         if (!conv) {
@@ -870,6 +1162,8 @@ export function openStore(data: string): Store {
             .run(conv.id, run.project, runId, session, now, now);
         }
         const c = conv.id;
+        const inheritedMax = prefixFor(runId).at(-1)?.position ?? 0;
+        db.prepare("UPDATE chat_conversations SET latest_sequence = max(latest_sequence, ?) WHERE id = ?").run(inheritedMax, c);
         const nextSeq = () => Number((db.prepare("UPDATE chat_conversations SET latest_sequence = latest_sequence + 1, updated_at = ? WHERE id = ? RETURNING latest_sequence")
           .get(now, c) as { latest_sequence: number }).latest_sequence);
         const turnRow = (providerTurnId?: string) => providerTurnId
@@ -878,6 +1172,13 @@ export function openStore(data: string): Store {
         for (const e of events) {
           if (e.type === "conversation") {
             out.conversationId = e.id;
+            if(session===NODE_ID && e.forkStrategy)db.prepare("UPDATE conversation_branches SET strategy=? WHERE run_id=? AND active=1").run(e.forkStrategy,runId);
+            const fork = forkRecord(runId);
+            if (fork && e.forkStrategy) {
+              fork.strategy = e.forkStrategy;
+              db.prepare("UPDATE thread_forks SET data_json = ? WHERE run_id = ?").run(JSON.stringify(fork), runId);
+              logEvent(runId, NODE_ID, "conversation.initialized", { strategy: fork.strategy });
+            }
             if (session === NODE_ID) {
               db.prepare("UPDATE nodes SET provider_conversation_id = ? WHERE run_id = ? AND id = ?").run(e.id, runId, NODE_ID);
               logEvent(runId, NODE_ID, "chat.conversation", { id: e.id });
@@ -889,20 +1190,47 @@ export function openStore(data: string): Store {
             const id = turnRow(e.turnId);
             if (e.state === "running") {
               const agent = (db.prepare("SELECT agent FROM nodes WHERE run_id = ? AND id = ?").get(runId, NODE_ID) as { agent: string } | undefined)?.agent ?? "";
-              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent) VALUES (?, ?, ?, 'running', ?, ?, ?)")
-                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now, agent);
+              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent, provider_conversation_id) VALUES (?, ?, ?, 'running', ?, ?, ?, (SELECT provider_conversation_id FROM nodes WHERE run_id = ? AND id = 'agent'))")
+                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now, agent, runId);
               out.activity = "active";
             } else {
               if (id) db.prepare("UPDATE chat_turns SET state = ?, error_message = ?, completed_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
               out.activity = "idle";
             }
           } else if (e.type === "message") {
-            const text = redact(e.text);
+            let text = redact(e.text);
+            if (e.role === "user" && !e.itemId.startsWith("rivet-") && !db.prepare("SELECT 1 FROM chat_messages WHERE conversation_id=? AND provider_item_id=?").get(c,e.itemId)) {
+              const hostPrompts = db.prepare("SELECT id,text FROM chat_messages WHERE conversation_id=? AND role='user' AND provider_item_id LIKE 'rivet-%' ORDER BY sequence").all(c) as {id:string;text:string}[];
+              const host = hostPrompts.find(p=>text === p.text || text.endsWith("\n\n"+p.text));
+              if (host) {
+                db.prepare("UPDATE chat_messages SET provider_item_id=?,turn_id=? WHERE id=?").run(e.itemId,turnRow(e.turnId),host.id);
+                text = host.text;
+              }
+            }
             const found = db.prepare("SELECT id FROM chat_messages WHERE conversation_id = ? AND provider_item_id = ?").get(c, e.itemId) as { id: string } | undefined;
             const streaming = e.streaming ? 1 : 0;
             if (found) db.prepare("UPDATE chat_messages SET text = ?, streaming = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, streaming, now, found.id);
             else db.prepare(`INSERT INTO chat_messages (id, conversation_id, turn_id, sequence, role, origin, text, streaming, provider_item_id, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, e.role === "user" ? "daemon" : "provider", text, streaming, e.itemId, now, now);
+          } else if(e.type==="history") {
+            const existing=db.prepare("SELECT id,role,text,streaming,provider_item_id AS providerId FROM chat_messages WHERE conversation_id=? ORDER BY sequence").all(c) as {id:string;role:string;text:string;streaming:number;providerId:string}[];
+            const used=new Set<string>();
+            for(const [index,item] of e.items.entries()){
+              const whole=redact(item.text);
+              const providerId="acp-history-"+createHash("sha256").update(JSON.stringify([e.providerId,index,item.role,whole])).digest("hex");
+              const exact=existing.find(row=>!used.has(row.id)&&row.providerId===providerId);
+              const matched=exact??existing.find(row=>!used.has(row.id)&&row.role===item.role&&(row.text===whole || item.role==="user"&&whole.endsWith("\n\n"+row.text) || item.role==="assistant"&&row.streaming===1&&row.text.length>0&&whole.startsWith(row.text)));
+              if(matched){
+                used.add(matched.id);
+                if(matched.streaming)db.prepare("UPDATE chat_messages SET text=?,streaming=0,revision=revision+1,updated_at=? WHERE id=?").run(whole,now,matched.id);
+              }else{
+                const id=randomBytes(8).toString("hex");
+                db.prepare("INSERT INTO chat_messages(id,conversation_id,sequence,role,origin,text,streaming,provider_item_id,created_at,updated_at) VALUES (?,?,?,?,'provider',?,0,?,?,?)").run(id,c,nextSeq(),item.role,whole,providerId,now,now);
+                existing.push({id,role:item.role,text:whole,streaming:0,providerId});used.add(id);
+              }
+            }
+            out.activity="idle";
+            logEvent(runId,session,"chat.history-reconciled",{items:e.items.length,provider:e.providerId,positionPolicy:"append missing entries; preserve existing positions"});
           } else if (e.type === "usage") {
             // add: one turn's use on top of the totals; set: the agent's own totals. Context
             // figures are always the latest.
@@ -930,9 +1258,13 @@ export function openStore(data: string): Store {
             }
           }
         }
-        db.exec("COMMIT");
+        if (receipt) {
+          for (const id of receipt.accepted) db.prepare("UPDATE outbox SET delivered_at = coalesce(delivered_at, ?) WHERE id = ? AND run_id = ? AND node_id = ?").run(now, id, runId, session);
+          db.prepare("INSERT INTO chat_receipts(run_id,session,id,outcome) VALUES (?,?,?,?)").run(runId, session, receipt.id, JSON.stringify(out));
+        }
+        db.exec("RELEASE store_write");
       } catch (e) {
-        db.exec("ROLLBACK");
+        db.exec("ROLLBACK TO store_write; RELEASE store_write");
         throw e;
       }
       return out;
@@ -953,7 +1285,7 @@ export function openStore(data: string): Store {
       const insert = db.prepare("INSERT OR IGNORE INTO chat_provider_events (conversation_id, provider_event_id, method, payload_json, received_at) VALUES (?, ?, ?, ?, ?)");
       const now = new Date().toISOString();
       let kept = 0;
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         for (const line of lines) {
           let m: { method?: unknown; id?: unknown; result?: unknown; error?: unknown };
@@ -962,9 +1294,9 @@ export function openStore(data: string): Store {
           const method = typeof m.method === "string" ? m.method : m.error !== undefined ? "error" : "result";
           kept += Number(insert.run(conv.id, "", method, redact(line), now).changes);
         }
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
       } catch (e) {
-        db.exec("ROLLBACK");
+        db.exec("ROLLBACK TO store_write; RELEASE store_write");
         throw e;
       }
       return kept;
@@ -980,22 +1312,26 @@ export function openStore(data: string): Store {
 
     readChat(runId, o) {
       const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
-      if (!conv) return { items: [], total: 0 };
-      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number; agent: string | null };
+      const inherited = o.session && o.session !== NODE_ID ? [] : prefixFor(runId);
+      if (!conv) {
+        const shown = inherited.filter((i) => !o.kinds || o.kinds.includes(i.kind));
+        return { total: shown.length, items: shown.filter((i) => i.position > (o.after ?? 0)).slice(0, o.limit) };
+      }
+      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number; agent: string | null; turn_id: string | null; provider: string | null };
       const rows = db.prepare(`
         SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at, streaming,
-          (SELECT agent FROM chat_turns t WHERE t.id = turn_id) AS agent FROM chat_messages WHERE conversation_id = ?
+          (SELECT agent FROM chat_turns t WHERE t.id = turn_id) AS agent, (SELECT provider_turn_id FROM chat_turns t WHERE t.id = turn_id) AS turn_id, (SELECT provider_conversation_id FROM chat_turns t WHERE t.id = turn_id) AS provider FROM chat_messages WHERE conversation_id = ?
         UNION ALL
-        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0, NULL FROM chat_activities WHERE conversation_id = ?
+        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0, NULL, NULL, NULL FROM chat_activities WHERE conversation_id = ?
         ORDER BY sequence`).all(conv.id, conv.id) as Row[];
-      let firstUser = true;
-      const all: TimelineItem[] = [];
+      let firstUser = !inherited.some((i) => i.kind === "prompt" || i.kind === "message");
+      const all: TimelineItem[] = [...inherited];
       for (const r of rows) {
         const base = { position: Number(r.sequence), session: o.session ?? NODE_ID, at: r.at };
         if (r.source === "message") {
           const kind: TimelineKind = r.role === "assistant" ? "assistant" : firstUser ? "prompt" : "message";
           if (r.role === "user") firstUser = false;
-          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}) });
+          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}), ...(r.provider ? { providerConversationId: r.provider } : {}) });
           continue;
         }
         const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};
@@ -1106,4 +1442,5 @@ export function openStore(data: string): Store {
       db.close();
     },
   };
+  try { return journalStore(db,data,store); } catch(error) {db.close();throw error;}
 }

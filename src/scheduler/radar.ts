@@ -20,7 +20,7 @@ export function wouldConflict(repo: string, a: string, b: string): Promise<strin
 
 // Work that has yet to land: a worker still working, or done with its work not merged.
 function unlanded(r: Run): boolean {
-  if (r.role !== "worker") return false;
+  if (r.role !== "worker" || r.sharedWorkspace) return false;
   return r.node.status === "running" || (r.node.status === "done" && r.node.prStatus !== "merged" && r.node.prStatus !== "terminated");
 }
 

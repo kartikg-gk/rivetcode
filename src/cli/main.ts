@@ -1,5 +1,15 @@
 #!/usr/bin/env node
-import { runCli } from "./commands.js";
+// Install before loading commands: their imports may initialize node:sqlite.
+const emitWarning = process.emitWarning;
+process.emitWarning = ((warning: string | Error, ...args: unknown[]) => {
+  const kind = typeof args[0] === "string" ? args[0]
+    : typeof args[0] === "object" && args[0] !== null ? (args[0] as { type?: string }).type
+    : warning instanceof Error ? warning.name : undefined;
+  const message = typeof warning === "string" ? warning : warning.message;
+  if (kind === "ExperimentalWarning" && message.startsWith("SQLite is an experimental feature")) return;
+  Reflect.apply(emitWarning, process, [warning, ...args]);
+}) as typeof process.emitWarning;
+const { runCli } = await import("./commands.js");
 
 async function readStdin(): Promise<string> {
   if (process.stdin.isTTY) return "";

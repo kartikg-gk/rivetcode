@@ -1,3 +1,4 @@
+import { contextText } from "./conversations.js";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -157,11 +158,14 @@ export function createScheduler(d: SchedulerDeps) {
     return existsSync(main) ? main : fileURLToPath(new URL("../../dist/cli/main.js", import.meta.url));
   };
 
-  async function launch(run: Run, prompt?: string, o: { resume?: boolean } = {}): Promise<string> {
+  async function launch(run: Run, prompt?: string, o: { resume?: boolean; fresh?: boolean } = {}): Promise<string> {
     const node = run.node;
     const sessionId = sessionOf(run);
     if (d.runtime.isAlive(sessionId)) throw new SchedulerError(409, "session is already running");
     if (!existsSync(node.worktree)) throw new SchedulerError(409, `worktree is missing: ${node.worktree}`);
+    const fork = await d.write(() => d.store.getFork(run.id));
+    const branch = await d.write(() => d.store.activeBranch(run.id));
+    if (fork?.detached) throw new SchedulerError(409, "fork was detached from its shared checkout");
     const agent = d.agents(node.agent);
     const launchId = newLaunchId();
     const config = await d.write(() => d.store.getConfig(run.project));
@@ -181,7 +185,12 @@ export function createScheduler(d: SchedulerDeps) {
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
-    const chat = config["session.mode"] === "chat" && (node.agent === "claude" || node.agent === "codex");
+    const chat = (config["session.mode"] === "chat" || !!fork || !!branch) && (node.agent === "claude" || node.agent === "codex");
+    if (chat && run.spec?.denyTools?.length) {
+      const summary = "task denyTools cannot be enforced by this chat provider; use terminal mode or remove the unsupported restriction explicitly";
+      await d.write(() => d.store.updateNode(run.id,NODE_ID,{status:"escalated",summary}));
+      throw new SchedulerError(409,summary);
+    }
     const headless = chat || (worker ? config["worker.mode"] !== "interactive" : node.agent === "fake");
     const cfg = {
       sessionId, workspace: node.worktree, headless,
@@ -194,8 +203,8 @@ export function createScheduler(d: SchedulerDeps) {
     if (chat && o.resume && !node.providerConversationId) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
     const argv = chat
       ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-host", encodeConfig({
-        agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
-        ...(model ? { model } : {}), ...(o.resume ? { resume: node.providerConversationId! } : {}), ...(prompt !== undefined ? { prompt } : {}),
+        inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
+        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.providerConversationId ? { fork: { providerId: branch.items.at(-1)?.providerConversationId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
       })]
       : o.resume
         ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })
@@ -266,9 +275,9 @@ export function createScheduler(d: SchedulerDeps) {
     // progress, waits for the next one, or stops the turn first.
     if (chats.has(sessionId)) {
       for (const m of queued) {
-        const control: Control = { type: "send", mode: m.mode, text: m.message };
+        const control: Control = { type: "send", mode: m.mode, text: m.message, messageId: m.id };
         try { await d.runtime.write(sessionId, JSON.stringify(control)); } catch { return; }
-        await d.write(() => d.store.markDelivered(m.id));
+        // Chat delivery is acknowledged by a completed provider turn, not a pipe write.
       }
       return;
     }
@@ -405,6 +414,22 @@ export function createScheduler(d: SchedulerDeps) {
   async function workFinished(runId: string): Promise<void> {
     const run = await load(runId);
     if (run.node.status !== "running" || run.node.finishedAt) return;
+    if (run.sharedWorkspace) {
+      if (run.spec?.paths?.length) {
+        const tracked = await filesChanged(run);
+        const modified = await git(["diff","--name-only","HEAD"],run.node.worktree);
+        const untracked = await git(["ls-files","--others","--exclude-standard"],run.node.worktree);
+        const outside = outsidePaths([...tracked,...modified.split(/\r?\n/),...untracked.split(/\r?\n/)].filter(Boolean),run.spec.paths);
+        if (outside.length) {await workFailed(runId,`shared checkout has changes outside allowed paths: ${outside.join(", ")}`);return;}
+      }
+      if (run.spec?.doneWhen) {
+        const result = await verify(run);
+        if (!result.ok) {await workFailed(runId,result.why);return;}
+      }
+      await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString() }));
+      await transition(runId, "done", "fork exploration completed in shared checkout; use merge-back to transfer context");
+      return;
+    }
     await commitLeftovers(run.node.worktree, `rivet: save work left uncommitted by "${run.node.title}"`);
     // Any failure noted on an earlier attempt is over now.
     await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString(), summary: null }));
@@ -618,6 +643,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (!d.github) throw new SchedulerError(409, "GitHub is not available");
     const run = await load(runId);
     const node = run.node;
+    if (run.sharedWorkspace) throw new SchedulerError(409, "shared forks do not publish a second pull request; use the source run");
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker opens a pull request");
     if (node.status !== "done") throw new SchedulerError(409, `run ${runId} is not done (it is ${node.status})`);
     if (!(await hasChanges(run))) throw new SchedulerError(409, `run ${runId} changed nothing, so there is no pull request to open`);
@@ -721,7 +747,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (!(await d.write(() => d.store.getTerminateOnPrMerge(run.id)))) return;
     if (run.node.status === "running" || d.runtime.isAlive(sessionOf(run))) return;
     await d.write(() => d.store.updateNode(run.id, NODE_ID, { prStatus: "terminated" }));
-    const { kept } = await cleanRun(d.data, run);
+    const { kept } = await cleanWorkspace(run);
     await d.write(() => d.store.setPr(run.id, { ...pr, handled: kept.length ? `terminated; kept ${kept.join(", ")}` : "terminated" }));
     if (kept.length) report(new Error(`run ${run.id}: kept its worktree, which has uncommitted work`));
   }
@@ -958,7 +984,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
     if (run.node.status === "done" || run.node.status === "pending") throw new SchedulerError(409, `run ${runId} is ${run.node.status}; switch a worker that is working, failed or escalated`);
     if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
-    // An agent is switched between turns: stopped mid-turn it can leave a git lock,
+    // Switch agents between turns: stopping mid-turn can leave a git lock,
     // a half-done merge or a half-installed package behind.
     const busy = () => d.runtime.isAlive(sessionOf(run)) && (run.node.activity === "active" || run.node.activity === "blocked");
     for (const end = Date.now() + waitMs; !now && busy(); run = await load(runId)) {
@@ -982,7 +1008,8 @@ export function createScheduler(d: SchedulerDeps) {
     await stopSession(sessionOf(run));
     const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
     const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
-    notes.push(...await settleGit(run.node.worktree));
+    const otherWriters = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id)).some((r) => r.id !== runId && r.node.worktree === run.node.worktree && d.runtime.isAlive(sessionOf(r))));
+    notes.push(...await settleGit(run.node.worktree, !otherWriters));
     const said = await d.write(() => (run.node.sessionMode === "chat" ? d.store.readChat : d.store.readTimeline)(runId, { limit: 10_000, kinds: ["prompt", "message", "assistant"], session: NODE_ID }));
     const turns = handoffTurns(said.items, from);
     await d.write(() => {
@@ -993,17 +1020,18 @@ export function createScheduler(d: SchedulerDeps) {
     });
     if (run.node.status !== "running") await transition(runId, "running");
     const switched = await load(runId);
-    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status, notes, turns }));
+    await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status, notes, turns }), { fresh: true });
     await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
   }
 
   // After an agent is stopped: a lock its git left is removed (no one holds it now), and a
   // merge or rebase it left half done is named for the next agent.
-  async function settleGit(worktree: string): Promise<string[]> {
+  async function settleGit(worktree: string, removeLock = true): Promise<string[]> {
     const dir = (await git(["rev-parse", "--absolute-git-dir"], worktree).catch(() => "")).trim();
     if (!dir) return [];
     const notes: string[] = [];
-    if (existsSync(join(dir, "index.lock"))) {
+    if (!removeLock && existsSync(join(dir, "index.lock"))) notes.push("Another live session shares the checkout; its git lock was left in place.");
+    if (removeLock && existsSync(join(dir, "index.lock"))) {
       await rm(join(dir, "index.lock"), { force: true });
       notes.push("Its git was stopped mid-command; the lock it left was removed.");
     }
@@ -1027,6 +1055,7 @@ export function createScheduler(d: SchedulerDeps) {
   // it, then continues whatever was interrupted.
   async function resume(runId: string): Promise<void> {
     const run = await load(runId);
+    if (run.sharedWorkspace) { await startForkMessage(runId); return; }
     if (run.role === "orchestrator") {
       if (d.runtime.isAlive(sessionOf(run))) return;
       if (run.node.status !== "running") await transition(runId, "running");
@@ -1077,6 +1106,7 @@ export function createScheduler(d: SchedulerDeps) {
   async function recover(runId: string): Promise<void> {
     const run = await load(runId);
     const node = run.node;
+    if (run.sharedWorkspace) return;
     if (node.id !== NODE_ID || node.status !== "running" || run.role !== "worker") return;
     if (node.finishedAt) {
       await track(workFinished(runId));
@@ -1093,7 +1123,34 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
-  return { launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  const cleaningWorkspaces = new Set<string>();
+  async function cleanWorkspace(run: Run): Promise<{ removed: string[]; kept: string[] }> {
+    if (run.sharedWorkspace) return { removed: [], kept: [NODE_ID] };
+    const preserve = await d.write(() => {
+      if (cleaningWorkspaces.has(run.node.worktree)) throw new SchedulerError(409, "checkout is already being cleaned");
+      if (d.store.workspaceForks(run.id).length) return true;
+      cleaningWorkspaces.add(run.node.worktree);
+      return false;
+    });
+    if (preserve) return { removed: [], kept: [NODE_ID] };
+    try { return await cleanRun(d.data, run); } finally { cleaningWorkspaces.delete(run.node.worktree); }
+  }
+  const startingForks = new Map<string, Promise<void>>();
+  async function startForkMessage(runId: string): Promise<boolean> {
+    const run = await load(runId);
+    if (!run.sharedWorkspace || d.runtime.isAlive(sessionOf(run))) return false;
+    if ((await d.write(() => d.store.getFork(runId)))?.detached) throw new SchedulerError(409, "fork was detached from its shared checkout");
+    if (startingForks.has(runId)) { await startingForks.get(runId); return true; }
+    const work = (async () => {
+      if ((await load(runId)).node.status !== "running") await transition(runId, "running");
+      await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: null }));
+      await launch(await load(runId));
+    })();
+    startingForks.set(runId, work);
+    try { await work; return true; } finally { startingForks.delete(runId); }
+  }
+
+  return { cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

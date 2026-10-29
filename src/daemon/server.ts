@@ -1,3 +1,7 @@
+import { cleanupQueue } from "./cleanup.js";
+import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
+import { existsSync } from "node:fs";
+import { waitForRun } from "../scheduler/wait.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -35,11 +39,16 @@ function checkChatEvents(raw: unknown): ChatEvent[] {
   const out: ChatEvent[] = [];
   for (const e of raw.slice(0, 500) as Record<string, unknown>[]) {
     if (!e || typeof e !== "object") continue;
-    if (e.type === "conversation" && str(e.id)) out.push({ type: "conversation", id: (e.id as string).slice(0, 200) });
+    if (e.type === "conversation" && str(e.id)) out.push({ type: "conversation", id: (e.id as string).slice(0, 200), ...(["native", "reconstructed"].includes(e.forkStrategy as string) ? { forkStrategy: e.forkStrategy as "native" | "reconstructed" } : {}) });
     else if (e.type === "turn" && str(e.turnId) && TURN_STATES.includes(e.state as string)) {
       out.push({ type: "turn", turnId: e.turnId as string, state: e.state as "running", ...(str(e.error) ? { error: cut(e.error as string) } : {}) });
     } else if (e.type === "message" && str(e.itemId) && str(e.text) && (e.role === "user" || e.role === "assistant")) {
       out.push({ type: "message", itemId: e.itemId as string, role: e.role, text: cut(e.text as string), ...(str(e.turnId) ? { turnId: e.turnId as string } : {}), ...(e.streaming === true ? { streaming: true } : {}) });
+    } else if(e.type==="history"){
+      if(!str(e.providerId)||!Array.isArray(e.items)||e.items.length>5000)throw new HttpError(400,"invalid provider history");
+      const items=e.items as {role:unknown;text:unknown}[];
+      if(items.some(item=>!item||!["user","assistant"].includes(String(item.role))||!str(item.text))||items.reduce((size,item)=>size+String(item.text).length,0)>200000)throw new HttpError(400,"provider history exceeds import bounds");
+      out.push({type:"history",providerId:e.providerId as string,items:items as {role:"user"|"assistant";text:string}[]});
     } else if (e.type === "usage" && (e.mode === "add" || e.mode === "set")) {
       const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? { ok: true as const, v } : null);
       const fields = ["input", "output", "cached", "total", "contextUsed", "contextWindow"] as const;
@@ -248,10 +257,23 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!repo) throw new Error(`origin is not a GitHub repository (${remote || "no origin"}); set github.repo`);
     return githubClient({ repo, token: await githubToken(process.env, remote) });
   });
+  const branchChanges = new Set<string>();
+  let wakeTimer: NodeJS.Timeout | undefined;
+  const waitAbort = new AbortController();
   const scheduler = createScheduler({
     data, runFile, store, write, runtime, agents, launches, github,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
+  });
+
+  const cleanup = cleanupQueue(async (runId) => {
+    const run = await write(() => store.loadRun(runId));
+    await scheduler.stopSession(sessionIdOf(run.id, run.node.id));
+    if (run.sharedWorkspace) {
+      await write(() => store.detachFork(run.id));
+      return { removed: [], kept: [run.node.id], detached: true };
+    }
+    return scheduler.cleanWorkspace(run);
   });
 
   // Creates a run with the project's settings and starts its agent.
@@ -333,6 +355,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       process.off("SIGTERM", onSignal);
       if (automationTimer) clearInterval(automationTimer);
       if (pruneTimer) clearInterval(pruneTimer);
+      if (wakeTimer) clearInterval(wakeTimer);
+      waitAbort.abort();
+      await cleanup.close();
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await queue;
@@ -485,6 +510,34 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 204);
       return;
     }
+    if (path === "/api/v1/recovery") {
+      if (req.method !== "GET") throw new HttpError(405,"method not allowed");
+      reply(res,200,await write(()=>({...store.recoveryStatus(),integrity:store.verifyJournal()})));return;
+    }
+    if (path === "/api/v1/threads") {
+      if(req.method!=="GET")throw new HttpError(405,"method not allowed");
+      const q=new URL(req.url!,"http://x").searchParams;const mode=q.get("archived")??"hide";
+      const limit=Number(q.get("limit")??50);if(!["hide","only","all"].includes(mode)||!Number.isInteger(limit)||limit<1||limit>100)throw new HttpError(400,"invalid thread filter or limit");
+      const rows=await write(()=>store.listRuns(q.get("project")??undefined).map(id=>({run:store.loadRun(id),organization:store.organization(id)})).filter(({run,organization:o})=>(mode==="all"||(mode==="only"?!!o.archivedAt:!o.archivedAt))&&(!q.has("group")||o.group===q.get("group"))&&(!q.has("after")||run.id>q.get("after")!)).sort((a,b)=>a.run.id.localeCompare(b.run.id)));
+      reply(res,200,{untrusted:true,threads:rows.slice(0,limit),...(rows.length>limit?{next:rows[limit-1]!.run.id}:{})});return;
+    }
+    const organizationRoute=/^\/api\/v1\/runs\/([^/]+)\/organization$/.exec(path);
+    if(organizationRoute){
+      if(req.method!=="PATCH")throw new HttpError(405,"method not allowed");
+      const payload=await body(req);const name=optionalString(payload.name,"name");const group=optionalString(payload.group,"group");
+      if(name!==undefined&&(!name.trim()||name.length>100)||group!==undefined&&group.length>100||payload.archived!==undefined&&typeof payload.archived!=="boolean")throw new HttpError(400,"invalid organization fields");
+      await write(()=>store.organizeRun(organizationRoute[1]!,{...(name!==undefined?{name:name.trim()}:{}),...(group!==undefined?{group}:{}),...(payload.archived!==undefined?{archived:payload.archived as boolean}:{})}));
+      reply(res,200,await write(()=>({run:store.loadRun(organizationRoute[1]!),organization:store.organization(organizationRoute[1]!)})));return;
+    }
+    if(path==="/api/v1/recovery/snapshot"){
+      if(req.method!=="POST")throw new HttpError(405,"method not allowed");const payload=await body(req);const path=optionalString(payload.path,"path");if(!path)throw new HttpError(400,"snapshot path required");
+      reply(res,201,await write(()=>store.snapshot(path)));return;
+    }
+    if(path==="/api/v1/recovery/journal"){
+      if(req.method!=="GET")throw new HttpError(405,"method not allowed");const q=new URL(req.url!,"http://x").searchParams;const after=Number(q.get("after")??0),limit=Number(q.get("limit")??50);
+      if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>200)throw new HttpError(400,"invalid journal page");
+      reply(res,200,await write(()=>store.journalEntries(after,limit)));return;
+    }
     const chatRoute = /^\/api\/v1\/sessions\/([^/]+)\/chat$/.exec(path);
     if (chatRoute) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
@@ -495,7 +548,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 204);
         return;
       }
-      const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events)));
+      const batchId = optionalString(payload.batchId, "batchId");
+      if (batchId && batchId.length > 128) throw new HttpError(400, "batchId is too long");
+      const accepted = payload.accepted === undefined ? [] : payload.accepted;
+      if (!Array.isArray(accepted) || accepted.length > 1000 || accepted.some((id) => !Number.isSafeInteger(id) || id < 1)) throw new HttpError(400, "invalid accepted message IDs");
+      const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events), batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
       const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
       if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
       const state = outcome.activity ?? null;
@@ -571,13 +628,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (send) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(send[1]);
+      if (branchChanges.has(runId)) throw new HttpError(409,"conversation branch is changing");
       const payload = await body(req);
       if (typeof payload.message !== "string") throw new HttpError(400, "message must be a string");
       const from = optionalString(payload.from, "from");
       const mode = (optionalString(payload.mode, "mode") ?? "steer") as SendMode;
       if (!SEND_MODES.includes(mode)) throw new HttpError(400, `mode must be one of ${SEND_MODES.join(", ")}`);
-      const id = await write(() => store.queueMessage(runId, nodeId, payload.message as string, from, mode));
+      if ((await write(() => store.getFork(runId)))?.detached) throw new HttpError(409, "fork was detached from its shared checkout");
+      const id = await write(() => {if (branchChanges.has(runId)) throw new HttpError(409,"conversation branch is changing");return store.queueMessage(runId, nodeId, payload.message as string, from, mode);});
       if (id === null) throw new HttpError(404, "unknown session");
+      if (nodeId === NODE_ID) await scheduler.startForkMessage(runId);
       const target = sessionIdOf(runId, nodeId);
       let delivery: string;
       if (runtime.takesInput(target)) {
@@ -589,6 +649,150 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         delivery = mode === "interrupt" && (await scheduler.interruptHeadless(runId)) ? "interrupted" : "turn-end";
       } else delivery = "next-launch";
       reply(res, 202, { id, delivery });
+      return;
+    }
+    if (path === "/api/v1/search") {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const q = new URL(req.url!, "http://x").searchParams;
+      const query = q.get("query")?.trim();
+      const limit = Number(q.get("limit") ?? 20);
+      if (!query || query.length > 500 || !Number.isInteger(limit) || limit < 1 || limit > 50) throw new HttpError(400, "search needs query (1-500 characters) and limit (1-50)");
+      reply(res, 200, { untrusted: true, matches: await write(() => store.searchRuns(query, { limit, ...(q.get("project") ? { project: q.get("project")! } : {}) })) });
+      return;
+    }
+    const transferStatus = /^\/api\/v1\/runs\/([^/]+)\/transfers$/.exec(path);
+    if (transferStatus) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      reply(res, 200, await write(() => { store.loadRun(transferStatus[1]!); return { transfers: store.listContextTransfers(transferStatus[1]!) }; }));
+      return;
+    }
+    const discoveryRoute=/^\/api\/v1\/runs\/([^/]+)\/provider$/.exec(path);
+    if(discoveryRoute){
+      if(req.method!=="GET")throw new HttpError(405,"method not allowed");
+      const run=await write(()=>store.loadRun(discoveryRoute[1]!));
+      if(run.node.agent!=="claude"&&run.node.agent!=="codex")throw new HttpError(409,"provider discovery is unavailable");
+      const {inspectProvider}=await import("../chat/discovery.js");reply(res,200,await inspectProvider(run.node.agent,run.repo));return;
+    }
+    const compactRoute=/^\/api\/v1\/runs\/([^/]+)\/compact$/.exec(path);
+    if(compactRoute){
+      if(req.method!=="POST")throw new HttpError(405,"method not allowed");
+      const run=await write(()=>store.loadRun(compactRoute[1]!));
+      if(!["claude","codex"].includes(run.node.agent)||run.node.sessionMode!=="chat")throw new HttpError(409,"native compaction requires a supported chat provider");
+      const pending=await write(()=>store.pendingContextSize(run.id)>0||store.undeliveredMessages(run.id,NODE_ID).length>0||store.listRuns().some(id=>{const child=store.loadRun(id);return child.orchestrator===sessionIdOf(run.id,NODE_ID)&&["pending","running"].includes(child.node.status);}));
+      if(run.node.activity!=="idle"||pending||runtime.isAlive(sessionIdOf(run.id,"partner"))||runtime.isAlive(sessionIdOf(run.id,"review")))throw new HttpError(409,"compaction requires idle with no pending context, messages or child work");
+      await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"compact"}));reply(res,202,{requested:true,runId:run.id});return;
+    }
+    const reconcileRoute = /^\/api\/v1\/runs\/([^/]+)\/reconcile$/.exec(path);
+    if (reconcileRoute) {
+      if (req.method !== "POST") throw new HttpError(405,"method not allowed");
+      const run = await write(()=>store.loadRun(reconcileRoute[1]!));
+      if (run.node.sessionMode !== "chat" || !["claude","codex"].includes(run.node.agent)) throw new HttpError(409,"provider history refresh requires a supported chat provider");
+      if (run.node.activity !== "idle") throw new HttpError(409,"wait for idle before reconciliation");
+      await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"reconcile"}));
+      reply(res,202,{requested:true,runId:run.id});return;
+    }
+    const branchRoute = /^\/api\/v1\/runs\/([^/]+)\/(branches|rollback|edit)$/.exec(path);
+    if (branchRoute) {
+      const id = branchRoute[1]!;
+      if (req.method === "GET" && branchRoute[2] === "branches") {
+        reply(res,200,{untrusted:true,branches:await write(()=>store.branches(id))}); return;
+      }
+      if (req.method !== "POST") throw new HttpError(405,"method not allowed");
+      const payload = await body(req);
+      if (branchChanges.has(id)) throw new HttpError(409,"conversation branch is changing");
+      branchChanges.add(id);
+      try {
+      const source = await write(()=>store.loadRun(id));
+      if ((await write(()=>store.getFork(id)))?.detached) throw new HttpError(409,"fork is detached");
+      if (source.node.sessionMode !== "chat") throw new HttpError(409,"conversation editing requires chat mode");
+      if (["active","blocked"].includes(source.node.activity ?? "")) throw new HttpError(409,"wait for the active turn or answer its permission request first");
+      if ((await write(()=>store.undeliveredMessages(id,NODE_ID))).length) throw new HttpError(409,"settle pending messages before changing conversation branches");
+      const history = await write(()=>store.readChat(id,{limit:5001}).items);
+      if (history.length > 5000) throw new HttpError(409,"conversation exceeds the branch snapshot limit");
+      let prefix = history;
+      let replacement: string | undefined;
+      const restore = branchRoute[2] === "branches" ? optionalString(payload.branch,"branch") : undefined;
+      if (branchRoute[2] === "rollback") {
+        const turns = payload.turns;
+        if (!Number.isSafeInteger(turns) || (turns as number) < 1) throw new HttpError(400,"turns must be a positive integer");
+        const prompts = history.filter(i=>i.kind === "prompt" || i.kind === "message");
+        const boundary = prompts.at(-(turns as number));
+        if (!boundary) throw new HttpError(400,"not enough turns to roll back");
+        prefix = history.filter(i=>i.position < boundary.position);
+      } else if (branchRoute[2] === "edit") {
+        const prompt = history.find(i=>i.position === payload.at && ["prompt","message"].includes(i.kind));
+        replacement = optionalString(payload.message,"message");
+        if (!prompt || !replacement) throw new HttpError(400,"edit needs a user-message position and replacement message");
+        prefix = history.filter(i=>i.position < prompt.position);
+      } else if (!restore) throw new HttpError(400,"branch is required");
+      if (restore) {
+        const target = await write(()=>store.branches(id).find(b=>b.id===restore));
+        if (!target) throw new HttpError(404,"unknown conversation branch");
+        if (target.active) {reply(res,200,{runId:id,branch:target.id,strategy:"unchanged"});return;}
+        if (target.agent !== source.node.agent) throw new HttpError(409,"switch to the branch's provider before restoring it");
+      }
+      if (source.spec?.denyTools?.length) throw new HttpError(409,"this task's denyTools cannot be enforced in chat mode");
+      await scheduler.stopSession(sessionIdOf(id,NODE_ID));
+      const branch = await write(()=>store.changeBranch(id,prefix,history,restore));
+      if (replacement) await write(()=>store.queueMessage(id,NODE_ID,replacement,undefined,"queue"));
+      const fresh = await write(()=>store.loadRun(id));
+      await scheduler.launch(fresh,undefined,fresh.node.providerConversationId ? {resume:true} : {});
+      reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "pending",filesystem:"current checkout; historical files are not restored"}); return;
+      } finally {branchChanges.delete(id);}
+    }
+    const conversationRoute = /^\/api\/v1\/runs\/([^/]+)\/(fork|merge-back)$/.exec(path);
+    if (conversationRoute) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      const at = payload.at;
+      if (at !== undefined && (typeof at !== "number" || !Number.isSafeInteger(at) || at < 1)) throw new HttpError(400, "at must be a positive position");
+      const name = optionalString(payload.name, "name");
+      if (name && name.length > 100) throw new HttpError(400, "name must be at most 100 characters");
+      const target = optionalString(payload.target, "target");
+      try {
+        if (conversationRoute[2] === "fork") reply(res, 201, await write(() => {
+          const source = store.loadRun(conversationRoute[1]!);
+          if (scheduler.isCleaning(source.node.worktree) || !existsSync(source.node.worktree)) throw new Error("source checkout is missing or being cleaned");
+          return forkConversation(store, source.id, { at: at as number | undefined, name });
+        }));
+        else {
+          const transfer = await write(() => mergeConversation(store, conversationRoute[1]!, target, at as number | undefined));
+          reply(res, 202, transfer);
+        }
+      } catch (e) { throw new HttpError(409, (e as Error).message); }
+      return;
+    }
+    const waitRoute = /^\/api\/v1\/runs\/([^/]+)\/wait$/.exec(path);
+    if (waitRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = waitRoute[1]!;
+      const q = new URL(req.url!, "http://x").searchParams;
+      const scope = q.get("scope") ?? "turn";
+      const timeoutMs = Number(q.get("timeoutMs") ?? 30000);
+      if (!["turn", "task"].includes(scope) || !Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60000) throw new HttpError(400, "invalid wait scope or timeout (0-60000 ms)");
+      if (!(await write(() => store.listRuns().includes(runId)))) throw new HttpError(404, "unknown run");
+      const wakeSession = q.get("wakeSession");
+      const wakeCaller = wakeSession ? session(wakeSession) : undefined;
+      if (wakeCaller && (await write(() => store.loadRun(wakeCaller.runId).project !== store.loadRun(runId).project))) throw new HttpError(400, "wake target must be in the same project");
+      if (wakeCaller?.runId === runId) throw new HttpError(400, "cannot wake a session waiting on itself");
+      if (q.get("turn")) {
+        try { await write(() => store.waitTurn(runId, q.get("turn")!)); } catch { throw new HttpError(404, "unknown turn"); }
+      }
+      const abort = new AbortController();
+      const closed = () => abort.abort();
+      res.on("close", closed);
+      try {
+        const result = await waitForRun(async (turn) => write(() => {
+          const run = store.loadRun(runId);
+          return { retrying: run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2), status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstSignalAt };
+        }), { scope: scope as "turn" | "task", timeoutMs, ...(q.get("turn") ? { turn: q.get("turn")! } : {}) }, AbortSignal.any([abort.signal, waitAbort.signal]));
+        let next: string | undefined;
+        if (result.timedOut && wakeCaller) {
+          await write(() => store.subscribeWait(runId,wakeCaller.runId,wakeCaller.nodeId,scope,result.turnId ?? ""));
+          next = "Completion wakes this session, so end your turn. Do not poll.";
+        }
+        if (!abort.signal.aborted) reply(res, 200, { ...result, ...(next ? { next } : {}) });
+      } catch (e) { if (waitAbort.signal.aborted && !abort.signal.aborted) reply(res, 503, { error: "daemon stopping" }); else if (!abort.signal.aborted) throw e; } finally { res.off("close", closed); }
       return;
     }
     const timelineRoute = /^\/api\/v1\/runs\/([^/]+)\/timeline$/.exec(path);
@@ -784,6 +988,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 200, { ...found, enabled, nextRunAt });
       return;
     }
+    const cleanupRoute = /^\/api\/v1\/cleanup\/([a-f0-9]+)$/.exec(path);
+    if (cleanupRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const job = cleanup.get(cleanupRoute[1]!);
+      if (!job) throw new HttpError(404, "unknown cleanup job");
+      reply(res, 200, job); return;
+    }
     const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review|switch))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
@@ -805,7 +1016,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
         const chatUsage = run.node.sessionMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), ...(chatUsage ? { chatUsage } : {}), now: new Date(at).toISOString() });
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, ...(pendingRequest ? { pendingRequest } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {
@@ -846,8 +1057,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 202, { runId: run.id });
         return;
       }
-      await scheduler.stopSession(sessionIdOf(run.id, run.node.id));
-      reply(res, 200, await cleanRun(data, run));
+      if (stopping) throw new HttpError(503, "daemon stopping");
+      reply(res, 202, cleanup.submit(run.id));
       return;
     }
     const projectRadar = /^\/api\/v1\/projects\/([^/]+)\/radar$/.exec(path);
@@ -913,6 +1124,35 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");
     await writeRunFile(runFile, { pid: process.pid, port: address.port, startedAt: new Date().toISOString() });
     scheduler.watchPrs(opts.prWatchMs ?? 30_000);
+    let checkingWakes = false;
+    wakeTimer = setInterval(() => {
+      if (checkingWakes || stopping) return;
+      checkingWakes = true;
+      void (async () => {
+        const callers = await write(() => {
+          const ready = new Set<string>();
+          for (const subscription of store.waitSubscriptions()) {
+            const run = store.loadRun(subscription.target);
+            const retrying = run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2);
+            const taskDone = ["done","failed","escalated"].includes(run.node.status) && !retrying;
+            let turn: {id:string;state:string}|undefined;
+            try { turn = subscription.turn ? store.waitTurn(run.id,subscription.turn) : store.waitTurn(run.id); }
+            catch {
+              store.completeWait(subscription.id,`Wait ended for run ${run.id}: the selected turn moved to an archived conversation branch. Read branch history for details.`);
+              ready.add(subscription.caller);continue;
+            }
+            const turnDone = turn && !["running","queued"].includes(turn.state) && (!runtime.isAlive(sessionIdOf(run.id,NODE_ID)) || !!run.node.firstSignalAt);
+            if (taskDone || (subscription.scope === "turn" && turnDone)) {
+              store.completeWait(subscription.id,`Wait completed for run ${run.id}: ${subscription.scope === "task" ? run.node.status : turn?.state ?? run.node.status}. Read its history for details.`);
+              ready.add(subscription.caller);
+            }
+          }
+          return [...ready];
+        });
+        for (const caller of callers) await scheduler.deliver(caller);
+      })().catch((e) => opts.onError?.(e)).finally(() => { checkingWakes = false; });
+    },250);
+    wakeTimer.unref();
     automationTimer = setInterval(() => { void runDueAutomations().catch((e) => opts.onError?.(e)); }, opts.automationMs ?? 30_000);
     automationTimer.unref();
     pruneTimer = setInterval(() => { void pruneTimelines().catch((e) => opts.onError?.(e)); }, opts.pruneMs ?? 3_600_000);

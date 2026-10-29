@@ -15,7 +15,7 @@ describe("event log write paths", () => {
       .map((m) => m[1]!);
     expect(writers.length).toBeGreaterThan(0);
 
-    const body = src.slice(src.indexOf("\n  return {\n"));
+    const body = src.slice(src.indexOf("const store: Store = {"));
     const methods = [...body.matchAll(/\n    (\w+)\([^)]*\) \{\n([\s\S]*?)\n    \},/g)];
     expect(methods.length).toBeGreaterThan(10);
     const unlogged = methods

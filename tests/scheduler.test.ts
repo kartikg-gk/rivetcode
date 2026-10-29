@@ -9,7 +9,7 @@ import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { git } from "../src/git.js";
 import type { Run } from "../src/store.js";
 import { listWorktrees } from "../src/worktree.js";
-import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
+import { cleanupResult, makeDataDir, makeRepo, removeRepo } from "./helpers.js";
 
 let repo: string;
 let data: string;
@@ -245,7 +245,9 @@ describe("clean", () => {
     await start();
     const runId = await spawn({ files: { "a.txt": "a" }, commit: "a" });
     const run = await settled(runId);
-    expect((await api("POST", `/api/v1/runs/${runId}/clean`)).json).toEqual({ removed: ["agent"], kept: [] });
+    const queued = await api("POST", `/api/v1/runs/${runId}/clean`);
+    expect(queued.status).toBe(202);
+    expect(await cleanupResult(`http://127.0.0.1:${daemon!.port}`, queued.json.id)).toEqual({ removed: ["agent"], kept: [] });
     expect(existsSync(run.node.worktree)).toBe(false);
     expect((await git(["branch", "--list", run.node.branch], repo)).trim()).not.toBe("");
   });
@@ -265,7 +267,9 @@ describe("symlink list", () => {
     const run = await settled(runId);
     expect(run.node.status).toBe("done");
     expect(await readFile(join(run.node.worktree, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
-    expect((await api("POST", `/api/v1/runs/${runId}/clean`)).status).toBe(200);
+    const queued = await api("POST", `/api/v1/runs/${runId}/clean`);
+    expect(queued.status).toBe(202);
+    await cleanupResult(`http://127.0.0.1:${daemon!.port}`, queued.json.id);
     expect(existsSync(run.node.worktree)).toBe(false);
     expect(await readFile(join(repo, "node_modules", "dep", "x.js"), "utf8")).toBe("x");
   });
