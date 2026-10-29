@@ -505,6 +505,34 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 204);
       return;
     }
+    if (path === "/api/v1/recovery") {
+      if (req.method !== "GET") throw new HttpError(405,"method not allowed");
+      reply(res,200,await write(()=>({...store.recoveryStatus(),integrity:store.verifyJournal()})));return;
+    }
+    if (path === "/api/v1/threads") {
+      if(req.method!=="GET")throw new HttpError(405,"method not allowed");
+      const q=new URL(req.url!,"http://x").searchParams;const mode=q.get("archived")??"hide";
+      const limit=Number(q.get("limit")??50);if(!["hide","only","all"].includes(mode)||!Number.isInteger(limit)||limit<1||limit>100)throw new HttpError(400,"invalid thread filter or limit");
+      const rows=await write(()=>store.listRuns(q.get("project")??undefined).map(id=>({run:store.loadRun(id),organization:store.organization(id)})).filter(({run,organization:o})=>(mode==="all"||(mode==="only"?!!o.archivedAt:!o.archivedAt))&&(!q.has("group")||o.group===q.get("group"))&&(!q.has("after")||run.id>q.get("after")!)).sort((a,b)=>a.run.id.localeCompare(b.run.id)));
+      reply(res,200,{untrusted:true,threads:rows.slice(0,limit),...(rows.length>limit?{next:rows[limit-1]!.run.id}:{})});return;
+    }
+    const organizationRoute=/^\/api\/v1\/runs\/([^/]+)\/organization$/.exec(path);
+    if(organizationRoute){
+      if(req.method!=="PATCH")throw new HttpError(405,"method not allowed");
+      const payload=await body(req);const name=optionalString(payload.name,"name");const group=optionalString(payload.group,"group");
+      if(name!==undefined&&(!name.trim()||name.length>100)||group!==undefined&&group.length>100||payload.archived!==undefined&&typeof payload.archived!=="boolean")throw new HttpError(400,"invalid organization fields");
+      await write(()=>store.organizeRun(organizationRoute[1]!,{...(name!==undefined?{name:name.trim()}:{}),...(group!==undefined?{group}:{}),...(payload.archived!==undefined?{archived:payload.archived as boolean}:{})}));
+      reply(res,200,await write(()=>({run:store.loadRun(organizationRoute[1]!),organization:store.organization(organizationRoute[1]!)})));return;
+    }
+    if(path==="/api/v1/recovery/snapshot"){
+      if(req.method!=="POST")throw new HttpError(405,"method not allowed");const payload=await body(req);const path=optionalString(payload.path,"path");if(!path)throw new HttpError(400,"snapshot path required");
+      reply(res,201,await write(()=>store.snapshot(path)));return;
+    }
+    if(path==="/api/v1/recovery/journal"){
+      if(req.method!=="GET")throw new HttpError(405,"method not allowed");const q=new URL(req.url!,"http://x").searchParams;const after=Number(q.get("after")??0),limit=Number(q.get("limit")??50);
+      if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>200)throw new HttpError(400,"invalid journal page");
+      reply(res,200,await write(()=>store.journalEntries(after,limit)));return;
+    }
     const chatRoute = /^\/api\/v1\/sessions\/([^/]+)\/chat$/.exec(path);
     if (chatRoute) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
@@ -633,6 +661,22 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 200, await write(() => { store.loadRun(transferStatus[1]!); return { transfers: store.listContextTransfers(transferStatus[1]!) }; }));
       return;
     }
+    const discoveryRoute=/^\/api\/v1\/runs\/([^/]+)\/provider$/.exec(path);
+    if(discoveryRoute){
+      if(req.method!=="GET")throw new HttpError(405,"method not allowed");
+      const run=await write(()=>store.loadRun(discoveryRoute[1]!));
+      if(run.node.agent!=="claude"&&run.node.agent!=="codex")throw new HttpError(409,"provider discovery is unavailable");
+      const {inspectProvider}=await import("../chat/discovery.js");reply(res,200,await inspectProvider(run.node.agent,run.repo));return;
+    }
+    const compactRoute=/^\/api\/v1\/runs\/([^/]+)\/compact$/.exec(path);
+    if(compactRoute){
+      if(req.method!=="POST")throw new HttpError(405,"method not allowed");
+      const run=await write(()=>store.loadRun(compactRoute[1]!));
+      if(!["claude","codex"].includes(run.node.agent)||run.node.sessionMode!=="chat")throw new HttpError(409,"native compaction requires a supported chat provider");
+      const pending=await write(()=>store.pendingContextSize(run.id)>0||store.undeliveredMessages(run.id,NODE_ID).length>0||store.listRuns().some(id=>{const child=store.loadRun(id);return child.orchestrator===sessionIdOf(run.id,NODE_ID)&&["pending","running"].includes(child.node.status);}));
+      if(run.node.activity!=="idle"||pending||runtime.isAlive(sessionIdOf(run.id,"partner"))||runtime.isAlive(sessionIdOf(run.id,"review")))throw new HttpError(409,"compaction requires idle with no pending context, messages or child work");
+      await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"compact"}));reply(res,202,{requested:true,runId:run.id});return;
+    }
     const reconcileRoute = /^\/api\/v1\/runs\/([^/]+)\/reconcile$/.exec(path);
     if (reconcileRoute) {
       if (req.method !== "POST") throw new HttpError(405,"method not allowed");
@@ -688,7 +732,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (replacement) await write(()=>store.queueMessage(id,NODE_ID,replacement,undefined,"queue"));
       const fresh = await write(()=>store.loadRun(id));
       await scheduler.launch(fresh,undefined,fresh.node.providerConversationId ? {resume:true} : {});
-      reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "reconstructed",filesystem:"current checkout; historical files are not restored"}); return;
+      reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "pending",filesystem:"current checkout; historical files are not restored"}); return;
       } finally {branchChanges.delete(id);}
     }
     const conversationRoute = /^\/api\/v1\/runs\/([^/]+)\/(fork|merge-back)$/.exec(path);

@@ -68,9 +68,16 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (!server?.command || server.args?.at(-1) !== "mcp" || session !== "r1-agent") return out({ id: m.id, error: { code: -1, message: "missing Rivet MCP registration" } });
   }
   switch (m.method) {
-    case "initialize": return reply(acp ? { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } } } : { userAgent: "fake" });
+    case "initialize": return reply(acp ? { protocolVersion: 1, agentCapabilities: { sessionCapabilities: process.env.RIVET_TEST_NO_RESUME ? {} : { resume: {} } } } : { userAgent: "fake" });
+    case "model/list": return reply({data:[{id:p.cursor?"model-b":"model-a",displayName:p.cursor?"Model B":"Model A"}],nextCursor:p.cursor?null:"page-two"});
+    case "account/rateLimits/read":
+      if(process.env.RIVET_TEST_NO_QUOTA)return out({id:m.id,error:{code:-32601,message:"quota unavailable"}});
+      return reply({rateLimits:{primary:{usedPercent:25,windowDurationMins:300,resetsAt:1800000000}}});
+    case "thread/compact/start": return reply({});
     case "initialized": return;
-    case "session/new": return reply({ sessionId: "s1" });
+    case "session/new":
+      reply({ sessionId: "s1", models:{availableModels:[{modelId:"claude-fixture",name:"Claude Fixture"}]} });
+      if(process.env.RIVET_TEST_COMPACT==="1")update({sessionUpdate:"available_commands_update",availableCommands:[{name:"compact"}]});return;
     case "session/resume": return reply({});
     case "session/set_config_option": return reply({ configOptions: [] });
     case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));

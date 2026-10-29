@@ -37,6 +37,12 @@ const USAGE = `usage: rivet <command>
                                         start a worker per task, each with its goal, done_when, limits and guardrails
   orchestrator [--agent <name>] [--repo <dir>] [<what you want>]
                                         start an agent that splits work and spawns workers
+  threads [--archived hide|only|all] [--group <name>] [--project <id>]
+  rename <run> <name> | archive <run> | unarchive <run> | group <run> <name>
+  provider claude|codex [--repo <dir>]  discover current models, capabilities and quota availability
+  compact <run>                       request native compaction when idle without pending work
+  recovery status | journal [--after <n>] [--limit <n>]
+  recovery snapshot <new file> | rebuild <new database> [--through <sequence>]
   search <query> [--project <id>] [--limit <n>] [--all]
                                         find sessions by metadata and recorded conversation text
   wait <run> [--scope turn|task] [--turn <id>] [--timeout <ms>]
@@ -897,6 +903,42 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "chat-host": {
         const { runHost } = await import("../chat/host.js");
         return await runHost(JSON.parse(Buffer.from(args[0] ?? "", "base64url").toString("utf8")), io.env);
+      }
+      case "threads": {
+        const {flags,rest}=parseFlags(args,["project","archived","group","limit","after"]);if(rest.length)throw new UsageError("threads accepts filters only");
+        const q=new URLSearchParams();for(const key of ["project","archived","group","limit","after"])if(typeof flags.get(key)==="string")q.set(key,flags.get(key) as string);
+        io.out(JSON.stringify(await callDaemon(io.env,"GET","/api/v1/threads?"+q,undefined,COMMAND_TIMEOUT_MS)));return 0;
+      }
+      case "rename":
+      case "archive":
+      case "unarchive":
+      case "group": {
+        if(args.length!==(command==="rename"||command==="group"?2:1))throw new UsageError("organization command needs a run and, for rename/group, a value");
+        const patch=command==="rename"?{name:args[1]}:command==="group"?{group:args[1]}:{archived:command==="archive"};
+        io.out(JSON.stringify(await callDaemon(io.env,"PATCH",`/api/v1/runs/${encodeURIComponent(args[0]!)}/organization`,patch,COMMAND_TIMEOUT_MS)));return 0;
+      }
+      case "provider": {
+        const {flags,rest}=parseFlags(args,["repo"]);if(rest.length!==1||!["claude","codex"].includes(rest[0]!))throw new UsageError("provider needs claude or codex");
+        const {inspectProvider}=await import("../chat/discovery.js");const repo=await repoTop(resolve(io.cwd,typeof flags.get("repo")==="string"?flags.get("repo") as string:"."));
+        io.out(JSON.stringify(await inspectProvider(rest[0] as "claude"|"codex",repo,io.env)));return 0;
+      }
+      case "compact": {
+        if(args.length!==1)throw new UsageError("compact needs one run ID");io.out(JSON.stringify(await callDaemon(io.env,"POST",`/api/v1/runs/${encodeURIComponent(args[0]!)}/compact`,{},COMMAND_TIMEOUT_MS)));return 0;
+      }
+      case "recovery": {
+        if(args[0] === "rebuild") {
+          const {flags,rest}=parseFlags(args.slice(1),["through"]);if(rest.length!==1)throw new UsageError("recovery rebuild needs a new destination database path");
+          const {rebuildStore}=await import("../recovery.js");io.out(JSON.stringify(rebuildStore(dataDirFrom(io.env),resolve(io.cwd,rest[0]!),flags.has("through")?Number(flags.get("through")):undefined)));return 0;
+        }
+        if(args[0] === "snapshot") {
+          if(args.length!==2)throw new UsageError("recovery snapshot needs a new path");io.out(JSON.stringify(await callDaemon(io.env,"POST","/api/v1/recovery/snapshot",{path:resolve(io.cwd,args[1]!)},COMMAND_TIMEOUT_MS)));return 0;
+        }
+        if(args[0] === "journal") {
+          const {flags,rest}=parseFlags(args.slice(1),["after","limit"]);if(rest.length)throw new UsageError("journal accepts filters only");const q=new URLSearchParams();for(const key of ["after","limit"])if(typeof flags.get(key)==="string")q.set(key,flags.get(key) as string);
+          io.out(JSON.stringify(await callDaemon(io.env,"GET","/api/v1/recovery/journal?"+q,undefined,COMMAND_TIMEOUT_MS)));return 0;
+        }
+        if(args[0] !== "status")throw new UsageError("recovery needs status or rebuild <new database path>");
+        io.out(JSON.stringify(await callDaemon(io.env,"GET","/api/v1/recovery",undefined,COMMAND_TIMEOUT_MS)));return 0;
       }
       case "reconcile": {
         if (args.length !== 1) throw new UsageError("reconcile needs one run ID");

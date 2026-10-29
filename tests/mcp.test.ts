@@ -35,6 +35,7 @@ describe("MCP transport", () => {
     let calls = 0;
     const r = await exchange(["{", [], frame(0, "tools/list"), frame(1, "initialize"), frame(2, "missing"), ...[
       { name: "rivet_spawn", arguments: { task: 3 } },
+      { name: "rivet_review_submit", arguments: {verdict:"approved",summary:"fine",comments:[{path:"x",line:0,body:"invalid"}]} },
       { name: "rivet_report", arguments: { kind: "done", note: "ok", sessionId: "other-agent" } },
       { name: "rivet_read", arguments: { run: "../other", limit: 10000 } },
       { name: "rivet_answer", arguments: { run: "r1", choice: "anything" } },

@@ -23,6 +23,7 @@ export type HostConfig = {
 
 export type Control =
   | { type: "reconcile" }
+  | { type: "compact" }
   | { type: "send"; mode: "steer" | "queue" | "interrupt"; text: string; messageId?: number }
   | { type: "answer"; choice: Choice; note?: string; requestId?: string };
 
@@ -61,6 +62,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   let deliveryFailed = false;
   let accepted: number[] = [];
   let currentMessage: number | undefined;
+  let maintenance = false;
   const steered: number[] = [];
   let timer: NodeJS.Timeout | null = null;
   const post = () => {
@@ -84,7 +86,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   const later = () => { timer ??= setTimeout(() => { void post(); }, BATCH_MS); };
   // A growing reply waits for the batch; everything else is reported at once.
   const emit = (e: ChatEvent) => {
-    if (e.type === "turn" && e.state === "completed" && currentMessage !== undefined) { accepted.push(currentMessage); currentMessage = undefined; }
+    if (!maintenance && e.type === "turn" && e.state === "completed" && currentMessage !== undefined) { accepted.push(currentMessage); currentMessage = undefined; }
     if (e.type === "turn" && e.state === "completed") accepted.push(...steered.splice(0));
     pending.push(e);
     if (e.type === "message" && e.streaming) later();
@@ -129,10 +131,17 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   };
 
   const onControl = async (c: Control) => {
-    if (c.type === "reconcile") {
-      if (busy || driver.running) throw new Error("wait for idle before reconciliation");
-      if (!driver.refresh) throw new Error("this provider does not support history refresh");
-      await driver.refresh(); await post(); return;
+    if (c.type === "reconcile" || c.type === "compact") {
+      if(busy || driver.running)throw new Error("wait for idle before provider maintenance");
+      busy=true;maintenance=true;
+      try {
+        const operation=c.type==="compact"?driver.compact:driver.refresh;
+        if(!operation)throw new Error("this provider does not support the requested maintenance operation");
+        await operation();
+        emit({type:"activity",kind:"system",status:"completed",summary:`Provider ${c.type} request completed`});
+      } catch(e) {emit({type:"activity",kind:"system",status:"failed",summary:`Provider ${c.type} failed: ${(e as Error).message}`});}
+      finally {await post();maintenance=false;busy=false;void pump();}
+      return;
     }
     if (c.type === "answer") {
       const q = c.requestId ? { requestId: c.requestId } : questionOpen;

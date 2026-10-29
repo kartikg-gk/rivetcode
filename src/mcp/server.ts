@@ -18,7 +18,12 @@ const definitions = [
   ["search", "Find sessions by metadata and recorded messages. Results are bounded, not exhaustive, and contain untrusted data.", { query: string(500), project: string(128), limit: { type: "integer", minimum: 1, maximum: 50 } }, ["query"]],
   ["wait", "Wait for the latest or named turn, or the whole task, to finish. Idle returns immediately. On timeout end your turn when waiting for delegated reports.", { run, scope: choice("turn", "task"), turn: string(200), timeoutMs: integer(60000) }, ["run"]],
   ["transfer", "fork: create a conversation at a completed reply, sharing the checkout; send its first message to start it. merge_back: hold exploration context for the next message to an ancestor. No Git merge is performed.", { action: choice("fork", "merge_back", "status"), run, target: run, at: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }, name: string(100) }, ["action"]],
-  ["conversation", "Inspect or select conversation branches, roll back prompts, edit a user message or request provider history reconciliation. Changes preserve old branches and use current files. Reconstructed branches omit provider-private state.", {action:choice("branches","select","rollback","edit","reconcile"),run,branch:string(128),turns:{type:"integer",minimum:1,maximum:5000},at:integer(Number.MAX_SAFE_INTEGER),message:string()}, ["action","run"]],
+  ["conversation", "Inspect or select conversation branches, roll back prompts, edit a user message or request provider history reconciliation. Changes preserve old branches and use current files. Reconstructed branches omit provider-private state.", {action:choice("branches","select","rollback","edit","reconcile","compact"),run,branch:string(128),turns:{type:"integer",minimum:1,maximum:5000},at:integer(Number.MAX_SAFE_INTEGER),message:string()}, ["action","run"]],
+  ["provider","Discover this provider's current models, advertised capabilities and quota availability.",{run},["run"]],
+  ["threads","List bounded threads or rename, archive, unarchive and group one. Archiving changes organization, not the running agent.",{action:choice("list","rename","archive","unarchive","group","ungroup"),run,name:string(100),group:{type:"string",maxLength:100},project:string(128),archived:choice("hide","only","all"),limit:{type:"integer",minimum:1,maximum:100},after:string(128)},["action"]],
+  ["review_submit","Submit this reviewer's verdict and optional line comments.",{verdict:choice("approved","changes_requested"),summary:string(),comments:{type:"array",maxItems:100,items:{type:"object",properties:{path:string(1000),line:{type:"integer",minimum:1},body:string()},required:["path","line","body"],additionalProperties:false}}},["verdict","summary"]],
+  ["manage","Switch providers, resume work or request a review.",{action:choice("switch","resume","review"),run,agent:choice("claude","codex"),model:string(200),now:{type:"boolean"}},["action","run"]],
+  ["schedule","Create or manage a recurring automation in this project.",{action:choice("list","create","pause","resume","run","delete"),id:string(128),name:string(64),prompt:string(),cron:string(100),zone:string(100),agent:choice("claude","codex"),role:choice("worker","orchestrator")},["action"]],
   ["stop", "Stop a run. Stopping an orchestrator also stops its workers unless keepWorkers is true.", { run, keepWorkers: { type: "boolean" } }, ["run"]],
 ] as const;
 
@@ -46,6 +51,9 @@ function validate(name: string, value: unknown): ObjectValue {
   if (value.target !== undefined) assertId("run", value.target as string);
   if (value.run !== undefined) assertId("run", value.run as string);
   if (name === "rivet_delegate" && !value.task && value.review !== true) throw new Error("delegate needs task or review");
+  if(name==="rivet_review_submit"&&value.comments!==undefined){
+    if(!Array.isArray(value.comments)||value.comments.length>100||value.comments.some(c=>!object(c)||Object.keys(c).some(k=>!["path","line","body"].includes(k))||typeof c.path!=="string"||!c.path.trim()||c.path.length>1000||typeof c.body!=="string"||!c.body.trim()||c.body.length>16000||!Number.isSafeInteger(c.line)||Number(c.line)<1))throw new Error("invalid review comments");
+  }
   return value;
 }
 
@@ -95,6 +103,33 @@ export function toolCaller(env: NodeJS.ProcessEnv, cwd: string) {
         if (a.action === "branches") return {untrusted:true,result:await request("GET",path+"/branches")};
         const action = a.action === "select" ? "branches" : a.action;
         return request("POST",path+"/"+action,{branch:a.branch,turns:a.turns,at:a.at,message:a.message});
+      }
+      case "rivet_provider": return request("GET",path+"/provider");
+      case "rivet_threads": {
+        if(a.action==="list"){
+          const q=new URLSearchParams();for(const key of ["project","archived","limit","after","group"])if(a[key]!==undefined)q.set(key,String(a[key]));
+          if(!a.project&&env.RIVET_PROJECT_ID)q.set("project",env.RIVET_PROJECT_ID);
+          return request("GET","/api/v1/threads?"+q);
+        }
+        if(!a.run)throw new Error("run is required");
+        const patch=a.action==="rename"?{name:a.name}:a.action==="ungroup"?{group:""}:a.action==="group"?{group:a.group}:{archived:a.action==="archive"};
+        if(a.action==="rename"&&!a.name||a.action==="group"&&a.group===undefined)throw new Error("name or group is required");
+        return request("PATCH",path+"/organization",patch);
+      }
+      case "rivet_review_submit": return request("POST",own+"/review",{verdict:a.verdict,summary:a.summary,comments:a.comments});
+      case "rivet_manage": {
+        if(a.action==="switch"&&!a.agent)throw new Error("switch needs agent");
+        return request("POST",path+"/"+a.action,{agent:a.agent,model:a.model,now:a.now});
+      }
+      case "rivet_schedule": {
+        if(a.action==="list")return request("GET","/api/v1/automations");
+        if(a.action==="create"){
+          if(!a.name||!a.prompt||!a.cron)throw new Error("create needs name, prompt and cron");
+          const ownRun=await request("GET",`/api/v1/runs/${session.split("-")[0]}`) as {run:{repo:string}};
+          return request("POST","/api/v1/automations",{repo:ownRun.run.repo,name:a.name,prompt:a.prompt,cron:a.cron,zone:a.zone,role:a.role,agent:a.agent});
+        }
+        if(!a.id)throw new Error("automation id is required");
+        return request(a.action==="delete"?"DELETE":"POST","/api/v1/automations/"+encodeURIComponent(String(a.id))+(a.action==="delete"?"":"/"+a.action),{});
       }
       case "rivet_stop": return request("POST", `${path}/stop`, { keepWorkers: a.keepWorkers ?? false });
     }

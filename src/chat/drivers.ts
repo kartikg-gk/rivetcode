@@ -53,6 +53,7 @@ export type ChatDriver = {
   answer(requestId: string, choice: Choice): boolean;
   readonly running: boolean;
   refresh?(): Promise<void>;
+  compact?(): Promise<void>;
   close(): void;
   exited: Promise<void>;
 };
@@ -116,6 +117,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   let segment = 0;
   let turn = 0;
   let activeTurn = "";
+  const commands=new Set<string>();
   // Assistant text arrives in pieces; each message is kept whole once it is complete.
   let message: { id: string; text: string } | null = null;
   const tools = new Map<string, { tool: string; summary: string }>();
@@ -131,6 +133,9 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       if (method !== "session/update") return;
       const u = (params.update ?? {}) as Record<string, unknown>;
       const kind = u.sessionUpdate;
+      if(kind==="available_commands_update"){
+        commands.clear();for(const command of Array.isArray(u.availableCommands)?u.availableCommands as {name?:string}[]:[])if(command.name)commands.add(command.name);return;
+      }
       if (kind === "agent_message_chunk") {
         const id = typeof u.messageId === "string" ? `${identity}:${u.messageId}` : `${activeTurn}:m${segment}`;
         const piece = text((u.content as { text?: unknown } | undefined)?.text);
@@ -199,10 +204,12 @@ export function claudeChat(o: ChatOptions): ChatDriver {
     return true;
   }
 
-  return {
+  const driver:ChatDriver = {
+    async compact(){if(!commands.has("compact")||!turn)throw new Error("provider compaction is not advertised or the conversation has no turns");await driver.prompt("/compact");},
     async start() {
       const init = await rpc.call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
       const caps = (init.agentCapabilities ?? {}) as { sessionCapabilities?: { resume?: unknown } };
+      if(o.resume&&caps.sessionCapabilities?.resume===undefined)throw new Error("provider does not support resuming this conversation; refusing to start a new one silently");
       const opened = o.resume && caps.sessionCapabilities?.resume !== undefined
         ? await rpc.call("session/resume", { sessionId: o.resume, cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] }).then(() => ({ sessionId: o.resume! }))
         : await rpc.call("session/new", { cwd: o.cwd, mcpServers: o.env.RIVET_SESSION_ID ? [{ name: "rivet", ...mcpLaunch(o.env), env: Object.entries(mcpLaunch(o.env).env).map(([name, value]) => ({ name, value })) }] : [] });
@@ -246,6 +253,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
     close() { child.kill(); },
     exited,
   };
+  return driver;
 }
 
 // Chat permissions: edits stay in the worktree and the agent asks when it
@@ -393,6 +401,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
   }
   return {
     refresh,
+    async compact() {if(activeTurn)throw new Error("wait for idle before compaction");await rpc.call("thread/compact/start",{threadId});},
     async start() {
       await rpc.call("initialize", { clientInfo: { name: "rivet", version: "0.1.0" } });
       rpc.notify("initialized");

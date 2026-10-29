@@ -212,7 +212,7 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
   expect((await api("POST", `/runs/${child}/merge-back`, {})).value.duplicate).toBe(true);
   const rolled = await api("POST",`/runs/${child}/rollback`,{turns:1});
   expect(rolled.status).toBe(202);
-  expect(rolled.value.strategy).toBe("reconstructed");
+  expect(rolled.value.strategy).toBe("pending");
   const branches = (await api("GET",`/runs/${child}/branches`)).value.branches;
   expect(branches).toHaveLength(2);
   expect(branches.some((b:any)=>!b.active && b.snapshot.some((i:any)=>i.text.includes("new finding")))).toBe(true);
