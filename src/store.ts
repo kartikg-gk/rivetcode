@@ -1,3 +1,4 @@
+import {journalStore,recoveryStatus,snapshotStore,verifyJournal} from "./recovery.js";
 import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -31,8 +32,14 @@ export type Run = {
   node: Node;
 };
 
-export type ConversationBranch = { id: string; parent: string | null; items: TimelineItem[]; snapshot: TimelineItem[]; provider: string; agent: string; active: boolean };
+export type ConversationBranch = { id: string; parent: string | null; items: TimelineItem[]; snapshot: TimelineItem[]; provider: string; agent: string; active: boolean; strategy:string };
 export type Store = {
+  organizeRun(runId:string,patch:{name?:string;archived?:boolean;group?:string}):void;
+  organization(runId:string):{archivedAt:string|null;group:string};
+  journalEntries(after:number,limit:number):{sequence:number;schemaVersion:number;operation:string;recordedAt:string;hash:string;bytes:number}[];
+  recoveryStatus(): ReturnType<typeof recoveryStatus>;
+  verifyJournal(): ReturnType<typeof verifyJournal>;
+  snapshot(path:string): ReturnType<typeof snapshotStore>;
   activeBranch(runId: string): ConversationBranch | undefined;
   branches(runId: string): ConversationBranch[];
   changeBranch(runId: string, prefix: TimelineItem[], history: TimelineItem[], restore?: string): string;
@@ -363,6 +370,10 @@ ALTER TABLE runs ADD COLUMN issue INTEGER;
 
 // Chat sessions: how each session runs, and the conversation of a chat session (its
 // turns, readable messages and activities), kept by Rivet.
+MIGRATIONS.push({version:28,sql:`ALTER TABLE conversation_branches ADD COLUMN strategy TEXT NOT NULL DEFAULT 'original';`});
+MIGRATIONS.push({version:27,sql:`CREATE TABLE run_organization(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, archived_at TEXT, group_name TEXT NOT NULL DEFAULT '');`});
+MIGRATIONS.push({version:26,sql:`CREATE TABLE recovery_journal(sequence INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, operation TEXT NOT NULL, recorded_at TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT NOT NULL, changes BLOB NOT NULL);`});
+
 MIGRATIONS.push({ version: 25, sql: `
 CREATE TABLE conversation_branches (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, parent TEXT, items TEXT NOT NULL, snapshot TEXT NOT NULL, provider TEXT NOT NULL, agent TEXT NOT NULL, active INTEGER NOT NULL);
 CREATE UNIQUE INDEX conversation_branch_active ON conversation_branches(run_id) WHERE active = 1;
@@ -714,7 +725,7 @@ export function openStore(data: string): Store {
   }
 
   function branches(runId: string): ConversationBranch[] {
-    return (db.prepare("SELECT * FROM conversation_branches WHERE run_id=? ORDER BY rowid").all(runId) as {id:string;parent:string|null;items:string;snapshot:string;provider:string;agent:string;active:number}[]).map(r=>({...r,items:JSON.parse(r.items) as TimelineItem[],snapshot:JSON.parse(r.snapshot) as TimelineItem[],active:!!r.active}));
+    return (db.prepare("SELECT * FROM conversation_branches WHERE run_id=? ORDER BY rowid").all(runId) as {id:string;parent:string|null;items:string;snapshot:string;provider:string;agent:string;active:number;strategy:string}[]).map(r=>({...r,items:JSON.parse(r.items) as TimelineItem[],snapshot:JSON.parse(r.snapshot) as TimelineItem[],active:!!r.active}));
   }
   const prefixFor = (runId: string) => branches(runId).find(b=>b.active)?.items ?? forkRecord(runId)?.items ?? [];
   const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
@@ -730,14 +741,30 @@ export function openStore(data: string): Store {
     return (selectActivity.get(runId, nodeId) as { activity: string | null } | undefined)?.activity;
   }
 
-  return {
+  const store: Store = {
+    journalEntries:(after,limit)=>db.prepare("SELECT sequence,schema_version AS schemaVersion,operation,recorded_at AS recordedAt,hash,length(changes) AS bytes FROM recovery_journal WHERE sequence>? ORDER BY sequence LIMIT ?").all(after,limit) as {sequence:number;schemaVersion:number;operation:string;recordedAt:string;hash:string;bytes:number}[],
+    recoveryStatus:()=>recoveryStatus(db,data),
+    verifyJournal:()=>verifyJournal(db),
+    snapshot:path=>snapshotStore(db,path),
+    organization(runId) {
+      const row=db.prepare("SELECT archived_at AS archivedAt,group_name AS 'group' FROM run_organization WHERE run_id=?").get(runId) as {archivedAt:string|null;group:string}|undefined;
+      return row??{archivedAt:null,group:""};
+    },
+    organizeRun(runId,patch) {
+      if(!selectRun.get(runId))throw new RunStoreError("unknown run");
+      if(patch.name!==undefined){db.prepare("UPDATE runs SET name=? WHERE id=?").run(patch.name,runId);db.prepare("UPDATE nodes SET title=? WHERE run_id=? AND id='agent'").run(patch.name,runId);}
+      db.prepare("INSERT OR IGNORE INTO run_organization(run_id) VALUES (?)").run(runId);
+      if(patch.archived!==undefined)db.prepare("UPDATE run_organization SET archived_at=? WHERE run_id=?").run(patch.archived?new Date().toISOString():null,runId);
+      if(patch.group!==undefined)db.prepare("UPDATE run_organization SET group_name=? WHERE run_id=?").run(patch.group,runId);
+      logEvent(runId,NODE_ID,"thread.organized",patch);
+    },
     saveRun(run, fork) {
       try {
         check(run, fork);
       } catch (e) {
         throw e instanceof RunStoreError ? e : new RunStoreError((e as Error).message);
       }
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         const before = selectRun.get(run.id) ? (selectStatus.get(run.id, run.node.id) as { status: string } | undefined)?.status ?? null : undefined;
         upsertRun.run(run.id, run.project, run.repo, run.base, run.task, run.createdAt, run.role, run.name, run.orchestrator ?? null, run.model ?? null, run.issue ?? null, run.spec ? JSON.stringify(run.spec) : null);
@@ -759,9 +786,9 @@ export function openStore(data: string): Store {
         // Creation is recorded once, followed only by real state changes.
         if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
         else if (before !== n.status) logEvent(run.id, n.id, "node.updated", { status: n.status });
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
       } catch (e) {
-        db.exec("ROLLBACK");
+        db.exec("ROLLBACK TO store_write; RELEASE store_write");
         throw new RunStoreError(`could not save run ${run.id}: ${(e as Error).message}`);
       }
     },
@@ -848,7 +875,7 @@ export function openStore(data: string): Store {
 
     queueMessage(runId, nodeId, message, from, mode = "steer") {
       if (!sessionExists.get(runId, nodeId)) return null;
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         const pending = nodeId === NODE_ID ? db.prepare("SELECT t.id, t.message_id, o.message FROM context_transfers t JOIN outbox o ON o.id = t.message_id WHERE t.target_run = ? AND t.attached = 0 ORDER BY t.created_at, t.id").all(runId) as { id: string; message_id: number; message: string }[] : [];
         const text = pending.length ? pending.map((p) => p.message).join("\n\n") + "\n\nNew user message:\n" + message : message;
@@ -860,9 +887,9 @@ export function openStore(data: string): Store {
           db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ?").run(now, p.message_id);
         }
         logEvent(runId, nodeId, "message.queued", { id, mode, from: from ?? null, ...(pending.length ? { transfers: pending.map((p) => p.id) } : {}) });
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
         return id;
-      } catch (e) { db.exec("ROLLBACK"); throw e; }
+      } catch (e) { db.exec("ROLLBACK TO store_write; RELEASE store_write"); throw e; }
     },
 
     undeliveredMessages(runId, nodeId) {
@@ -979,12 +1006,12 @@ export function openStore(data: string): Store {
       const target = restore ? branches(runId).find(b=>b.id===restore) : undefined;
       if (restore && !target) throw new RunStoreError("unknown conversation branch");
       if (target?.active) return target.id;
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         let current = branches(runId).find(b=>b.active);
         if (!current) {
           const id = randomBytes(8).toString("hex");
-          db.prepare("INSERT INTO conversation_branches VALUES (?,?,NULL,?,?,?,?,1)").run(id,runId,JSON.stringify(forkRecord(runId)?.items ?? []),JSON.stringify(history),node.provider,node.agent);
+          db.prepare("INSERT INTO conversation_branches(id,run_id,parent,items,snapshot,provider,agent,active) VALUES (?,?,NULL,?,?,?,?,1)").run(id,runId,JSON.stringify(forkRecord(runId)?.items ?? []),JSON.stringify(history),node.provider,node.agent);
           current = branches(runId).find(b=>b.active)!;
         }
         db.prepare("UPDATE conversation_branches SET snapshot=?,provider=?,agent=?,active=0 WHERE id=?").run(JSON.stringify(history),node.provider,node.agent,current.id);
@@ -994,11 +1021,12 @@ export function openStore(data: string): Store {
           if (target.agent !== node.agent) throw new RunStoreError("switch to the branch's provider before restoring it");
           db.prepare("UPDATE conversation_branches SET active=1 WHERE id=?").run(id);
           db.prepare("UPDATE chat_conversations SET session='agent' WHERE run_id=? AND session=?").run(runId,'branch-'+id);
-        } else db.prepare("INSERT INTO conversation_branches VALUES (?,?,?,?,?,?,?,1)").run(id,runId,current.id,JSON.stringify(prefix),JSON.stringify(prefix),'',node.agent);
+        } else db.prepare("INSERT INTO conversation_branches(id,run_id,parent,items,snapshot,provider,agent,active) VALUES (?,?,?,?,?,?,?,1)").run(id,runId,current.id,JSON.stringify(prefix),JSON.stringify(prefix),'',node.agent);
         db.prepare("UPDATE nodes SET provider_conversation_id=?,status='running',finished_at=NULL,activity='idle' WHERE run_id=? AND id='agent'").run(target?.provider ?? '',runId);
+        if(!target)db.prepare("UPDATE conversation_branches SET strategy='pending' WHERE id=?").run(id);
         logEvent(runId,NODE_ID,"conversation.branch",{id,parent:current.id,strategy:target ? "restore" : "reconstructed"});
-        db.exec("COMMIT");return id;
-      } catch(e) {db.exec("ROLLBACK");throw e;}
+        db.exec("RELEASE store_write");return id;
+      } catch(e) {db.exec("ROLLBACK TO store_write; RELEASE store_write");throw e;}
     },
     subscribeWait(target, caller, session, scope, turn) {
       db.prepare("INSERT OR IGNORE INTO wait_subscriptions VALUES (?,?,?,?,?,?)").run(randomBytes(8).toString("hex"),target,caller,session,scope,turn);
@@ -1006,7 +1034,7 @@ export function openStore(data: string): Store {
     },
     waitSubscriptions() { return db.prepare("SELECT * FROM wait_subscriptions").all() as {id:string;target:string;caller:string;session:string;scope:string;turn:string}[]; },
     completeWait(id, message) {
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         const row = db.prepare("SELECT * FROM wait_subscriptions WHERE id=?").get(id) as {caller:string;session:string} | undefined;
         if (row) {
@@ -1014,8 +1042,8 @@ export function openStore(data: string): Store {
           db.prepare("DELETE FROM wait_subscriptions WHERE id=?").run(id);
           logEvent(row.caller,row.session,"wait.completed",{id});
         }
-        db.exec("COMMIT");
-      } catch(e) {db.exec("ROLLBACK");throw e;}
+        db.exec("RELEASE store_write");
+      } catch(e) {db.exec("ROLLBACK TO store_write; RELEASE store_write");throw e;}
     },
     getFork(runId) { return forkRecord(runId); },
     inherited(runId) { return prefixFor(runId); },
@@ -1047,19 +1075,19 @@ export function openStore(data: string): Store {
     },
     transferContext(source, target, through, text) {
       const id = randomBytes(8).toString("hex");
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         const previous = db.prepare("SELECT id FROM context_transfers WHERE source_run = ? AND target_run = ? AND through_position = ?").get(source, target, through) as { id: string } | undefined;
-        if (previous) { db.exec("COMMIT"); return { id: previous.id, duplicate: true }; }
+        if (previous) { db.exec("RELEASE store_write"); return { id: previous.id, duplicate: true }; }
         const now = new Date().toISOString();
         const message = db.prepare("INSERT INTO outbox (run_id, node_id, message, from_session, created_at, mode) VALUES (?, 'agent', ?, ?, ?, 'queue')").run(target, redact(text), `${source}-agent`, now);
         db.prepare("INSERT INTO context_transfers (id, source_run, target_run, through_position, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
           .run(id, source, target, through, Number(message.lastInsertRowid), now);
         logEvent(source, NODE_ID, "context.merge_back", { id, target, through });
         logEvent(target, NODE_ID, "context.received", { id, source, through });
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
         return { id, duplicate: false };
-      } catch (e) { db.exec("ROLLBACK"); throw e; }
+      } catch (e) { db.exec("ROLLBACK TO store_write; RELEASE store_write"); throw e; }
     },
     waitTurn(runId, turn) {
       const row = db.prepare(`SELECT t.provider_turn_id AS id, t.state FROM chat_turns t
@@ -1125,7 +1153,7 @@ export function openStore(data: string): Store {
       if (!run) throw new RunStoreError(`no run ${runId}`);
       const now = new Date().toISOString();
       const out: ChatOutcome = {};
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         let conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
         if (!conv) {
@@ -1144,6 +1172,7 @@ export function openStore(data: string): Store {
         for (const e of events) {
           if (e.type === "conversation") {
             out.conversationId = e.id;
+            if(session===NODE_ID && e.forkStrategy)db.prepare("UPDATE conversation_branches SET strategy=? WHERE run_id=? AND active=1").run(e.forkStrategy,runId);
             const fork = forkRecord(runId);
             if (fork && e.forkStrategy) {
               fork.strategy = e.forkStrategy;
@@ -1214,9 +1243,9 @@ export function openStore(data: string): Store {
           for (const id of receipt.accepted) db.prepare("UPDATE outbox SET delivered_at = coalesce(delivered_at, ?) WHERE id = ? AND run_id = ? AND node_id = ?").run(now, id, runId, session);
           db.prepare("INSERT INTO chat_receipts(run_id,session,id,outcome) VALUES (?,?,?,?)").run(runId, session, receipt.id, JSON.stringify(out));
         }
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
       } catch (e) {
-        db.exec("ROLLBACK");
+        db.exec("ROLLBACK TO store_write; RELEASE store_write");
         throw e;
       }
       return out;
@@ -1237,7 +1266,7 @@ export function openStore(data: string): Store {
       const insert = db.prepare("INSERT OR IGNORE INTO chat_provider_events (conversation_id, provider_event_id, method, payload_json, received_at) VALUES (?, ?, ?, ?, ?)");
       const now = new Date().toISOString();
       let kept = 0;
-      db.exec("BEGIN IMMEDIATE");
+      db.exec("SAVEPOINT store_write");
       try {
         for (const line of lines) {
           let m: { method?: unknown; id?: unknown; result?: unknown; error?: unknown };
@@ -1246,9 +1275,9 @@ export function openStore(data: string): Store {
           const method = typeof m.method === "string" ? m.method : m.error !== undefined ? "error" : "result";
           kept += Number(insert.run(conv.id, "", method, redact(line), now).changes);
         }
-        db.exec("COMMIT");
+        db.exec("RELEASE store_write");
       } catch (e) {
-        db.exec("ROLLBACK");
+        db.exec("ROLLBACK TO store_write; RELEASE store_write");
         throw e;
       }
       return kept;
@@ -1394,4 +1423,5 @@ export function openStore(data: string): Store {
       db.close();
     },
   };
+  try { return journalStore(db,data,store); } catch(error) {db.close();throw error;}
 }
