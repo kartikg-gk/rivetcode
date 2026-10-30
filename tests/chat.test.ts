@@ -163,3 +163,8 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s 
     expect(final.some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
   },30000);
 });
+
+
+it("escalates a timed-out completion without publishing or replaying consumed guidance",async()=>{
+ process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"session.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("active",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="active");await api("POST","/api/v1/reports",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
+},30000);

@@ -508,6 +508,11 @@ export function createScheduler(d: SchedulerDeps) {
     try { run = await load(runId); } catch { return; }
     // An orchestrator's exit ends nothing but its own conversation.
     if (run.role !== "worker") return;
+    if (chats.has(sessionId) && code !== 0) {
+      await transition(runId, "escalated", "Chat completion is uncertain: inspect provider history and current files before an explicit resume; pending messages were preserved and were not automatically replayed.");
+      await tellOrchestrator(run, `Worker ${runId} stopped with uncertain chat completion; inspect its history before resuming.`);
+      return;
+    }
     if (code === 0 || doneReported.has(sessionId)) {
       // Its partner is still at work: the worker's turn is not its finish. It is resumed
       // with the partner's result once that comes.
@@ -1075,6 +1080,12 @@ export function createScheduler(d: SchedulerDeps) {
       await launch(fresh, prompt);
       return;
     }
+    if (run.node.agent !== "fake" && !d.runtime.isAlive(sessionOf(run)) && (run.node.providerConversationId || run.node.agentSessionId)) {
+      if (run.node.status !== "running") await transition(runId, "running");
+      await d.write(() => d.store.updateNode(runId, NODE_ID, {finishedAt:null}));
+      await launch(await load(runId), "The user explicitly resumed this interrupted work. Inspect current files and provider history before repeating any possibly completed action.", {resume:true});
+      return;
+    }
     if (run.node.status === "escalated" || run.node.status === "failed" || run.node.status === "pending") {
       await runSession(runId, run.node.summary).catch(report);
       return;
@@ -1114,6 +1125,10 @@ export function createScheduler(d: SchedulerDeps) {
     if (node.finishedAt) {
       await track(workFinished(runId));
     } else if (!d.runtime.isAlive(sessionOf(run))) {
+      if (node.agent !== "fake") {
+        await transition(runId, "escalated", "Interrupted by daemon restart; delivery may be uncertain. Inspect current files and history, then explicitly resume. No pending instruction was automatically replayed.");
+        return;
+      }
       const note = "Rivet was restarted while you worked; continue from the current state of the worktree.";
       await launch(run, workerPrompt(run, note)).catch(report);
     }

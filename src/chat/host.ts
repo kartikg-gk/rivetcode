@@ -61,6 +61,8 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   let raw: string[] = [];
   let posting = Promise.resolve();
   let deliveryFailed = false;
+  let completionFailed = false;
+  let lastTurnState: string | undefined;
   let accepted: number[] = [];
   let currentMessage: number | undefined;
   let maintenance = false;
@@ -87,6 +89,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   const later = () => { timer ??= setTimeout(() => { void post(); }, BATCH_MS); };
   // A growing reply waits for the batch; everything else is reported at once.
   const emit = (e: ChatEvent) => {
+    if (e.type === "turn") lastTurnState = e.state;
     if (!maintenance && e.type === "turn" && e.state === "completed" && currentMessage !== undefined) { accepted.push(currentMessage); currentMessage = undefined; }
     if (e.type === "turn" && e.state === "completed") accepted.push(...steered.splice(0));
     pending.push(e);
@@ -143,6 +146,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
       if (finishing) return;
       finishing = true;
       finishTimer = setTimeout(() => {
+        completionFailed = true;
         emit({type:"activity",kind:"system",status:"failed",summary:"Completion drain timed out; final provider output may be incomplete"});
         void finish();
       }, 15000);
@@ -207,5 +211,5 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   if (finishTimer) clearTimeout(finishTimer);
   await post();
   lines.close();
-  return deliveryFailed ? 1 : 0;
+  return deliveryFailed || completionFailed || lastTurnState === "failed" || lastTurnState === "running" || lastTurnState === "interrupted" ? 2 : 0;
 }

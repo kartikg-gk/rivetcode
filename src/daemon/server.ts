@@ -803,17 +803,26 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (!run) throw new HttpError(404, "unknown run");
       const q = new URL(req.url ?? "", "http://x").searchParams;
       const num = (k: string, d: number, max: number) => Math.min(max, Math.max(1, Number(q.get(k) ?? d) || d));
-      const view = q.get("view") === "activity" ? "activity" : "messages";
+      const item = q.has("item") ? Number(q.get("item")) : undefined;
+      const textOffset = Number(q.get("textOffset") ?? 0);
+      if (item !== undefined && (!Number.isSafeInteger(item) || item < 1) || !Number.isSafeInteger(textOffset) || textOffset < 0 || textOffset > 0 && item === undefined) throw new HttpError(400, "item must be a positive position; textOffset requires an item and must be nonnegative");
+      const view = item !== undefined || q.get("view") === "activity" ? "activity" : "messages";
       const limit = num("limit", 50, 100);
       const maxChars = num("maxChars", 20_000, 50_000);
       const session = q.get("session") ?? undefined;
       // A chat session's conversation is its timeline.
       const chat = run.node.sessionMode === "chat" && (!session || session === NODE_ID);
       const page = await write(() => (chat ? store.readChat : store.readTimeline)(run.id, {
-        after: Number(q.get("after") ?? 0) || 0, limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
+        after: item !== undefined ? item - 1 : Number(q.get("after") ?? 0) || 0, limit: item !== undefined ? 1 : limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
       }));
-      const items = page.items.map((i) => (i.text.length > maxChars
-        ? { ...i, text: i.text.slice(0, maxChars), cut: { shown: maxChars, length: i.text.length } } : i));
+      if (item !== undefined && page.items[0]?.position !== item) throw new HttpError(404, "history item not found");
+      if (item !== undefined && textOffset > page.items[0]!.text.length) throw new HttpError(400, "textOffset exceeds item length");
+      const items = page.items.map((i) => {
+        const offset = item !== undefined ? textOffset : 0;
+        const end = Math.min(i.text.length, offset + maxChars);
+        return {...i, text: i.text.slice(offset, end), textOffset: offset, nextTextOffset: end < i.text.length ? end : null,
+          ...(end < i.text.length ? {cut:{shown:end-offset,length:i.text.length}} : {})};
+      });
       const last = items.at(-1)?.position;
       reply(res, 200, {
         run: { id: run.id, name: run.name, role: run.role, agent: run.node.agent, status: run.node.status, activity: run.node.activity ?? null },
@@ -992,7 +1001,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (cleanupRoute) {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
       const job = cleanup.get(cleanupRoute[1]!);
-      if (!job) throw new HttpError(404, "unknown cleanup job");
+      if (!job) throw new HttpError(404, "cleanup job is unavailable, possibly after restart; inspect the worktree and rerun clean for the same run (dirty worktrees remain protected)");
       reply(res, 200, job); return;
     }
     const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review|switch))?$/.exec(path);
