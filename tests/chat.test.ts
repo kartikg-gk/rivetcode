@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -37,6 +38,7 @@ afterEach(async () => {
   await daemon?.stop();
   daemon = undefined;
   delete process.env.RIVET_CHAT_COMMAND;
+  delete process.env.RIVET_TEST_STREAM_GATE;
   await removeRepo(repo);
   await removeRepo(data);
 });
@@ -64,6 +66,8 @@ const said = (items: Item[], text: string) => items.some((i) => i.kind === "assi
 describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat session", (agent, protocol) => {
   it("keeps its conversation, takes messages in each mode, and asks Rivet before what it may not run", async () => {
     process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, protocol]);
+    const streamGate = join(data, "stream-observed");
+    process.env.RIVET_TEST_STREAM_GATE = streamGate;
     daemon = await startDaemon({
       data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
       agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }),
@@ -76,7 +80,10 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     const watcher = (async () => {
       while (watching) {
         const t = await timeline(runId).catch(() => [] as Item[]);
-        if (t.some((i) => (i as Item & { streaming?: boolean }).streaming && i.text === "echo: ")) sawStreaming = true;
+        if (!sawStreaming && t.some((i) => (i as Item & { streaming?: boolean }).streaming && i.text === "echo: ")) {
+          sawStreaming = true;
+          await writeFile(streamGate, "observed");
+        }
         await new Promise((r) => setTimeout(r, 30));
       }
     })();

@@ -4,6 +4,7 @@
 //   ASK  - ask permission for "npm publish" first     RIVET - ask for "rivet status" (allowed)
 //   SLOW - take 3 s, so a message can steer or interrupt it
 import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
 
 const protocol = process.argv[2];
 const acp = protocol === "acp";
@@ -15,6 +16,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let active = null; // { id, steered: [], cancelled }
 let turns = 0;
 let threadId = "th1";
+
+async function partialReplyObserved(t) {
+  const gate = process.env.RIVET_TEST_STREAM_GATE;
+  if (!gate || t.id !== "turn-1") return sleep(200);
+  // Let the integration reader prove it saw partial output before completing it.
+  const deadline = Date.now() + 15000;
+  while (!existsSync(gate)) {
+    if (Date.now() > deadline) throw new Error("partial reply was not observed");
+    await sleep(25);
+  }
+}
 
 function update(u) { out({ method: "session/update", params: { sessionId: "s1", update: u } }); }
 
@@ -39,14 +51,14 @@ async function turn(text, finish) {
     update({ sessionUpdate: "tool_call_update", toolCallId: `tc${turns}`, rawInput: { command: "ls" }, _meta: { claudeCode: { toolName: "Bash" } } });
     update({ sessionUpdate: "tool_call_update", toolCallId: `tc${turns}`, status: "completed", rawOutput: "a.txt" });
     update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(0, 6) } });
-    await sleep(200);
+    await partialReplyObserved(t);
     update({ sessionUpdate: "agent_message_chunk", messageId: `m${turns}`, content: { type: "text", text: said.slice(6) } });
     update({ sessionUpdate: "usage_update", used: 1000 * turns, size: 200000 });
   } else {
     out({ method: "item/started", params: { threadId, turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "inProgress" } } });
     out({ method: "item/completed", params: { threadId, turnId: t.id, item: { type: "commandExecution", id: `c${turns}`, command: "ls", commandActions: [{ command: "ls" }], status: "completed", aggregatedOutput: "a.txt" } } });
     out({ method: "item/agentMessage/delta", params: { threadId, turnId: t.id, itemId: `m${turns}`, delta: said.slice(0, 6) } });
-    await sleep(200);
+    await partialReplyObserved(t);
     out({ method: "item/agentMessage/delta", params: { threadId, turnId: t.id, itemId: `m${turns}`, delta: said.slice(6) } });
     out({ method: "item/completed", params: { threadId, turnId: t.id, item: { type: "agentMessage", id: `m${turns}`, text: said } } });
     out({ method: "thread/tokenUsage/updated", params: { threadId, turnId: t.id, tokenUsage: { total: { totalTokens: 150 * turns, inputTokens: 100 * turns, cachedInputTokens: 40 * turns, outputTokens: 50 * turns }, last: { totalTokens: 1000 * turns }, modelContextWindow: 200000 } } });
