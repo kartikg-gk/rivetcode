@@ -31,8 +31,8 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
 }
 
 // Removing or pruning rewrites a repo's shared worktree records while other git commands
-// read them, so teardown is queued per repo inside this process. Creates stay parallel:
-// measured, they never failed alongside each other or a queued teardown.
+// read them. Queue creation and teardown together per repo inside this process so an
+// add cannot inspect another registration while remove/prune is changing it.
 const queues = new Map<string, Promise<unknown>>();
 
 async function withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
@@ -58,8 +58,8 @@ export function createWorktree(o: {
   branch: string;
   from: string;
 }): Promise<Worktree> {
-  // Creates run in parallel; only teardown (remove, prune) takes the per-repo lock.
-  return create(o);
+  // Creation reads the shared registration directory too.
+  return withRepoLock(o.repo, () => create(o));
 }
 
 async function create(o: { repo: string; path: string; branch: string; from: string }): Promise<Worktree> {
@@ -78,11 +78,11 @@ async function create(o: { repo: string; path: string; branch: string; from: str
       // A record left by a worktree deleted by hand blocks its path. Pruning only
       // then keeps the usual create to one git call instead of two.
       if (!(e instanceof GitError) || !/already registered|missing but/i.test(e.stderr)) throw e;
-      await pruneWorktrees(o.repo);
+      await prune(o.repo);
       await git(["worktree", "add", path, o.branch], o.repo);
     }
   } catch (e) {
-    await pruneWorktrees(o.repo).catch(() => {});
+    await prune(o.repo).catch(() => {});
     await git(["branch", "-D", o.branch], o.repo).catch(() => {});
     throw e;
   }
