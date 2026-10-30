@@ -64,7 +64,7 @@ export type Store = {
   // agent's conversation id (kept for every launch, so usage counts retries too).
   recordSignal(runId: string, nodeId: string, state: ActivityState | null, agentSessionId?: string): boolean;
   // A launch: idle until the agent's hooks say otherwise; it must prove its signal again.
-  markLaunched(runId: string, nodeId: string): void;
+  markLaunched(runId: string, nodeId: string, active?: boolean): void;
   // Every agent conversation a run's nodes have had.
   conversations(runId: string): { nodeId: string; agent: string; id: string }[];
   createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
@@ -698,7 +698,7 @@ export function openStore(data: string): Store {
   const insertConversation = db.prepare(`INSERT INTO conversations (run_id, node_id, agent, conversation_id, seen_at)
     SELECT run_id, id, agent, ?, ? FROM nodes WHERE run_id = ? AND id = ?
     ON CONFLICT DO NOTHING`);
-  const updateLaunched = db.prepare(`UPDATE nodes SET activity = 'idle', activity_at = ?, first_signal_at = NULL,
+  const updateLaunched = db.prepare(`UPDATE nodes SET activity = ?, activity_at = ?, first_signal_at = NULL,
     started_at = COALESCE(started_at, ?) WHERE run_id = ? AND id = ?`);
   const selectConversations = db.prepare(`SELECT node_id, agent, conversation_id FROM conversations
     WHERE run_id = ? ORDER BY seen_at, node_id`);
@@ -855,9 +855,9 @@ export function openStore(data: string): Store {
       return found;
     },
 
-    markLaunched(runId, nodeId) {
+    markLaunched(runId, nodeId, active = false) {
       const now = new Date().toISOString();
-      updateLaunched.run(now, now, runId, nodeId);
+      updateLaunched.run(active ? "active" : "idle", now, now, runId, nodeId);
       logEvent(runId, nodeId, "launched");
     },
 

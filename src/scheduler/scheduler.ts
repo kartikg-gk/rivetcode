@@ -245,7 +245,7 @@ export function createScheduler(d: SchedulerDeps) {
     // A chat's host records its own conversation.
     if (prompt !== undefined && !chat) await note(run.id, NODE_ID, [{ kind: o.resume ? "message" : "prompt", text: prompt }]);
     if (!chat) followStream(run.id, NODE_ID, sessionId, node.agent, headless);
-    await d.write(() => d.store.markLaunched(run.id, node.id));
+    await d.write(() => d.store.markLaunched(run.id, node.id, !headless && !chat && agent.signals));
     await deliverQueued(run.id);
     return launchId;
   }

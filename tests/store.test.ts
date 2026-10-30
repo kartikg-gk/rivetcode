@@ -324,3 +324,8 @@ describe("timeline", () => {
     expect(store.listProjects()).toEqual([sampleRun().project]);
   });
 });
+
+
+it("keeps a signaled terminal active until its first idle hook instead of reusing startup idle",()=>{
+ const s=openStore(data);try{s.saveRun(sessionRun(data));s.markLaunched("r1","agent",true);expect(s.loadRun("r1").node.activity).toBe("active");s.recordSignal("r1","agent","idle");expect(s.loadRun("r1").node.activity).toBe("idle");}finally{s.close();}
+});
