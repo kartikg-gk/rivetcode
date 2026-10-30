@@ -144,3 +144,27 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     expect(messages.every((i) => ["prompt", "message", "assistant"].includes(i.kind))).toBe(true);
   }, 60_000);
 });
+
+
+describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s chat worker", (agent, protocol) => {
+  it("flushes the final reply and receipt before stopping after a done report", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, protocol]);
+    daemon = await startDaemon({data, runFile:join(data,"running.json"), port:0, agents:name=>({...getAgent("fake"),name,binary:"unused"})});
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, {key:"session.mode",value:"chat"});
+    const runId=(await api("POST","/api/v1/runs",{repo,task:"initial",agent})).json.runId;
+    await until("initial idle",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="idle" && (await timeline(runId)).some(i=>i.kind==="assistant" && !(i as Item & {streaming?:boolean}).streaming));
+    await api("POST",`/api/v1/sessions/${runId}-agent/send`,{message:"SLOW final receipt marker",mode:"queue"});
+    await until("active final turn",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="active");
+    expect((await api("POST","/api/v1/reports",{sessionId:`${runId}-agent`,kind:"done",message:"finished"})).status).toBeLessThan(300);
+    await until("done",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.status==="done");
+    const final=await timeline(runId);
+    expect(final.filter(i=>i.kind==="assistant"&&i.text==="echo: SLOW final receipt marker")).toHaveLength(1);
+    expect(final.filter(i=>i.kind==="message"&&i.text==="SLOW final receipt marker")).toHaveLength(1);
+    expect(final.some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
+  },30000);
+});
+
+
+it("escalates a timed-out completion without publishing or replaying consumed guidance",async()=>{
+ process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"session.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("active",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="active");await api("POST","/api/v1/reports",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
+},30000);

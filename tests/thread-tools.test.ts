@@ -293,8 +293,8 @@ describe("conversation recovery and branch lifecycle", () => {
 
 it("queues a wake after timeout while the caller is offline",async()=>{
   const s=await seed();s.saveRun(sessionRun(data!,{id:"r2"}));
-  s.updateNode("r1","agent",{status:"running"});
   daemon=await startDaemon({data:data!,runFile:join(data!,"running.json"),port:0});
+  s.updateNode("r1","agent",{status:"running"});
   const response=await fetch(`http://127.0.0.1:${daemon.port}/api/v1/runs/r1/wait?scope=task&timeoutMs=0&wakeSession=r2-agent`);
   expect(response.status).toBe(200);expect(await response.json()).toMatchObject({timedOut:true,next:expect.any(String)});
   s.updateNode("r1","agent",{status:"done"});
@@ -358,4 +358,12 @@ it("reconciles ACP gaps and partial replies without renumbering existing history
  expect(items.filter(i=>i.text==="recover me")).toHaveLength(1);expect(items.filter(i=>i.text==="missing later answer")).toHaveLength(1);
  expect(items.find(i=>i.text==="recovered answer")).toMatchObject({position:before});
  expect(items.find(i=>i.text==="recovered answer")?.streaming).not.toBe(true);
+});
+
+
+it("recovers an inherited long-item tail through MCP and CLI and offers a stable boundary after large-history refusal",async()=>{
+ const s=await seed();const long="start "+"bounded context ".repeat(5000)+" TAIL_RECOVERED";exchange(s,"r1","long-turn",long);const position=s.readChat("r1",{limit:20}).items.find(i=>i.text===long)!.position;const child=forkConversation(s,"r1",{at:position});daemon=await startDaemon({data:data!,runFile:join(data!,"running.json"),port:0});
+ const env={RIVET_RUN_FILE:join(data!,"running.json"),RIVET_DATA_DIR:data!,RIVET_SESSION_ID:"r1-agent",RIVET_NO_AUTOSTART:"1"};const call=toolCaller(env,process.cwd());let offset=0,whole="";for(;;){const reply:any=await call("rivet_read",{run:child.runId,item:position,textOffset:offset,maxChars:4000});const item=reply.history.items[0];whole+=item.text;if(item.nextTextOffset===null)break;offset=item.nextTextOffset;}expect(whole).toBe(long);
+ const lines:string[]=[];const result=await runCli(["read",child.runId,"--item",String(position),"--text-offset",String(long.length-20)],{env,cwd:process.cwd(),readStdin:async()=>"",out:x=>lines.push(x),err:x=>lines.push(x)});expect(result).toBe(0);expect(lines.join("\n")).toContain("TAIL_RECOVERED");
+ s.recordChat("r1","agent",Array.from({length:5001},(_,i)=>({type:"message" as const,itemId:"overflow-"+i,role:"assistant" as const,text:"entry "+i})));expect(()=>forkConversation(s,"r1",{})).toThrow(/choose an earlier completed reply/);expect(forkConversation(s,"r1",{at:2}).position).toBe(2);
 });

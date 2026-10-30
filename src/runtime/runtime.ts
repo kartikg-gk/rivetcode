@@ -217,12 +217,14 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
   }
 
   function spawnTerminal(opts: StartOptions, p: Proc, exited: (code: number | null) => void): Handle {
+    const terminalEnv = mergeEnv(inheritedEnv(), opts.env);
+    if (!terminalEnv.TERM || terminalEnv.TERM === "dumb") terminalEnv.TERM = "xterm-256color";
     const term = loadPty()!.spawn(opts.argv[0]!, opts.argv.slice(1), {
       name: "xterm-256color",
       cols: opts.terminal!.cols,
       rows: opts.terminal!.rows,
       cwd: opts.workspace,
-      env: mergeEnv(inheritedEnv(), opts.env),
+      env: terminalEnv,
     });
     term.onData((data) => { if (p.alive) record(p, data); });
     term.onExit(({ exitCode }) => exited(exitCode));

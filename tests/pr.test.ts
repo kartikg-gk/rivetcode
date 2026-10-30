@@ -51,13 +51,13 @@ function reviewerAgent(): Agent {
   };
 }
 
-async function start(config: Record<string, string> = {}): Promise<void> {
+async function start(config: Record<string, string> = {}, rapid = false): Promise<void> {
   errors = [];
   daemon = await startDaemon({
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: 150, onError: (e) => errors.push(e),
+    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: rapid ? 1 : 150, onError: (e) => errors.push(e),
     // "claude" stands for a reviewer here (review.agent): it runs reviewerScript.
     agents: (name) => (name === "claude" ? reviewerAgent() : getAgent("fake")),
-    github: async () => githubClient({ repo: "o/r", token: "t0ken", api: gh.api }),
+    github: async () => { const client=githubClient({ repo: "o/r", token: "t0ken", api: gh.api }); return rapid ? {...client, facts:async(n:number)=>{await new Promise(r=>setTimeout(r,50));return client.facts(n);}} : client; },
   });
   const project = repo.split(/[\\/]/).pop()!.toLowerCase().replace(/ /g, "-");
   for (const [key, value] of Object.entries(config)) await api("PUT", `/api/v1/projects/${encodeURIComponent(project)}/config`, { key, value });
@@ -350,4 +350,8 @@ describe("the reviewer", () => {
     expect((await api("POST", `/api/v1/runs/${runId}/review`)).json.error).toMatch(/already running/);
     expect((await reviewsOf(runId)).reviews[0]).toMatchObject({ trigger: "manual", status: "running" });
   });
+});
+
+it("coalesces overlapping feedback polls and drains them before closing storage",async()=>{
+ await start({pr:"auto","pr.feedback":"full"},true);const runId=await spawn();await until(()=>runOf(runId),r=>r.pr!==null);gh.comments[1]=[{commit_id:"sha1",path:"a.txt",line:1,body:"check the existing behavior"}];await until(()=>runOf(runId),r=>r.run.node.attempts===2);await new Promise(r=>setTimeout(r,300));expect((await runOf(runId)).run.node.attempts).toBe(2);await daemon!.stop();daemon=undefined;expect(errors).toEqual([]);
 });

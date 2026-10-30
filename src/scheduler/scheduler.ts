@@ -245,7 +245,7 @@ export function createScheduler(d: SchedulerDeps) {
     // A chat's host records its own conversation.
     if (prompt !== undefined && !chat) await note(run.id, NODE_ID, [{ kind: o.resume ? "message" : "prompt", text: prompt }]);
     if (!chat) followStream(run.id, NODE_ID, sessionId, node.agent, headless);
-    await d.write(() => d.store.markLaunched(run.id, node.id));
+    await d.write(() => d.store.markLaunched(run.id, node.id, !headless && !chat && agent.signals));
     await deliverQueued(run.id);
     return launchId;
   }
@@ -508,6 +508,11 @@ export function createScheduler(d: SchedulerDeps) {
     try { run = await load(runId); } catch { return; }
     // An orchestrator's exit ends nothing but its own conversation.
     if (run.role !== "worker") return;
+    if (chats.has(sessionId) && code !== 0) {
+      await transition(runId, "escalated", "Chat completion is uncertain: inspect provider history and current files before an explicit resume; pending messages were preserved and were not automatically replayed.");
+      await tellOrchestrator(run, `Worker ${runId} stopped with uncertain chat completion; inspect its history before resuming.`);
+      return;
+    }
     if (code === 0 || doneReported.has(sessionId)) {
       // Its partner is still at work: the worker's turn is not its finish. It is resumed
       // with the partner's result once that comes.
@@ -575,7 +580,10 @@ export function createScheduler(d: SchedulerDeps) {
     if (kind !== "done" || run.role !== "worker") return;
     const sessionId = sessionOf(run);
     doneReported.add(sessionId);
-    if (d.runtime.isAlive(sessionId)) await d.runtime.stop(sessionId);
+    if (d.runtime.isAlive(sessionId)) {
+      if (chats.has(sessionId)) await d.runtime.write(sessionId, JSON.stringify({type:"finish"}));
+      else await d.runtime.stop(sessionId);
+    }
   }
 
   // Stops an agent without treating its exit as a failure; resume or a restart relaunches it.
@@ -698,7 +706,15 @@ export function createScheduler(d: SchedulerDeps) {
   }
 
   // One look at the pull request: record where it stands and act once on new feedback.
-  async function checkPr(runId: string): Promise<string | null> {
+  const checkingPrs = new Map<string, Promise<string | null>>();
+  function checkPr(runId: string): Promise<string | null> {
+    if (shuttingDown) return Promise.resolve(null);
+    const existing = checkingPrs.get(runId); if (existing) return existing;
+    const work = track(checkPrOnce(runId)); checkingPrs.set(runId, work);
+    void work.finally(() => { if (checkingPrs.get(runId) === work) checkingPrs.delete(runId); }).catch(() => {});
+    return work;
+  }
+  async function checkPrOnce(runId: string): Promise<string | null> {
     if (!d.github) return null;
     const pr = await d.write(() => d.store.getPr(runId));
     if (!pr) return null;
@@ -713,6 +729,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (node.prStatus === "terminated") return node.prStatus;
     const github = await d.github(run);
     const facts = await github.facts(pr.number);
+    if (shuttingDown) return null;
     const status = prStatus(facts);
     await d.write(() => d.store.updateNode(runId, NODE_ID, { prStatus: status }));
     if (status === "merged") {
@@ -1072,6 +1089,12 @@ export function createScheduler(d: SchedulerDeps) {
       await launch(fresh, prompt);
       return;
     }
+    if (run.node.agent !== "fake" && !d.runtime.isAlive(sessionOf(run)) && (run.node.providerConversationId || run.node.agentSessionId)) {
+      if (run.node.status !== "running") await transition(runId, "running");
+      await d.write(() => d.store.updateNode(runId, NODE_ID, {finishedAt:null}));
+      await launch(await load(runId), "The user explicitly resumed this interrupted work. Inspect current files and provider history before repeating any possibly completed action.", {resume:true});
+      return;
+    }
     if (run.node.status === "escalated" || run.node.status === "failed" || run.node.status === "pending") {
       await runSession(runId, run.node.summary).catch(report);
       return;
@@ -1111,6 +1134,10 @@ export function createScheduler(d: SchedulerDeps) {
     if (node.finishedAt) {
       await track(workFinished(runId));
     } else if (!d.runtime.isAlive(sessionOf(run))) {
+      if (node.agent !== "fake") {
+        await transition(runId, "escalated", "Interrupted by daemon restart; delivery may be uncertain. Inspect current files and history, then explicitly resume. No pending instruction was automatically replayed.");
+        return;
+      }
       const note = "Rivet was restarted while you worked; continue from the current state of the worktree.";
       await launch(run, workerPrompt(run, note)).catch(report);
     }

@@ -213,3 +213,14 @@ describe("daemon routes", () => {
     }
   });
 });
+
+
+it("pages an entire long item without skipping its tail and validates offsets",async()=>{
+ const s=openStore(data);const r=run();r.node.sessionMode="chat";s.saveRun(r);const text="prefix "+"long history ".repeat(6000)+" UNIQUE_TAIL";s.recordChat("r1","agent",[{type:"message",itemId:"long",role:"assistant",text}]);const position=s.readChat("r1",{limit:1}).items[0]!.position;s.close();await start();
+ let offset=0,recovered="";for(;;){const response=await fetch(url(`/api/v1/runs/r1/timeline?item=${position}&textOffset=${offset}&maxChars=4000`));expect(response.status).toBe(200);const page=await response.json();const item=page.items[0];recovered+=item.text;if(item.nextTextOffset===null)break;expect(item.nextTextOffset).toBeGreaterThan(offset);offset=item.nextTextOffset;}expect(recovered).toBe(text);
+ expect((await fetch(url("/api/v1/runs/r1/timeline?textOffset=3"))).status).toBe(400);expect((await fetch(url("/api/v1/runs/r1/timeline?item=999"))).status).toBe(404);
+});
+
+it("holds interrupted native workers on restart without replaying their pending messages",async()=>{
+ const s=openStore(data);const r=run();r.node.sessionMode="chat";r.node.status="running";r.node.attempts=1;r.node.providerConversationId="saved-provider";s.saveRun(r);s.queueMessage("r1","agent","possibly consumed",undefined,"queue");s.close();await start();await daemon!.idle();const reopened=openStore(data);try{expect(reopened.loadRun("r1").node).toMatchObject({status:"escalated",summary:expect.stringContaining("uncertain")});expect(reopened.undeliveredMessages("r1","agent")).toHaveLength(1);}finally{reopened.close();}
+});
