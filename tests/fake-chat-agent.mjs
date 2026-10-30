@@ -44,7 +44,14 @@ async function turn(text, finish) {
     allowed = acp ? answer.outcome?.optionId !== "no" : answer.decision !== "decline";
     if (!acp) out({ method: "serverRequest/resolved", params: { threadId, requestId: 100 + 0 } });
   }
-  if (text.includes("SLOW")) for (let i = 0; i < (text.includes("DRAIN_TIMEOUT") ? 300 : 30) && !t.cancelled; i++) await sleep(100);
+  if (process.env.RIVET_TEST_STREAM_GATE && ["SLOW work", "SLOW long job"].includes(text)) {
+    // Keep the intended turn open until the reader sends its steer or interrupt.
+    const deadline = Date.now() + 15000;
+    while (text === "SLOW work" ? t.steered.length === 0 && !t.cancelled : !t.cancelled) {
+      if (Date.now() > deadline) throw new Error("turn control was not received");
+      await sleep(25);
+    }
+  } else if (text.includes("SLOW")) for (let i = 0; i < (text.includes("DRAIN_TIMEOUT") ? 300 : 30) && !t.cancelled; i++) await sleep(100);
   const said = `echo: ${text}${t.steered.length ? ` + ${t.steered.join(" + ")}` : ""}${allowed ? "" : " (declined)"}`;
   if (acp) {
     update({ sessionUpdate: "tool_call", toolCallId: `tc${turns}`, title: "Terminal", kind: "execute", status: "pending", rawInput: {}, _meta: { claudeCode: { toolName: "Bash" } } });
