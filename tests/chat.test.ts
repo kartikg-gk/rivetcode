@@ -144,3 +144,22 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     expect(messages.every((i) => ["prompt", "message", "assistant"].includes(i.kind))).toBe(true);
   }, 60_000);
 });
+
+
+describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s chat worker", (agent, protocol) => {
+  it("flushes the final reply and receipt before stopping after a done report", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, protocol]);
+    daemon = await startDaemon({data, runFile:join(data,"running.json"), port:0, agents:name=>({...getAgent("fake"),name,binary:"unused"})});
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, {key:"session.mode",value:"chat"});
+    const runId=(await api("POST","/api/v1/runs",{repo,task:"initial",agent})).json.runId;
+    await until("initial idle",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="idle" && (await timeline(runId)).some(i=>i.kind==="assistant" && !(i as Item & {streaming?:boolean}).streaming));
+    await api("POST",`/api/v1/sessions/${runId}-agent/send`,{message:"SLOW final receipt marker",mode:"queue"});
+    await until("active final turn",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="active");
+    expect((await api("POST","/api/v1/reports",{sessionId:`${runId}-agent`,kind:"done",message:"finished"})).status).toBeLessThan(300);
+    await until("done",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.status==="done");
+    const final=await timeline(runId);
+    expect(final.filter(i=>i.kind==="assistant"&&i.text==="echo: SLOW final receipt marker")).toHaveLength(1);
+    expect(final.filter(i=>i.kind==="message"&&i.text==="SLOW final receipt marker")).toHaveLength(1);
+    expect(final.some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
+  },30000);
+});

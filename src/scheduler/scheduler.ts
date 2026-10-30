@@ -575,7 +575,10 @@ export function createScheduler(d: SchedulerDeps) {
     if (kind !== "done" || run.role !== "worker") return;
     const sessionId = sessionOf(run);
     doneReported.add(sessionId);
-    if (d.runtime.isAlive(sessionId)) await d.runtime.stop(sessionId);
+    if (d.runtime.isAlive(sessionId)) {
+      if (chats.has(sessionId)) await d.runtime.write(sessionId, JSON.stringify({type:"finish"}));
+      else await d.runtime.stop(sessionId);
+    }
   }
 
   // Stops an agent without treating its exit as a failure; resume or a restart relaunches it.
