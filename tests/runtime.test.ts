@@ -239,3 +239,8 @@ describe("terminal sessions", () => {
     expect(runtime.isAlive("r1-s")).toBe(false);
   });
 });
+
+
+it("gives an actual pseudo-terminal a usable TERM when its parent is dumb",async()=>{
+ const done=exited("r1-term");await runtime.start({sessionId:"r1-term",workspace:ws,argv:[process.execPath,"-e","console.log(process.env.TERM)"],env:{TERM:"dumb"},terminal:{cols:80,rows:24}});expect(await done).toBe(0);expect(runtime.output("r1-term",10)?.lines.join("\n")).toContain("xterm-256color");
+});

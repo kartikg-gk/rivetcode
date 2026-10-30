@@ -706,7 +706,15 @@ export function createScheduler(d: SchedulerDeps) {
   }
 
   // One look at the pull request: record where it stands and act once on new feedback.
-  async function checkPr(runId: string): Promise<string | null> {
+  const checkingPrs = new Map<string, Promise<string | null>>();
+  function checkPr(runId: string): Promise<string | null> {
+    if (shuttingDown) return Promise.resolve(null);
+    const existing = checkingPrs.get(runId); if (existing) return existing;
+    const work = track(checkPrOnce(runId)); checkingPrs.set(runId, work);
+    void work.finally(() => { if (checkingPrs.get(runId) === work) checkingPrs.delete(runId); }).catch(() => {});
+    return work;
+  }
+  async function checkPrOnce(runId: string): Promise<string | null> {
     if (!d.github) return null;
     const pr = await d.write(() => d.store.getPr(runId));
     if (!pr) return null;
@@ -721,6 +729,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (node.prStatus === "terminated") return node.prStatus;
     const github = await d.github(run);
     const facts = await github.facts(pr.number);
+    if (shuttingDown) return null;
     const status = prStatus(facts);
     await d.write(() => d.store.updateNode(runId, NODE_ID, { prStatus: status }));
     if (status === "merged") {
