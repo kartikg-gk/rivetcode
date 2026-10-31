@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { mkdir, readdir, realpath, rm, rmdir } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { git, GitError } from "./git.js";
@@ -133,9 +134,22 @@ export function pruneWorktrees(repo: string): Promise<void> {
   return withRepoLock(repo, () => prune(repo));
 }
 
+class RemovalSettlingError extends WorktreeError {}
+
 // Never passes --force: a dirty worktree may hold an agent's only copy of its work.
 export function removeWorktree(data: string, repo: string, path: string): Promise<void> {
-  return withRepoLock(repo, () => remove(data, repo, path));
+  return withRepoLock(repo, async () => {
+    const deadline = Date.now() + 8000;
+    for (;;) {
+      try { return await remove(data, repo, path); }
+      catch (e) {
+        if (!(e instanceof RemovalSettlingError)) throw e;
+        if (Date.now() >= deadline) throw new WorktreeError(
+          `cleanup has not settled for ${path}; inspect and preserve remaining files, then retry clean; refusing to force deletion`);
+        await delay(100);
+      }
+    }
+  });
 }
 
 async function remove(data: string, repo: string, path: string): Promise<void> {
@@ -155,7 +169,17 @@ async function remove(data: string, repo: string, path: string): Promise<void> {
     return;
   }
   // Checked first, so a refused worktree keeps its links.
-  if (await isDirty(full)) throw new DirtyWorktreeError(full);
+  let dirty: boolean;
+  try { dirty = await isDirty(full); }
+  catch (e) {
+    if (!existsSync(full) || (e instanceof GitError && /not a git repository|not a working tree|cannot change to/i.test(e.stderr))) {
+      // A previous Git process may still be removing this registered checkout.
+      // Start validation again after it settles; never delete unknown contents here.
+      throw new RemovalSettlingError(`worktree removal is still settling: ${full}`);
+    }
+    throw e;
+  }
+  if (dirty) throw new DirtyWorktreeError(full);
   // Links come out before git deletes anything: git worktree remove on Windows follows a
   // junction and empties the folder it points at.
   await unlinkAll(full, await recordedLinks(full));

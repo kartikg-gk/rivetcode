@@ -200,6 +200,28 @@ describe("removeWorktree", () => {
 });
 
 describe("removeWorktree after a partial removal", () => {
+  it("waits for an interrupted removal to settle and prunes its registration", async () => {
+    const path = wtPath("settling", "root");
+    await createWorktree({ repo, path, branch: "rivet/settling/root", from: "main" });
+    await rm(join(path, ".git"));
+    const finish = new Promise<void>((resolve, reject) => {
+      setTimeout(() => { void rm(path, { recursive: true }).then(resolve, reject); }, 250);
+    });
+    await removeWorktree(data, repo, path);
+    await finish;
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo)).map(w => w.path)).toEqual([resolve(repo)]);
+  });
+
+  it("preserves a broken checkout that never settles with an actionable error", async () => {
+    const path = wtPath("broken", "root");
+    await createWorktree({ repo, path, branch: "rivet/broken/root", from: "main" });
+    await rm(join(path, ".git"));
+    await writeFile(join(path, "keep.txt"), "preserve me");
+    await expect(removeWorktree(data, repo, path)).rejects.toThrow(/inspect and preserve remaining files/);
+    expect(existsSync(join(path, "keep.txt"))).toBe(true);
+    expect(existsSync(join(repo, "README.txt"))).toBe(true);
+  });
   it("cleans up an empty leftover directory git no longer tracks", async () => {
     const path = wtPath("r1", "root");
     await createWorktree({ repo, path, branch: "rivet/r1/root", from: "main" });
