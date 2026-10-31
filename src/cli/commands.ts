@@ -43,7 +43,7 @@ const USAGE = `usage: rivet <command>
   compact <run>                       request native compaction when idle without pending work
   recovery status | journal [--after <n>] [--limit <n>]
   recovery snapshot <new file> | rebuild <new database> [--through <sequence>]
-  search <query> [--project <id>] [--limit <n>] [--all]
+  search <query> [--project <id>] [--limit <n>] [--cursor <nextCursor>] [--all]
                                         find sessions by metadata and recorded conversation text
   wait <run> [--scope turn|task] [--turn <id>] [--timeout <ms>]
                                         bounded wait for completion (default latest turn, 30000 ms)
@@ -962,9 +962,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         io.out(JSON.stringify(await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(args[0]!)}/transfers`, undefined, COMMAND_TIMEOUT_MS))); return 0;
       }
       case "search": {
-        const { flags, rest } = parseFlags(args, ["project", "limit"]);
+        const { flags, rest } = parseFlags(args, ["project", "limit", "cursor"]);
         if (!rest.length) throw new UsageError("search needs a query");
-        const q = new URLSearchParams({ query: rest.join(" "), limit: String(flags.get("limit") ?? 20) });
+        const q = new URLSearchParams({ query: rest.join(" ") });
+        if (flags.has("limit")) q.set("limit", String(flags.get("limit")));
+        if (typeof flags.get("cursor") === "string") q.set("cursor", flags.get("cursor") as string);
         const project = flags.get("project") ?? io.env.RIVET_PROJECT_ID ?? (flags.has("all") ? undefined : await projectOf(io).catch(() => undefined));
         if (typeof project === "string" && !flags.has("all")) q.set("project", project);
         const result = await callDaemon(io.env, "GET", `/api/v1/search?${q}`, undefined, COMMAND_TIMEOUT_MS);

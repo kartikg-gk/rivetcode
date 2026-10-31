@@ -103,7 +103,7 @@ export type Store = {
   // Every project that has runs.
   listProjects(): string[];
   // A run's state changes after a position, oldest first.
-  searchRuns(query: string, o: { project?: string; limit: number }): { runId: string; project: string; title: string; source: string; snippet: string; position?: number }[];
+  searchRuns(query: string, o: { project?: string; limit: number; offset?: number; pageSize?: number }): { runId: string; project: string; title: string; source: string; snippet: string; position?: number; history: string; branchId?: string }[];
   waitTurn(runId: string, turn?: string): { id: string; state: string } | undefined;
   readEvents(runId: string, o: { after?: number; limit: number }): RunEvent[];
   // Folds a chat session's events into its conversation; returns what they mean for the
@@ -1101,43 +1101,74 @@ export function openStore(data: string): Store {
     searchRuns(query, o) {
       const q = query.trim().toLowerCase();
       if (!q) return [];
-      const limit = Math.min(50, Math.max(1, o.limit));
-      const metadataLimit = limit > 1 ? limit - Math.max(1, Math.floor(limit / 5)) : limit;
+      const limit = Math.min(51, Math.max(1, o.limit));
+      const pageSize = Math.min(50, Math.max(1, o.pageSize ?? Math.min(limit, 50)));
+      const metadataQuota = pageSize > 1 ? pageSize - Math.max(1, Math.floor(pageSize / 5)) : 1;
+      const messageQuota = Math.max(1, pageSize - metadataQuota);
       const indexed = Array.from(q).length >= 3 && !q.includes('\0');
-      const phrase = '"' + q.replace(/"/g, '""') + '"';
-      const messageFilter = indexed ? "AND m.rowid IN (SELECT rowid FROM chat_search WHERE chat_search MATCH ? ORDER BY rowid DESC LIMIT 10000)" : "AND m.rowid >= (SELECT coalesce(max(rowid),0) - 20000 FROM chat_messages)";
-      const timelineFilter = indexed ? "AND t.id IN (SELECT rowid FROM timeline_search WHERE timeline_search MATCH ? ORDER BY rowid DESC LIMIT 10000)" : "AND t.id >= (SELECT coalesce(max(id),0) - 20000 FROM timeline)";
-      const project = o.project ? 'AND r.project = ?' : '';
-      const args = o.project ? [o.project] : [];
-      type Hit = { runId: string; project: string; title: string; source: string; snippet: string; position?: number };
-      const hits = db.prepare(`SELECT r.id AS runId, r.project, r.name AS title, 'metadata' AS source,
-        r.name || ' ' || r.task || ' branch: ' || n.branch || ' project: ' || r.project || coalesce(' PR: #' || p.number || ' ' || p.url, '') AS snippet FROM runs r JOIN nodes n ON n.run_id = r.id
-        LEFT JOIN pull_requests p ON p.run_id = r.id
-        WHERE instr(lower(r.name || ' ' || r.task || ' ' || n.branch || ' ' || r.project || ' ' || coalesce('#' || p.number || ' ' || p.url, '')), ?) > 0
-        ${project} ORDER BY r.created_at DESC LIMIT ?`).all(q, ...args, metadataLimit) as Hit[];
-      if (hits.length < limit) {
-        const messages = db.prepare(`SELECT r.id AS runId, r.project, r.name AS title,
-          m.role AS source, m.text AS snippet, m.sequence AS position, m.created_at AS at
-          FROM chat_messages m JOIN chat_conversations c ON c.id = m.conversation_id
-          JOIN runs r ON r.id = c.run_id
-          WHERE c.session = 'agent' AND m.streaming = 0 AND instr(lower(m.text), ?) > 0 ${messageFilter} ${project}
-          UNION ALL
-          SELECT r.id, r.project, r.name, CASE WHEN t.kind = 'assistant' THEN 'assistant' ELSE 'user' END,
-          t.text, t.id, t.at FROM timeline t JOIN runs r ON r.id = t.run_id
-          JOIN nodes n ON n.run_id = r.id
-          WHERE n.session_mode <> 'chat' AND t.session = 'agent' AND t.kind IN ('prompt','message','assistant')
-          AND instr(lower(t.text), ?) > 0 ${timelineFilter} ${project}
-          ORDER BY at DESC LIMIT ?`).all(q, ...(indexed ? [phrase] : []), ...args, q, ...(indexed ? [phrase] : []), ...args, limit - hits.length) as Hit[];
-        hits.push(...messages);
-      }
-      return hits.map((h) => {
+      const messageFilter = indexed ? "AND m.rowid IN (SELECT rowid FROM chat_search WHERE chat_search MATCH @phrase)" : "";
+      const timelineFilter = indexed ? "AND t.id IN (SELECT rowid FROM timeline_search WHERE timeline_search MATCH @phrase)" : "";
+      type Hit = { runId: string; project: string; title: string; source: string; snippet: string; position: number | null; branchId: string | null; history: string };
+      const hits = db.prepare(`WITH prefixes AS (
+        SELECT f.run_id AS run_id, NULL AS branch_id, 'inherited' AS history, j.value AS item
+        FROM thread_forks f, json_each(f.data_json, '$.items') j
+        WHERE NOT EXISTS (SELECT 1 FROM conversation_branches b WHERE b.run_id=f.run_id AND b.active=1)
+        UNION ALL
+        SELECT b.run_id, b.id, 'inherited', j.value
+        FROM conversation_branches b, json_each(b.items) j WHERE b.active=1
+        UNION ALL
+        SELECT b.run_id, b.id, 'branch', j.value
+        FROM conversation_branches b, json_each(b.snapshot) j WHERE b.active=0
+      ), hits AS (
+        SELECT r.id AS runId, r.project, r.name AS title, 'metadata' AS source,
+          r.name || ' ' || r.task || ' branch: ' || n.branch || ' project: ' || r.project || coalesce(' PR: #' || p.number || ' ' || p.url, '') AS snippet,
+          NULL AS position, r.created_at AS at, NULL AS branchId, 'metadata' AS history, 0 AS category
+        FROM runs r JOIN nodes n ON n.run_id=r.id LEFT JOIN pull_requests p ON p.run_id=r.id
+        WHERE instr(lower(r.name || ' ' || r.task || ' ' || n.branch || ' ' || r.project || ' ' || coalesce('#' || p.number || ' ' || p.url, '')), @query)>0
+          AND (@project IS NULL OR r.project=@project)
+        UNION ALL
+        SELECT r.id, r.project, r.name, m.role, m.text, m.sequence, m.created_at, NULL, 'live', 1
+        FROM chat_messages m JOIN chat_conversations c ON c.id=m.conversation_id JOIN runs r ON r.id=c.run_id
+        WHERE c.session='agent' AND m.streaming=0 AND instr(lower(m.text),@query)>0
+          ${messageFilter} AND (@project IS NULL OR r.project=@project)
+        UNION ALL
+        SELECT r.id, r.project, r.name, CASE WHEN t.kind='assistant' THEN 'assistant' ELSE 'user' END,
+          t.text, t.id, t.at, NULL, 'live', 1
+        FROM timeline t JOIN runs r ON r.id=t.run_id JOIN nodes n ON n.run_id=r.id
+        WHERE n.session_mode<>'chat' AND t.session='agent' AND t.kind IN ('prompt','message','assistant')
+          AND instr(lower(t.text),@query)>0 ${timelineFilter} AND (@project IS NULL OR r.project=@project)
+        UNION ALL
+        SELECT r.id, r.project, r.name,
+          CASE WHEN json_extract(p.item,'$.kind')='assistant' THEN 'assistant' ELSE 'user' END,
+          json_extract(p.item,'$.text'), json_extract(p.item,'$.position'),
+          coalesce(json_extract(p.item,'$.at'),r.created_at), p.branch_id, p.history, 1
+        FROM prefixes p JOIN runs r ON r.id=p.run_id
+        WHERE json_extract(p.item,'$.kind') IN ('prompt','message','assistant')
+          AND coalesce(json_extract(p.item,'$.streaming'),0)=0
+          AND instr(lower(json_extract(p.item,'$.text')),@query)>0
+          AND (@project IS NULL OR r.project=@project)
+      ), numbered AS (
+        SELECT *, row_number() OVER (PARTITION BY category ORDER BY at DESC,runId,history,coalesce(branchId,''),coalesce(position,0) DESC,source) AS ordinal
+        FROM hits
+      ) SELECT runId,project,title,source,snippet,position,branchId,history FROM numbered
+      ORDER BY CASE WHEN category=0
+        THEN ((ordinal-1)/@metadataQuota)*@pageSize + ((ordinal-1)%@metadataQuota)
+        ELSE ((ordinal-1)/@messageQuota)*@pageSize + @metadataQuota + ((ordinal-1)%@messageQuota)
+      END, category,ordinal LIMIT @limit OFFSET @offset`).all({
+        '@query': q, '@project': o.project ?? null,
+        ...(indexed ? { '@phrase': '"' + q.replace(/"/g, '""') + '"' } : {}),
+        '@metadataQuota': metadataQuota, '@messageQuota': messageQuota, '@pageSize': pageSize,
+        '@limit': limit, '@offset': o.offset ?? 0,
+      }) as Hit[];
+      return hits.map(h => {
         const text = redact(h.snippet);
         const at = Math.max(0, text.toLowerCase().indexOf(q) - 80);
-        return { runId: h.runId, project: h.project, title: redact(h.title), source: h.source,
+        return { runId: h.runId, project: h.project, title: redact(h.title), source: h.source, history: h.history,
           snippet: `${at ? '…' : ''}${text.slice(at, at + 320)}${text.length > at + 320 ? '…' : ''}`,
-          ...(h.position === undefined ? {} : { position: h.position }) };
+          ...(h.position === null ? {} : { position: h.position }), ...(h.branchId ? { branchId: h.branchId } : {}) };
       });
     },
+
     readEvents(runId, o) {
       type Row = { id: number; node_id: string | null; type: string; data: string; at: string };
       return (db.prepare("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?").all(runId, o.after ?? 0, o.limit) as Row[])
@@ -1169,6 +1200,11 @@ export function openStore(data: string): Store {
         const turnRow = (providerTurnId?: string) => providerTurnId
           ? (db.prepare("SELECT id FROM chat_turns WHERE conversation_id = ? AND provider_turn_id = ?").get(c, providerTurnId) as { id: string } | undefined)?.id ?? null
           : null;
+        // State the partial-index predicate explicitly: SQLite cannot infer that a
+        // bound provider item id is nonempty, otherwise large imports scan each prefix.
+        const namedMessage = db.prepare("SELECT id FROM chat_messages WHERE conversation_id=? AND provider_item_id=? AND provider_item_id<>''");
+        const emptyMessage = db.prepare("SELECT id FROM chat_messages WHERE conversation_id=? AND provider_item_id=''");
+        const messageRow = (itemId: string) => (itemId ? namedMessage.get(c, itemId) : emptyMessage.get(c)) as { id: string } | undefined;
         for (const e of events) {
           if (e.type === "conversation") {
             out.conversationId = e.id;
@@ -1199,7 +1235,7 @@ export function openStore(data: string): Store {
             }
           } else if (e.type === "message") {
             let text = redact(e.text);
-            if (e.role === "user" && !e.itemId.startsWith("rivet-") && !db.prepare("SELECT 1 FROM chat_messages WHERE conversation_id=? AND provider_item_id=?").get(c,e.itemId)) {
+            if (e.role === "user" && !e.itemId.startsWith("rivet-") && !messageRow(e.itemId)) {
               const hostPrompts = db.prepare("SELECT id,text FROM chat_messages WHERE conversation_id=? AND role='user' AND provider_item_id LIKE 'rivet-%' ORDER BY sequence").all(c) as {id:string;text:string}[];
               const host = hostPrompts.find(p=>text === p.text || text.endsWith("\n\n"+p.text));
               if (host) {
@@ -1207,7 +1243,7 @@ export function openStore(data: string): Store {
                 text = host.text;
               }
             }
-            const found = db.prepare("SELECT id FROM chat_messages WHERE conversation_id = ? AND provider_item_id = ?").get(c, e.itemId) as { id: string } | undefined;
+            const found = messageRow(e.itemId);
             const streaming = e.streaming ? 1 : 0;
             if (found) db.prepare("UPDATE chat_messages SET text = ?, streaming = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, streaming, now, found.id);
             else db.prepare(`INSERT INTO chat_messages (id, conversation_id, turn_id, sequence, role, origin, text, streaming, provider_item_id, created_at, updated_at)

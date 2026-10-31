@@ -1,4 +1,5 @@
 import { cleanupQueue } from "./cleanup.js";
+import { searchPage, SearchInputError } from "../search.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
 import { existsSync } from "node:fs";
 import { waitForRun } from "../scheduler/wait.js";
@@ -655,9 +656,15 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
       const q = new URL(req.url!, "http://x").searchParams;
       const query = q.get("query")?.trim();
-      const limit = Number(q.get("limit") ?? 20);
-      if (!query || query.length > 500 || !Number.isInteger(limit) || limit < 1 || limit > 50) throw new HttpError(400, "search needs query (1-500 characters) and limit (1-50)");
-      reply(res, 200, { untrusted: true, matches: await write(() => store.searchRuns(query, { limit, ...(q.get("project") ? { project: q.get("project")! } : {}) })) });
+      let page;
+      try {
+        page = await write(() => searchPage(store, query ?? "", {
+          ...(q.has("limit") ? { limit: Number(q.get("limit")) } : {}),
+          ...(q.has("cursor") ? { cursor: q.get("cursor")! } : {}),
+          ...(q.get("project") ? { project: q.get("project")! } : {}),
+        }));
+      } catch (e) { if (e instanceof SearchInputError) throw new HttpError(400, e.message); throw e; }
+      reply(res, 200, page);
       return;
     }
     const transferStatus = /^\/api\/v1\/runs\/([^/]+)\/transfers$/.exec(path);

@@ -1,3 +1,4 @@
+import { searchPage } from "../src/search.js";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -366,4 +367,65 @@ it("recovers an inherited long-item tail through MCP and CLI and offers a stable
  const env={RIVET_RUN_FILE:join(data!,"running.json"),RIVET_DATA_DIR:data!,RIVET_SESSION_ID:"r1-agent",RIVET_NO_AUTOSTART:"1"};const call=toolCaller(env,process.cwd());let offset=0,whole="";for(;;){const reply:any=await call("rivet_read",{run:child.runId,item:position,textOffset:offset,maxChars:4000});const item=reply.history.items[0];whole+=item.text;if(item.nextTextOffset===null)break;offset=item.nextTextOffset;}expect(whole).toBe(long);
  const lines:string[]=[];const result=await runCli(["read",child.runId,"--item",String(position),"--text-offset",String(long.length-20)],{env,cwd:process.cwd(),readStdin:async()=>"",out:x=>lines.push(x),err:x=>lines.push(x)});expect(result).toBe(0);expect(lines.join("\n")).toContain("TAIL_RECOVERED");
  s.recordChat("r1","agent",Array.from({length:5001},(_,i)=>({type:"message" as const,itemId:"overflow-"+i,role:"assistant" as const,text:"entry "+i})));expect(()=>forkConversation(s,"r1",{})).toThrow(/choose an earlier completed reply/);expect(forkConversation(s,"r1",{at:2}).position).toBe(2);
+});
+
+describe("complete logical-history search", () => {
+  it("finds a fork's pinned prefix and preserved inactive branches with source identity", async () => {
+    const s = await seed();
+    const child = forkConversation(s, "r1", { at: 2 });
+    expect(s.searchRuns("original marker", { limit: 20 }).some(h => h.runId === child.runId && h.history === "inherited" && h.position === 2)).toBe(true);
+    const history = s.readChat("r1", { limit: 100 }).items;
+    s.changeBranch("r1", [], history);
+    exchange(s, "r1", "replacement", "replacement-only text");
+    const old = s.branches("r1").find(b => !b.active)!;
+    expect(s.searchRuns("original marker", { limit: 20 }).some(h => h.runId === "r1" && h.history === "branch" && h.branchId === old.id)).toBe(true);
+    expect(s.searchRuns("original marker", { project: "elsewhere", limit: 20 })).toEqual([]);
+    expect(s.searchRuns("replacement-only text", { limit: 20 }).some(h => h.runId === "r1" && h.history === "live")).toBe(true);
+  });
+
+  it("finds old indexed and short-query matches beyond former scan caps", async () => {
+    const s = await seed();
+    s.recordChat("r1", "agent", [{ type: "message", itemId: "oldest", role: "assistant", text: "zzsearch earliest retained reply" }]);
+    s.recordChat("r1", "agent", Array.from({ length: 21001 }, (_, i) => ({ type: "message" as const, itemId: `new-${i}`, role: "assistant" as const, text: `zzsearch later reply ${i}` })));
+    expect(s.searchRuns("zzsearch", { limit: 1, offset: 21001 })[0]?.snippet).toContain("earliest retained reply");
+    expect(s.searchRuns("zz", { limit: 1, offset: 21001 })[0]?.snippet).toContain("earliest retained reply");
+  }, 60000);
+
+  it("pages all hits and refuses cursors from other queries/projects or page sizes", async () => {
+    const s = await seed();
+    for (let i = 0; i < 7; i++) s.saveRun(sessionRun(data!, { id: `r${i + 2}`, task: "original marker" }));
+    let page = searchPage(s, "original marker", { project: "proj", limit: 2 });
+    expect(page.matches.some(h => h.source !== "metadata")).toBe(true);
+    const cursor = page.nextCursor!;
+    expect(() => searchPage(s, "different", { project: "proj", cursor })).toThrow(/another query/);
+    expect(() => searchPage(s, "original marker", { project: "elsewhere", cursor })).toThrow(/another query/);
+    expect(() => searchPage(s, "original marker", { project: "proj", limit: 3, cursor })).toThrow(/same search limit/);
+    expect(() => searchPage(s, "original marker", { cursor: "malformed" })).toThrow(/invalid search cursor/);
+    const hits = [...page.matches];
+    while (page.nextCursor) {
+      page = searchPage(s, "original marker", { project: "proj", cursor: page.nextCursor });
+      hits.push(...page.matches);
+    }
+    expect(hits).toHaveLength(9);
+    expect(new Set(hits.map(h => `${h.runId}:${h.source}:${h.position ?? 0}`)).size).toBe(9);
+  });
+
+  it("continues the same bounded search through MCP and CLI", async () => {
+    const s = await seed();
+    s.recordChat("r1", "agent", Array.from({ length: 5 }, (_, i) => ({ type: "message" as const, itemId: `page-${i}`, role: "assistant" as const, text: `page marker ${i}` })));
+    s.close(); store = undefined;
+    daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0 });
+    const env = { RIVET_DATA_DIR: data!, RIVET_RUN_FILE: join(data!, "running.json"), RIVET_NO_AUTOSTART: "1", RIVET_SESSION_ID: "r1-agent" };
+    const first = await toolCaller(env, process.cwd())("rivet_search", { query: "page marker", project: "proj", limit: 2 }) as { matches: { position: number }[]; nextCursor: string };
+    expect(first.matches).toHaveLength(2);
+    const lines: string[] = [];
+    const io: CliIo = { env, cwd: process.cwd(), readStdin: async () => "", out: line => lines.push(line), err: line => lines.push(line) };
+    expect(await runCli(["search", "page marker", "--project", "proj", "--cursor", first.nextCursor], io)).toBe(0);
+    const second = JSON.parse(lines.find(line => line.startsWith("{"))!);
+    expect(second.matches).toHaveLength(2);
+    expect(new Set([...first.matches, ...second.matches].map(h => h.position)).size).toBe(4);
+    const last = await toolCaller(env, process.cwd())("rivet_search", { query: "page marker", project: "proj", cursor: second.nextCursor }) as { matches: unknown[]; nextCursor: string | null };
+    expect(last.matches).toHaveLength(1);
+    expect(last.nextCursor).toBeNull();
+  });
 });
