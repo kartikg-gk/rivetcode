@@ -15,9 +15,9 @@ describe("panesPlan", () => {
   it("splits one Windows Terminal window", () => {
     expect(panesPlan({ platform: "win32", rivet: "C:\\r\\rivet.cmd", runId: "r1", sessions, have: () => true })).toEqual({
       kind: "wt", file: "wt", args: [
-        "-w", "new", "new-tab", "--title", "api", "C:\\r\\rivet.cmd", "attach", "r1-root.1",
-        ";", "split-pane", "-V", "--title", "ui", "C:\\r\\rivet.cmd", "attach", "r1-root.2",
-        ";", "split-pane", "-H", "--title", "docs", "C:\\r\\rivet.cmd", "attach", "r1-root.3",
+        "-w", "new", "new-tab", "--title", "api", "cmd", "/k", "C:\\r\\rivet.cmd", "attach", "r1-root.1",
+        ";", "split-pane", "-V", "--title", "ui", "cmd", "/k", "C:\\r\\rivet.cmd", "attach", "r1-root.2",
+        ";", "split-pane", "-H", "--title", "docs", "cmd", "/k", "C:\\r\\rivet.cmd", "attach", "r1-root.3",
       ],
     });
   });

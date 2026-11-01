@@ -896,6 +896,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const issueRef = optionalString(payload.issue, "issue");
       let spec: TaskSpec | undefined;
       try { spec = checkSpec(payload.spec); } catch (e) { throw new HttpError(400, (e as Error).message); }
+      if (payload.terminal === true) spec = { ...spec, terminal: true };
       if (typeof payload.repo !== "string" || (typeof payload.task !== "string" && issueRef === undefined)) {
         throw new HttpError(400, "repo and task must be strings");
       }

@@ -3,6 +3,8 @@ import { parse as parseYaml } from "yaml";
 // What a task file can ask of one worker beyond its task: its own definition of done,
 // limits that stop it, and guardrails on what it may change and run.
 export type TaskSpec = {
+  // Always in the agent's own terminal, whatever the project's session mode.
+  terminal?: boolean;
   // Replaces the project's check for this task; the project's tests still run.
   doneWhen?: string;
   // Stop and escalate once the worker has worked this long (from its first start)...

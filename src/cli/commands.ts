@@ -31,6 +31,7 @@ export type CliIo = {
 };
 
 const USAGE = `usage: rivet <command>
+  (no command)                          open Claude and Codex side by side in this repo
   spawn [--name <label>] [--agent <name>] [--model <id>] [--issue <n|owner/repo#n|url>] [--repo <dir>] [--base <branch>] [<task>]
                                         start a worker on a task in its own worktree
   run <tasks.yaml|tasks.json> [--dry-run] [--repo <dir>]
@@ -824,6 +825,31 @@ async function attach(args: string[], io: CliIo): Promise<number> {
 }
 
 // Every running agent side by side (orchestrator and workers alike).
+// Bare "rivet": Claude and Codex side by side in this repo, each in its own real terminal,
+// ready to talk to. Sessions already open here are shown again, not started twice.
+async function home(io: CliIo): Promise<number> {
+  const repo = await repoTop(resolve(io.cwd, "."));
+  const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as {
+    runs: { id: string; project: string; role: string; agent: string; live: boolean }[];
+  };
+  const project = defaultProjectId(repo);
+  const sessions: { id: string; title: string }[] = [];
+  for (const agent of ["claude", "codex"]) {
+    let id = runs.find((r) => r.live && r.project === project && r.role === "orchestrator" && r.agent === agent)?.id;
+    if (!id) {
+      try {
+        id = (await callDaemon(io.env, "POST", "/api/v1/runs", { repo, task: "Say in one line that you are ready, then wait for the user.", name: agent, role: "orchestrator", agent, terminal: true }, RUN_TIMEOUT_MS) as { runId: string }).runId;
+      } catch (e) {
+        io.err(`${agent} did not start: ${(e as Error).message}`);
+        continue;
+      }
+    }
+    sessions.push({ id: `${id}-agent`, title: agent });
+  }
+  if (sessions.length === 0) return 1;
+  return showPanes(sessions, io);
+}
+
 async function panes(io: CliIo): Promise<number> {
   const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as {
     runs: { id: string; task: string; name: string; role: string; live: boolean }[];
@@ -833,6 +859,10 @@ async function panes(io: CliIo): Promise<number> {
     io.out("no agent is running right now");
     return 1;
   }
+  return showPanes(sessions, io);
+}
+
+async function showPanes(sessions: { id: string; title: string }[], io: CliIo): Promise<number> {
   const runId = "rivet";
   const { panesPlan } = await import("./panes.js");
   const { rivetBinDir } = await import("../runtime/env.js");
@@ -922,8 +952,11 @@ async function doctorCommand(io: CliIo): Promise<number> {
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [command, ...args] = argv;
   try {
-    if (AUTOSTART.has(command ?? "")) await ensureDaemon(io);
+    if (AUTOSTART.has(command ?? "") || (command === undefined && io.tty)) await ensureDaemon(io);
     switch (command) {
+      case undefined:
+        if (io.tty) return await home(io);
+        throw new UsageError("no command given");
       case "--help":
       case "help": io.out(USAGE); return 0;
       case "--version":
