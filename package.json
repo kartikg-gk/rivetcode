@@ -23,7 +23,7 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.96.0",
     "node-pty": "^1.1.0",
-    "yaml": "^2.8.1"
+    "yaml": "^2.9.1"
   },
   "files": [
     "dist",
