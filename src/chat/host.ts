@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createInterface } from "node:readline";
-import { callDaemon } from "../cli/client.js";
+import { callDaemon, dataDirFrom } from "../cli/client.js";
 import { claudeChat, codexChat, type Approval, type ChatDriver, type ChatEvent, type Choice } from "./drivers.js";
 
 // The process that runs one chat session: it speaks the agent's protocol, takes Rivet's
@@ -74,6 +76,20 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   let maintenance = false;
   const steered: number[] = [];
   let timer: NodeJS.Timeout | null = null;
+  const journalDir = join(dataDirFrom(env), "chat-journal");
+  mkdirSync(journalDir, { recursive: true });
+  const journal = join(journalDir, `${sessionId}.jsonl`);
+  let unsent = 0;
+  // What an earlier host of this session never got to the daemon. Batch ids make a repeat
+  // harmless; a replay records history and does not change the session's present state.
+  if (existsSync(journal)) {
+    for (const line of readFileSync(journal, "utf8").split("\n").filter(Boolean)) {
+      let entry: Record<string, unknown>;
+      try { entry = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+      await callDaemon(env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/chat`, { ...entry, replay: true }, POST_TIMEOUT_MS);
+    }
+    rmSync(journal, { force: true });
+  }
   const post = () => {
     if (timer) { clearTimeout(timer); timer = null; }
     if (pending.length === 0 && raw.length === 0) return posting;
@@ -83,10 +99,13 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
     const batchId = randomUUID();
     pending = [];
     raw = [];
+    // On disk until the daemon has it, so a crash of this process or the daemon loses nothing.
+    appendFileSync(journal, JSON.stringify({ batchId, events, raw: lines, accepted: acknowledged }) + "\n");
+    unsent++;
     posting = posting.then(async () => {
       if (deliveryFailed) throw new Error("prior chat batch was not acknowledged");
       for (let attempt = 0; ; attempt++) {
-        try { await callDaemon(env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/chat`, { launchId, batchId, events, raw: lines, accepted: acknowledged }, POST_TIMEOUT_MS); return; }
+        try { await callDaemon(env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/chat`, { launchId, batchId, events, raw: lines, accepted: acknowledged }, POST_TIMEOUT_MS); if (--unsent === 0) rmSync(journal, { force: true }); return; }
         catch (e) { if (attempt >= 3) throw e; await delay(100 * 2 ** attempt); }
       }
     }).catch((e: Error) => { deliveryFailed = true; process.stderr.write(`chat: could not report to rivet: ${e.message}\n`); driver.close(); });

@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { describeTool } from "../timeline.js";
-import { connect, type Rpc } from "./rpc.js";
+import { connect, RpcError, type Rpc } from "./rpc.js";
 
 // What a conversation reports, the same for every agent. Rivet keeps it in its
 // conversation tables and derives the session's activity from it.
@@ -34,7 +34,7 @@ export type ChatOptions = {
   permission: string;
   resume?: string;
   inheritedTurns?: string[];
-  fork?: { providerId: string; turn?: string; agent: string; context: string };
+  fork?: { providerId: string; turn?: string; messageId?: string; agent: string; context: string };
   env: Record<string, string>;
   emit(e: ChatEvent): void;
   // Every line the agent wrote, as it came, for the record.
@@ -229,12 +229,13 @@ export function claudeChat(o: ChatOptions): ChatDriver {
     return true;
   }
 
+  let nativeFork=false;
   const driver:ChatDriver = {
     async refresh(){const items=await loadHistory(sessionId);if(o.model)await rpc.call("session/set_config_option",{sessionId,configId:"model",value:o.model});await rpc.call("session/set_config_option",{sessionId,configId:"mode",value:CLAUDE_MODES[o.permission]??"default"});o.emit({type:"history",providerId:sessionId,items});},
     async compact(){if(!commands.has("compact")||!turn)throw new Error("provider compaction is not advertised or the conversation has no turns");await driver.prompt("/compact");},
     async start() {
       const init = await rpc.call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
-      const caps=(init.agentCapabilities??{}) as {loadSession?:boolean;sessionCapabilities?:{resume?:unknown}};
+      const caps=(init.agentCapabilities??{}) as {loadSession?:boolean;sessionCapabilities?:{resume?:unknown;fork?:unknown}};
       canLoad=caps.loadSession===true;
       if(o.resume&&!canLoad&&caps.sessionCapabilities?.resume===undefined)throw new Error("provider does not support resuming this conversation; refusing to start a new one silently");
       let history:{role:"user"|"assistant";text:string}[]|undefined;
@@ -243,15 +244,25 @@ export function claudeChat(o: ChatOptions): ChatDriver {
         if(canLoad)history=await loadHistory(sessionId);
         else await rpc.call("session/resume",{sessionId,cwd:o.cwd,mcpServers:servers()});
       }else{
-        const opened=await rpc.call("session/new",{cwd:o.cwd,mcpServers:servers()});sessionId=text(opened.sessionId);
+        // A fork of Claude's own conversation, pinned at the reply it branches from. The
+        // adapter takes the pin through this _meta. If the reply is unknown to it, the fork
+        // starts new with the history as context.
+        const f=o.fork;
+        if(f&&f.agent==="claude"&&f.providerId&&f.messageId&&caps.sessionCapabilities?.fork!==undefined){
+          try{
+            const forked=await rpc.call("session/fork",{sessionId:f.providerId,cwd:o.cwd,mcpServers:servers(),_meta:{jetbrains:{air:{fork:{version:1,messageId:f.messageId}}}}});
+            sessionId=text(forked.sessionId);nativeFork=sessionId!==""&&sessionId!==f.providerId;
+          }catch(e){if(!(e instanceof RpcError)||(e.code!==-32601&&e.code!==-32602))throw e;}
+        }
+        if(!nativeFork){const opened=await rpc.call("session/new",{cwd:o.cwd,mcpServers:servers()});sessionId=text(opened.sessionId);}
       }
-      o.emit({type:"conversation",id:sessionId,...(o.fork&&!o.resume?{forkStrategy:"reconstructed" as const}:{})});
+      o.emit({type:"conversation",id:sessionId,...(o.fork&&!o.resume?{forkStrategy:nativeFork?"native" as const:"reconstructed" as const}:{})});
       if(history)o.emit({type:"history",providerId:sessionId,items:history});
       if (o.model) await rpc.call("session/set_config_option", { sessionId, configId: "model", value: o.model });
       await rpc.call("session/set_config_option", { sessionId, configId: "mode", value: CLAUDE_MODES[o.permission] ?? "default" });
     },
     async prompt(said) {
-      if (o.fork && !o.resume && turn === 0) said = o.fork.context + "\n\n" + said;
+      if (o.fork && !o.resume && !nativeFork && turn === 0) said = o.fork.context + "\n\n" + said;
       activeTurn = `${identity}:t${++turn}`;
       o.emit({ type: "turn", turnId: activeTurn, state: "running" });
       try {

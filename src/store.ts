@@ -177,7 +177,7 @@ export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
 export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; items: TimelineItem[] };
-export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; turnId?: string; providerConversationId?: string };
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; itemId?: string; turnId?: string; providerConversationId?: string };
 // A chat session's token use and context, as its agent last reported.
 export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
 export type ChatOutcome = { activity?: ActivityState; question?: { tool: string; detail: string; requestId: string } | null; conversationId?: string };
@@ -1361,12 +1361,12 @@ export function openStore(data: string): Store {
         const shown = inherited.filter((i) => !o.kinds || o.kinds.includes(i.kind));
         return { total: shown.length, items: shown.filter((i) => i.position > (o.after ?? 0)).slice(0, o.limit) };
       }
-      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number; agent: string | null; turn_id: string | null; provider: string | null };
+      type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number; agent: string | null; turn_id: string | null; provider: string | null; item_id: string | null };
       const rows = db.prepare(`
         SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at, streaming,
-          (SELECT agent FROM chat_turns t WHERE t.id = turn_id) AS agent, (SELECT provider_turn_id FROM chat_turns t WHERE t.id = turn_id) AS turn_id, (SELECT provider_conversation_id FROM chat_turns t WHERE t.id = turn_id) AS provider FROM chat_messages WHERE conversation_id = ?
+          (SELECT agent FROM chat_turns t WHERE t.id = turn_id) AS agent, (SELECT provider_turn_id FROM chat_turns t WHERE t.id = turn_id) AS turn_id, (SELECT provider_conversation_id FROM chat_turns t WHERE t.id = turn_id) AS provider, provider_item_id AS item_id FROM chat_messages WHERE conversation_id = ?
         UNION ALL
-        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0, NULL, NULL, NULL FROM chat_activities WHERE conversation_id = ?
+        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0, NULL, NULL, NULL, NULL FROM chat_activities WHERE conversation_id = ?
         ORDER BY sequence`).all(conv.id, conv.id) as Row[];
       let firstUser = !inherited.some((i) => i.kind === "prompt" || i.kind === "message");
       const all: TimelineItem[] = [...inherited];
@@ -1375,7 +1375,7 @@ export function openStore(data: string): Store {
         if (r.source === "message") {
           const kind: TimelineKind = r.role === "assistant" ? "assistant" : firstUser ? "prompt" : "message";
           if (r.role === "user") firstUser = false;
-          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}), ...(r.provider ? { providerConversationId: r.provider } : {}) });
+          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}), ...(r.provider ? { providerConversationId: r.provider } : {}), ...(r.item_id ? { itemId: r.item_id } : {}) });
           continue;
         }
         const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};

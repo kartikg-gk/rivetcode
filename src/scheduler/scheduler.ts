@@ -23,6 +23,13 @@ import { encodeConfig, type Control } from "../chat/host.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
 export const DEFAULT_PERMISSION = "accept-edits";
+// The agent's own id of the last reply: where a native fork of Claude's conversation is pinned.
+function replyAnchor(items: { kind: string; itemId?: string }[]): { messageId?: string } {
+  // Stored as "<host id>:<agent's id>"; a reply the agent gave no id has more parts.
+  const parts = items.filter((i) => i.kind === "assistant").at(-1)?.itemId?.split(":") ?? [];
+  return parts.length === 2 ? { messageId: parts[1]! } : {};
+}
+
 export const DEFAULT_ALLOWED_TOOLS = "Bash(rivet:*),Bash(git:*)";
 
 // Runners whose next word names the tool ("uv run ruff", "npx tsc"); for the rest the
@@ -204,7 +211,7 @@ export function createScheduler(d: SchedulerDeps) {
     const argv = chat
       ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-host", encodeConfig({
         inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
-        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.providerConversationId ? { fork: { providerId: branch.items.at(-1)?.providerConversationId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
+        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, ...replyAnchor(fork.items), context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.providerConversationId ? { fork: { providerId: branch.items.at(-1)?.providerConversationId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, ...replyAnchor(branch.items), context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
       })]
       : o.resume
         ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })

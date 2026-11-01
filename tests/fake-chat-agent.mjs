@@ -13,6 +13,7 @@ let nextId = 100;
 const asked = new Map();
 const ask = (method, params) => new Promise((resolve) => { const id = nextId++; asked.set(id, resolve); out({ id, method, params }); });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let sid = "s1";
 let active = null; // { id, steered: [], cancelled }
 let turns = 0;
 let threadId = "th1";
@@ -28,7 +29,7 @@ async function partialReplyObserved(t) {
   }
 }
 
-function update(u) { out({ method: "session/update", params: { sessionId: "s1", update: u } }); }
+function update(u) { out({ method: "session/update", params: { sessionId: sid, update: u } }); }
 
 async function turn(text, finish) {
   const t = { id: `turn-${++turns}`, steered: [], cancelled: false };
@@ -44,7 +45,7 @@ async function turn(text, finish) {
   let allowed = true;
   if (command) {
     const answer = acp
-      ? await ask("session/request_permission", { sessionId: "s1", toolCall: { toolCallId: "tc0", name: "Bash", rawInput: { command }, title: command, kind: "execute" },
+      ? await ask("session/request_permission", { sessionId: sid, toolCall: { toolCallId: "tc0", name: "Bash", rawInput: { command }, title: command, kind: "execute" },
         options: [{ optionId: "yes", kind: "allow_once" }, { optionId: "always", kind: "allow_always" }, { optionId: "no", kind: "reject_once" }] })
       : await ask("item/commandExecution/requestApproval", { threadId, turnId: t.id, itemId: "c0", command: `powershell -Command '${command}'`, commandActions: [{ type: "unknown", command }] });
     allowed = acp ? answer.outcome?.optionId !== "no" : answer.decision !== "decline";
@@ -93,7 +94,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (!server?.command || server.args?.at(-1) !== "mcp" || session !== "r1-agent") return out({ id: m.id, error: { code: -1, message: "missing Rivet MCP registration" } });
   }
   switch (m.method) {
-    case "initialize": return reply(acp ? { protocolVersion: 1, agentCapabilities: { loadSession:process.env.RIVET_TEST_LOAD==="1", sessionCapabilities: process.env.RIVET_TEST_NO_RESUME ? {} : { resume: {} } } } : { userAgent: "fake" });
+    case "initialize": return reply(acp ? { protocolVersion: 1, agentCapabilities: { loadSession:process.env.RIVET_TEST_LOAD==="1", sessionCapabilities: process.env.RIVET_TEST_NO_RESUME ? {} : { resume: {}, ...(process.env.FAKE_NATIVE_FORK ? { fork: {} } : {}) } } } : { userAgent: "fake" });
     case "model/list": return reply({data:[{id:p.cursor?"model-b":"model-a",displayName:p.cursor?"Model B":"Model A"}],nextCursor:p.cursor?null:"page-two"});
     case "account/rateLimits/read":
       if(process.env.RIVET_TEST_NO_QUOTA)return out({id:m.id,error:{code:-32601,message:"quota unavailable"}});
@@ -101,13 +102,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     case "thread/compact/start": return reply({});
     case "initialized": return;
     case "session/new":
-      reply({ sessionId: "s1", models:{availableModels:[{modelId:"claude-fixture",name:"Claude Fixture"}]} });
+      reply({ sessionId: sid, models:{availableModels:[{modelId:"claude-fixture",name:"Claude Fixture"}]} });
       if(process.env.RIVET_TEST_COMPACT==="1")update({sessionUpdate:"available_commands_update",availableCommands:[{name:"compact"}]});return;
     case "session/load":
       update({sessionUpdate:"user_message_chunk",content:{type:"text",text:"recover me"}});
       update({sessionUpdate:"agent_message_chunk",content:{type:"text",text:"recovered answer"}});
       return reply({});
     case "session/resume": return reply({});
+    case "session/fork": return p._meta?.jetbrains?.air?.fork?.messageId ? (sid = "forked", reply({ sessionId: "forked" })) : out({ id: m.id, error: { code: -32602, message: "no pin" } });
     case "session/set_config_option": return reply({ configOptions: [] });
     case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));
     case "_session/steering": if (active) { active.steered.push(p.prompt[0].text); return reply({ outcome: "injected" }); } return reply({ outcome: "promptRequired" });

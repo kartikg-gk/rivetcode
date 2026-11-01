@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -70,6 +71,39 @@ describe("a chat session's own tools", () => {
     expect(autoApproved(["Bash(rivet:*)"], { tool: "mcp__other__delete" })).toBe(false);
     expect(autoApproved(["Bash(rivet:*)"], { tool: "Bash", command: "rivet status" })).toBe(true);
   });
+});
+
+describe("what a chat host could not report", () => {
+  it("is replayed by the next host", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "first", agent: "claude" })).json.runId as string;
+    await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
+    await api("POST", `/api/v1/sessions/${runId}-agent/stop`);
+    await mkdir(join(data, "chat-journal"), { recursive: true });
+    const lost = { batchId: "lost-1", events: [{ type: "message", itemId: "lost", role: "assistant", text: "said before the crash" }], raw: [], accepted: [] };
+    await writeFile(join(data, "chat-journal", `${runId}-agent.jsonl`), JSON.stringify(lost) + "\n");
+    await api("POST", `/api/v1/runs/${runId}/resume`, {});
+    await until("the replayed reply", async () => said(await timeline(runId), "said before the crash"));
+    await until("the journal to clear", async () => !existsSync(join(data, "chat-journal", `${runId}-agent.jsonl`)));
+  }, 30_000);
+});
+
+describe("forking a Claude chat", () => {
+  it("is native at the reply when the adapter can, with no context pasted in", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
+    process.env.FAKE_NATIVE_FORK = "1";
+    try {
+      daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+      await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+      const runId = (await api("POST", "/api/v1/runs", { repo, task: "first", agent: "claude" })).json.runId as string;
+      await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
+      const fork = (await api("POST", `/api/v1/runs/${runId}/fork`, {})).json.runId as string;
+      await api("POST", `/api/v1/sessions/${fork}-agent/send`, { message: "from the fork", mode: "queue" });
+      await until("the fork's reply", async () => (await timeline(fork) as (Item & { providerConversationId?: string })[]).some((i) => i.kind === "assistant" && i.text.startsWith("echo: from the fork") && i.providerConversationId === "forked" && !i.text.includes("Inherited context")));
+    } finally { delete process.env.FAKE_NATIVE_FORK; }
+  }, 30_000);
 });
 
 describe("a chat worker whose agent refuses its turn", () => {
