@@ -87,6 +87,7 @@ const USAGE = `usage: rivet <command>
   send --session <id> --message <text> [--mode steer|queue|interrupt]
                                         send a message: as soon as it can take it (steer), once idle (queue),
                                         or stopping its current turn first (interrupt)
+  spawn/orchestrator open a typing pane in Windows Terminal when run from a terminal (--no-pane to skip)
   read <run> [--item <position> --text-offset <n>] [--activity] [--after <n>] [--limit <n>] [--session agent|review|partner] [--follow] [--raw]
                                         what a session was told and said (with --activity, what it did too)
   answer <run> yes|always|no [--note <text>]
@@ -454,6 +455,9 @@ async function startSession(args: string[], io: CliIo, role: "worker" | "orchest
   const result = await callDaemon(io.env, "POST", "/api/v1/runs", {
     repo, task, role, ...text("base"), ...text("agent"), ...text("name"), ...text("model"), ...text("issue"), ...(from ? { from } : {}),
   }, RUN_TIMEOUT_MS) as { runId: string };
+  // Started by a person at a terminal: its pane opens beside the others. Agents starting
+  // workers, and --no-pane, open nothing.
+  if (io.tty && !from && flags.get("no-pane") !== true) await openPane(result.runId, task || role, role, io);
   if (role === "orchestrator") io.out(`orchestrator ${result.runId} started; talk to it with: rivet attach ${result.runId}-agent`);
   else io.out(`worker ${result.runId} started; follow it with: rivet status ${result.runId}`);
   return 0;
@@ -735,9 +739,41 @@ async function cue(args: string[], io: CliIo): Promise<number> {
 const DETACH_KEY = "\u001d"; // Ctrl-]
 
 // Your terminal becomes the session's: its screen streams in, your keys go to it.
+// Opens a typing pane for a new session in Windows Terminal; elsewhere says how to.
+async function openPane(runId: string, title: string, role: string, io: CliIo): Promise<void> {
+  const { execFileSync, spawn } = await import("node:child_process");
+  const hint = () => io.out(`type to it with: rivet attach ${runId}-agent`);
+  if (process.platform !== "win32") return hint();
+  try { execFileSync("where", ["wt"], { stdio: "ignore" }); } catch { return hint(); }
+  try {
+    const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as { runs: { id: string; live: boolean }[] };
+    const { addPaneArgs } = await import("./panes.js");
+    const { rivetBinDir } = await import("../runtime/env.js");
+    const first = !runs.some((r) => r.live && r.id !== runId);
+    const args = addPaneArgs(join(rivetBinDir(), "rivet.cmd"), { id: `${runId}-agent`, title: `${role} ${title.slice(0, 40)}` }, first);
+    spawn("wt", args, { detached: true, stdio: "ignore" }).unref();
+  } catch { hint(); }
+}
+
+// A session without a terminal of its own (chat or headless): its conversation as it
+// happens, and each line typed goes to it as a message.
+async function converse(sessionId: string, runId: string, io: CliIo): Promise<number> {
+  io.err(`talking to ${sessionId}; type a message and press Enter; Ctrl-C leaves (the session keeps running)`);
+  const lines = io.tty ? (await import("node:readline")).createInterface({ input: io.tty.input }) : null;
+  lines?.on("line", (message) => {
+    if (!message.trim()) return;
+    void callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/send`, { message, mode: "steer" }, COMMAND_TIMEOUT_MS)
+      .catch((e: Error) => io.err(`not sent: ${e.message}`));
+  });
+  try { return await follow(runId, true, io); } finally { lines?.close(); }
+}
+
 async function attach(args: string[], io: CliIo): Promise<number> {
   const [sessionId] = args;
   if (!sessionId) throw new UsageError("attach needs a session id (see rivet status <run>)");
+  const runId = sessionId.slice(0, sessionId.indexOf("-"));
+  const known = runId ? await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS).catch(() => null) as { terminal?: boolean; live?: boolean } | null : null;
+  if (io.tty && known?.live && known.terminal === false) return converse(sessionId, runId, io);
   const info = await readRunFile(runFileFrom(io.env));
   if (!info) throw new DaemonDownError();
   const base = `http://127.0.0.1:${info.port}/api/v1/sessions/${encodeURIComponent(sessionId)}`;

@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { panesPlan } from "../src/cli/panes.js";
+import { addPaneArgs, panesPlan } from "../src/cli/panes.js";
 
 const sessions = [{ id: "r1-root.1", title: "api" }, { id: "r1-root.2", title: "ui" }, { id: "r1-root.3", title: "docs" }];
+
+describe("addPaneArgs", () => {
+  it("opens the first session as the shared window's tab and splits the next beside it", () => {
+    const s = { id: "r1-agent", title: "worker x" };
+    expect(addPaneArgs("rivet.cmd", s, true)).toEqual(["-w", "rivet", "new-tab", "--title", "worker x", "cmd", "/k", "rivet.cmd", "attach", "r1-agent"]);
+    expect(addPaneArgs("rivet.cmd", s, false).slice(0, 4)).toEqual(["-w", "rivet", "split-pane", "-V"]);
+  });
+});
 
 describe("panesPlan", () => {
   it("splits one Windows Terminal window", () => {

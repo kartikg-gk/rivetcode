@@ -4,6 +4,12 @@ export type PanesPlan =
   | { kind: "tmux"; steps: string[][] }
   | { kind: "print"; lines: string[] };
 
+// One more session in the shared "rivet" window: its first tab, or a split beside the others.
+// cmd /k keeps a pane open after the session ends, so what it said can still be read.
+export function addPaneArgs(rivet: string, session: { id: string; title: string }, first: boolean): string[] {
+  return ["-w", "rivet", ...(first ? ["new-tab"] : ["split-pane", "-V"]), "--title", session.title, "cmd", "/k", rivet, "attach", session.id];
+}
+
 const shellQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 export function panesPlan(o: {
@@ -20,7 +26,7 @@ export function panesPlan(o: {
     sessions.forEach((s, i) => {
       if (i > 0) args.push(";", "split-pane", i % 2 === 1 ? "-V" : "-H");
       else args.push("new-tab");
-      args.push("--title", s.title, o.rivet, "attach", s.id);
+      args.push("--title", s.title, "cmd", "/k", o.rivet, "attach", s.id);
     });
     return { kind: "wt", file: "wt", args };
   }

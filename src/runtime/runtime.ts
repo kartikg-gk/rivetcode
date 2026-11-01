@@ -36,6 +36,8 @@ export type Runtime = {
   isAlive(sessionId: string): boolean;
   // Whether a running session reads what is typed to it (a headless agent does not).
   takesInput(sessionId: string): boolean;
+  // Whether it runs in a terminal someone can attach to and type into.
+  hasTerminal(sessionId: string): boolean;
   output(sessionId: string, lines: number): Output | null;
   // Types a line (text, then Enter).
   write(sessionId: string, text: string): Promise<void>;
@@ -285,6 +287,9 @@ export function createRuntime(o: { logDir: string; keepLines?: number; stopGrace
         if (chars.length > 0) await pause(TYPE_SUBMIT_DELAY_MS);
         await p.handle.send("\r");
       } catch (e) { throw new RuntimeError(`write to ${sessionId}: ${(e as Error).message}`); }
+    },
+    hasTerminal(sessionId) {
+      return procs.get(sessionId)?.handle?.terminal === true;
     },
     input(sessionId, data) {
       const p = live(sessionId);
