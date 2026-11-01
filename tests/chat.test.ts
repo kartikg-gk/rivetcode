@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getAgent } from "../src/agents/agent.js";
-import { allowed } from "../src/chat/host.js";
+import { allowed, autoApproved } from "../src/chat/host.js";
 import { runCli } from "../src/cli/commands.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
@@ -62,6 +62,26 @@ async function until<T>(what: string, fn: () => Promise<T | undefined | false>, 
   }
 }
 const said = (items: Item[], text: string) => items.some((i) => i.kind === "assistant" && i.text.includes(text));
+
+describe("a chat session's own tools", () => {
+  it("are covered by the rivet rule, and other tools are not", () => {
+    expect(autoApproved(["Bash(rivet:*)"], { tool: "mcp__rivet__rivet_report" })).toBe(true);
+    expect(autoApproved(["Bash(git:*)"], { tool: "mcp__rivet__rivet_report" })).toBe(false);
+    expect(autoApproved(["Bash(rivet:*)"], { tool: "mcp__other__delete" })).toBe(false);
+    expect(autoApproved(["Bash(rivet:*)"], { tool: "Bash", command: "rivet status" })).toBe(true);
+  });
+});
+
+describe("a chat worker whose agent refuses its turn", () => {
+  it("escalates with the agent's own reason", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "codex"]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "LIMITFAIL", agent: "codex" })).json.runId as string;
+    const run = await until("escalation", async () => { const r = (await api("GET", `/api/v1/runs/${runId}`)).json.run; return r.node.status === "escalated" && r; });
+    expect(run.node.summary).toBe("codex failed: You've hit your usage limit.");
+  }, 30_000);
+});
 
 describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat session", (agent, protocol) => {
   it("keeps its conversation, takes messages in each mode, and asks Rivet before what it may not run", async () => {

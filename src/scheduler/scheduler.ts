@@ -509,6 +509,13 @@ export function createScheduler(d: SchedulerDeps) {
     // An orchestrator's exit ends nothing but its own conversation.
     if (run.role !== "worker") return;
     if (chats.has(sessionId) && code !== 0) {
+      // The agent said why: that is the reason, not uncertainty.
+      const failure = await d.write(() => d.store.lastTurnError(runId));
+      if (failure) {
+        await transition(runId, "escalated", `${run.node.agent} failed: ${failure}`);
+        await tellOrchestrator(run, `Worker ${runId} stopped: ${run.node.agent} failed: ${failure}`);
+        return;
+      }
       await transition(runId, "escalated", "Chat completion is uncertain: inspect provider history and current files before an explicit resume; pending messages were preserved and were not automatically replayed.");
       await tellOrchestrator(run, `Worker ${runId} stopped with uncertain chat completion; inspect its history before resuming.`);
       return;
@@ -584,6 +591,14 @@ export function createScheduler(d: SchedulerDeps) {
       if (chats.has(sessionId)) await d.runtime.write(sessionId, JSON.stringify({type:"finish"}));
       else await d.runtime.stop(sessionId);
     }
+  }
+
+  // A worker's chat turn failed and its agent is still up: nothing more will happen on its
+  // own, so it stops and onExit escalates it with the agent's reason.
+  async function chatTurnFailed(runId: string): Promise<void> {
+    const run = await load(runId);
+    const session = sessionOf(run);
+    if (run.role === "worker" && chats.has(session) && !doneReported.has(session) && d.runtime.isAlive(session)) await d.runtime.stop(session);
   }
 
   // Stops an agent without treating its exit as a failure; resume or a restart relaunches it.
@@ -1177,7 +1192,7 @@ export function createScheduler(d: SchedulerDeps) {
     try { await work; return true; } finally { startingForks.delete(runId); }
   }
 
-  return { cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

@@ -556,6 +556,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events), batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
       const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
       if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
+      if (nodeId === NODE_ID && (payload.events as { type?: string; state?: string }[] | undefined)?.some((e) => e?.type === "turn" && e.state === "failed")) {
+        void scheduler.chatTurnFailed(runId).catch((e) => opts.onError?.(e));
+      }
       const state = outcome.activity ?? null;
       if (nodeId === "review" || nodeId === "partner" || state === null) {
         reply(res, 204);

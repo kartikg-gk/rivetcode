@@ -53,6 +53,12 @@ export function allowed(rules: string[], command: string | undefined): boolean {
   });
 }
 
+// Rivet's own tools are the same operations as the rivet command, so the same rule covers them.
+export function autoApproved(rules: string[], a: { tool: string; command?: string }): boolean {
+  if (a.tool.startsWith("mcp__rivet__")) return allowed(rules, "rivet");
+  return allowed(rules, a.command);
+}
+
 export async function runHost(config: HostConfig, env: Record<string, string | undefined> = process.env): Promise<number> {
   const sessionId = env.RIVET_SESSION_ID ?? "";
   const launchId = env.RIVET_LAUNCH_ID ?? "";
@@ -106,7 +112,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
     inheritedTurns: config.inheritedTurns,
     ...(config.fork ? { fork: config.fork } : {}),
     decide: (a: Approval): Choice | undefined => {
-      if (allowed(config.allow, a.command)) return "yes";
+      if (autoApproved(config.allow, a)) return "yes";
       questionOpen = a;
       return undefined;
     },

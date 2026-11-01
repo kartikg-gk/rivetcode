@@ -33,6 +33,12 @@ function update(u) { out({ method: "session/update", params: { sessionId: "s1", 
 async function turn(text, finish) {
   const t = { id: `turn-${++turns}`, steered: [], cancelled: false };
   active = t;
+  if (!acp && text.includes("LIMITFAIL")) {
+    out({ method: "turn/started", params: { threadId: "th1", turn: { id: t.id, status: "inProgress" } } });
+    out({ method: "turn/completed", params: { threadId: "th1", turn: { id: t.id, status: "failed", error: { message: "You've hit your usage limit." } } } });
+    active = null;
+    return finish(false);
+  }
   if (!acp) out({ method: "turn/started", params: { threadId, turn: { id: t.id, status: "inProgress" } } });
   const command = text.includes("RIVET") ? "rivet status" : text.includes("ASK") ? "npm publish" : null;
   let allowed = true;

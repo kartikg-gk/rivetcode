@@ -112,6 +112,8 @@ export type Store = {
   // A chat session's conversation as timeline entries, in the order they happened.
   readChat(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
   chatUsage(runId: string, session?: string): ChatUsage | null;
+  // Why a chat session's latest turn failed, as its agent said.
+  lastTurnError(runId: string): string | null;
   // Keeps the agent's own lines as they came (a protocol message each).
   recordProviderLines(runId: string, session: string, lines: string[]): number;
   providerLines(runId: string, o: { after?: number; limit: number; session?: string }): { position: number; method: string; payload: string; at: string }[];
@@ -1304,6 +1306,12 @@ export function openStore(data: string): Store {
         throw e;
       }
       return out;
+    },
+
+    lastTurnError(runId) {
+      const r = db.prepare(`SELECT t.state, t.error_message AS error FROM chat_turns t JOIN chat_conversations c ON c.id = t.conversation_id
+        WHERE c.run_id = ? AND c.session = ? ORDER BY t.rowid DESC LIMIT 1`).get(runId, NODE_ID) as { state: string; error: string } | undefined;
+      return r?.state === "failed" && r.error ? r.error : null;
     },
 
     chatUsage(runId, session = NODE_ID) {
