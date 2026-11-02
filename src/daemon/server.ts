@@ -377,7 +377,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
     if (!allowedRequest(req.headers)) {
-      reply(res, 403, { status: "forbidden", error: "request refused: not from this machine" });
+      reply(res, 403, { status: "forbidden" });
       return;
     }
     if (path === "/healthz") {
