@@ -298,7 +298,9 @@ function Provider({ id }: { id: string }) {
 
 export function Conversation({ id }: { id: string }) {
   const { data: d, error } = useLive(() => api<RunDetail>("GET", runPath(id)), [id]);
-  const [activity, setActivity] = useState(false);
+  // A terminal session records its steps but few words, so its steps show unless turned off.
+  const [picked, setActivity] = useState<boolean | null>(null);
+  const activity = picked ?? (!!d && d.run.node.sessionMode !== "chat");
   const [session, setSession] = useState("agent");
   const [side, setSide] = useState<Side | null>(null);
   const [menu, setMenu] = useState(false);
@@ -341,7 +343,7 @@ export function Conversation({ id }: { id: string }) {
             </ul>
           )}
         </header>
-        {d && !chat && !activity && d.run.node.agent === "claude" && <p className="px-3 py-1 text-xs text-muted border-b border-line">In a terminal, Claude records only its last reply per turn. Use the terminal panel for everything.</p>}
+        {d && !chat && d.run.node.agent === "claude" && <p className="px-3 py-1 text-xs text-muted border-b border-line">In a terminal, only Claude's last reply per turn is recorded, and none if it reports done first. The terminal panel has everything while it runs.</p>}
         <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto p-4 grid grid-cols-[minmax(0,1fr)] gap-4 content-start" aria-live="off">
           {readError && <p className="text-danger">{readError}</p>}
           {items.length === 0 && !readError && <p className="text-muted">Nothing recorded yet.</p>}
