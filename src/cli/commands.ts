@@ -31,7 +31,8 @@ export type CliIo = {
 };
 
 const USAGE = `usage: rivet <command>
-  (no command)                          open Claude and Codex side by side in this repo
+  (no command)                          open Claude and Codex beside a prompt with / commands
+  console                               only the prompt with / commands
   spawn [--name <label>] [--agent <name>] [--model <id>] [--issue <n|owner/repo#n|url>] [--repo <dir>] [--base <branch>] [<task>]
                                         start a worker on a task in its own worktree
   run <tasks.yaml|tasks.json> [--dry-run] [--repo <dir>]
@@ -751,7 +752,7 @@ async function openPane(runId: string, title: string, role: string, io: CliIo): 
     const { addPaneArgs } = await import("./panes.js");
     const { rivetBinDir } = await import("../runtime/env.js");
     const first = !runs.some((r) => r.live && r.id !== runId);
-    const args = addPaneArgs(join(rivetBinDir(), "rivet.cmd"), { id: `${runId}-agent`, title: `${role} ${title.slice(0, 40)}` }, first);
+    const args = addPaneArgs(join(rivetBinDir(), "rivet.cmd"), { id: `${runId}-agent`, title: `${role} ${title.slice(0, 40)}` }, first, !!io.env.WT_SESSION);
     spawn("wt", args, { detached: true, stdio: "ignore" }).unref();
   } catch { hint(); }
 }
@@ -827,14 +828,14 @@ async function attach(args: string[], io: CliIo): Promise<number> {
 // Every running agent side by side (orchestrator and workers alike).
 // Bare "rivet": Claude and Codex side by side in this repo, each in its own real terminal,
 // ready to talk to. Sessions already open here are shown again, not started twice.
-async function home(io: CliIo): Promise<number> {
+async function home(io: CliIo, agents: string[] = ["claude", "codex"]): Promise<number> {
   const repo = await repoTop(resolve(io.cwd, "."));
   const { runs } = await callDaemon(io.env, "GET", "/api/v1/runs", undefined, COMMAND_TIMEOUT_MS) as {
     runs: { id: string; project: string; role: string; agent: string; live: boolean }[];
   };
   const project = defaultProjectId(repo);
   const sessions: { id: string; title: string }[] = [];
-  for (const agent of ["claude", "codex"]) {
+  for (const agent of agents) {
     let id = runs.find((r) => r.live && r.project === project && r.role === "orchestrator" && r.agent === agent)?.id;
     if (!id) {
       try {
@@ -848,6 +849,23 @@ async function home(io: CliIo): Promise<number> {
   }
   if (sessions.length === 0) return 1;
   return showPanes(sessions, io);
+}
+
+async function slashConsole(io: CliIo): Promise<number> {
+  const { runConsole } = await import("./console.js");
+  return runConsole({
+    input: io.tty!.input, output: io.tty!.output,
+    run: async ([command, ...args], started) => {
+      if (command === "console-open") { await home(io, args); return; }
+      if (command === "console-pane") { await openPane(args[0]!, args[0]!, "session", io); return; }
+      const out = (line: string) => {
+        io.out(line);
+        const m = /^(?:worker|orchestrator) (\S+) started/.exec(line) ?? /"runId":"(r[a-z0-9]+)"/.exec(line);
+        if (m) started(m[1]!);
+      };
+      await runCli([command!, ...args], { ...io, out });
+    },
+  });
 }
 
 async function panes(io: CliIo): Promise<number> {
@@ -871,7 +889,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
     try { execFileSync(process.platform === "win32" ? "where" : "which", [tool], { stdio: "ignore" }); return true; } catch { return false; }
   };
   const rivet = join(rivetBinDir(), process.platform === "win32" ? "rivet.cmd" : "rivet");
-  const plan = panesPlan({ platform: process.platform, rivet, runId, sessions, have });
+  const plan = panesPlan({ platform: process.platform, rivet, runId, sessions, have, beside: !!io.env.WT_SESSION });
   if (plan.kind === "print") {
     io.out("no terminal multiplexer found; attach to each session in its own terminal:");
     for (const line of plan.lines) io.out(line);
@@ -889,7 +907,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -955,8 +973,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (AUTOSTART.has(command ?? "") || (command === undefined && io.tty)) await ensureDaemon(io);
     switch (command) {
       case undefined:
-        if (io.tty) return await home(io);
-        throw new UsageError("no command given");
+        if (!io.tty) throw new UsageError("no command given");
+        // The agents open beside a prompt that takes slash commands.
+        await home(io).catch((e: Error) => { io.err(e.message); });
+        return await slashConsole(io);
+      case "console":
+        if (!io.tty) throw new UsageError("console needs a terminal");
+        return await slashConsole(io);
       case "--help":
       case "help": io.out(USAGE); return 0;
       case "--version":
