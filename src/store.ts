@@ -124,6 +124,8 @@ export type Store = {
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
   getTerminateOnPrMerge(runId: string): boolean;
   setTerminateOnPrMerge(runId: string, terminate: boolean): void;
+  // Rows this connection has changed since it opened; moves whenever stored state does.
+  changeCount(): number;
   close(): void;
 };
 
@@ -1482,6 +1484,9 @@ export function openStore(data: string): Store {
       else upsertConfig.run(project, key, value);
     },
 
+    changeCount() {
+      return Number((db.prepare("SELECT total_changes() AS n").get() as { n: number | bigint }).n);
+    },
     close() {
       db.close();
     },

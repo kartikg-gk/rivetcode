@@ -1,4 +1,6 @@
 import { cleanupQueue } from "./cleanup.js";
+import { allowedRequest, liveSocket, serveApp } from "./web.js";
+import { parseTaskFile, TaskFileError } from "../scheduler/tasks.js";
 import { searchPage, SearchInputError } from "../search.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
 import { existsSync } from "node:fs";
@@ -74,6 +76,7 @@ import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, 
 import { emptyTrash } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
+const DIFF_LIMIT = 2 * 1024 * 1024;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
 const CONFIG_KEYS = [
   "check",
@@ -331,6 +334,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return scheduler.launch(run, prompt);
   }
 
+  const live = liveSocket({ server, runtime, changeCount: () => store.changeCount(), sessionOf: (id) => { const s = session(id); return sessionIdOf(s.runId, s.nodeId); } });
   let stopping: Promise<void> | undefined;
   let markStopped!: () => void;
   const stopped = new Promise<void>((resolve) => { markStopped = resolve; });
@@ -358,6 +362,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (pruneTimer) clearInterval(pruneTimer);
       if (wakeTimer) clearInterval(wakeTimer);
       waitAbort.abort();
+      live.close();
       await cleanup.close();
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -371,6 +376,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (!allowedRequest(req.headers)) {
+      reply(res, 403, { status: "forbidden", error: "request refused: not from this machine" });
+      return;
+    }
     if (path === "/healthz") {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
       reply(res, 200, { status: "ok", service: "rivet-daemon", pid: process.pid });
@@ -509,6 +518,42 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       // An agent that went idle can take what was queued for it.
       if (state === "idle" || state === "waiting_input") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
+      return;
+    }
+    if (path === "/api/v1/doctor") {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const { doctor, realProbes } = await import("../cli/doctor.js");
+      const { loadPty } = await import("../runtime/runtime.js");
+      const repoDir = new URL(req.url!, "http://x").searchParams.get("repo");
+      const remote = repoDir ? (await git(["remote", "get-url", "origin"], repoDir).catch(() => "")).trim() : "";
+      reply(res, 200, { checks: await doctor(data, realProbes({
+        findClaude: () => findClaude(), findCodex: () => findCodex(), loadPty: () => loadPty() !== null,
+        daemonUp: async () => true, githubToken: () => githubToken(process.env, remote),
+      })) });
+      return;
+    }
+    if (path === "/api/v1/tasks/parse") {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      if (typeof payload.source !== "string") throw new HttpError(400, "source must be a string");
+      try { reply(res, 200, { tasks: parseTaskFile(payload.source, optionalString(payload.fileName, "fileName") ?? "tasks.yaml") }); }
+      catch (e) { if (e instanceof TaskFileError) throw new HttpError(400, e.message); throw e; }
+      return;
+    }
+    const diffRoute = /^\/api\/v1\/runs\/([^/]+)\/diff$/.exec(path);
+    if (diffRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const run = await write(() => store.loadRun(diffRoute[1]!)).catch(() => null);
+      if (!run) throw new HttpError(404, "unknown run");
+      if (!existsSync(run.node.worktree)) { reply(res, 200, { available: false, diff: "", stat: "", untracked: [], cut: false, untrusted: true }); return; }
+      // Everything this worktree changed from where it branched, committed or not.
+      const from = (await git(["merge-base", run.base, "HEAD"], run.node.worktree).catch(() => run.base)).trim();
+      const [full, stat, untracked] = await Promise.all([
+        git(["diff", from], run.node.worktree), git(["diff", "--stat", from], run.node.worktree),
+        git(["ls-files", "--others", "--exclude-standard"], run.node.worktree),
+      ]);
+      const cut = full.length > DIFF_LIMIT;
+      reply(res, 200, { available: true, diff: cut ? full.slice(0, DIFF_LIMIT) : full, stat, untracked: untracked.split(/\r?\n/).filter(Boolean), cut, untrusted: true });
       return;
     }
     if (path === "/api/v1/recovery") {
@@ -886,6 +931,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           return {
             id: r.id, project: r.project, task: r.task, createdAt: r.createdAt, status: r.node.status, role: r.role, name: r.name,
             agent: r.node.agent, live: runtime.isAlive(sessionIdOf(r.id, r.node.id)), ...(r.orchestrator ? { orchestrator: r.orchestrator } : {}),
+            repo: r.repo, activity: r.node.activity ?? null, sessionMode: r.node.sessionMode ?? "terminal", organization: store.organization(r.id), needsAnswer: !!scheduler.pendingRequest(r.id),
           };
         }));
         reply(res, 200, { runs });
@@ -1135,6 +1181,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 204);
       return;
     }
+    if (req.method === "GET" && !path.startsWith("/api/") && await serveApp(path, res)) return;
     throw new HttpError(404, "unknown route");
   }
 
