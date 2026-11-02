@@ -17,11 +17,14 @@ function useTimeline(id: string, activity: boolean, session: string) {
   const known = useRef<Item[]>([]);
   const q = (after: number) => `/timeline?after=${after}&limit=100&maxChars=50000&session=${session}${activity ? "&view=activity" : ""}`;
   const { error, reload } = useLive(async () => {
-    const start = known.current.find((i) => i.streaming)?.position ?? known.current.at(-1)?.position ?? 0;
-    let after = start > 0 && known.current.some((i) => i.streaming) ? start - 1 : start;
+    const anchor = known.current.find((i) => i.streaming) ?? known.current.at(-1);
+    let after = anchor ? anchor.position - 1 : 0;
     let page = await api<Page>("GET", runPath(id, q(after)));
-    // A rollback or a restored branch renumbers the history; start again.
-    if (page.total < known.current.length) { known.current = []; after = 0; page = await api<Page>("GET", runPath(id, q(0))); }
+    // A rollback, an edit or a restored branch replaces the history; start again.
+    if (anchor && (page.items[0]?.position !== anchor.position || page.items[0].at !== anchor.at)) {
+      known.current = []; after = 0;
+      page = await api<Page>("GET", runPath(id, q(0)));
+    }
     const merged = known.current.filter((i) => i.position <= after);
     for (;;) {
       merged.push(...page.items);
@@ -342,7 +345,7 @@ export function Conversation({ id }: { id: string }) {
         <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto p-4 grid gap-4 content-start" aria-live="off">
           {readError && <p className="text-danger">{readError}</p>}
           {items.length === 0 && !readError && <p className="text-muted">Nothing recorded yet.</p>}
-          {items.map((i) => <Entry key={`${i.position}`} item={i} id={id} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
+          {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
         </div>
         {d?.pendingRequest && <Question id={id} request={d.pendingRequest} />}
         <Composer id={id} actions={actions} openSide={(t) => setSide(t)} />
