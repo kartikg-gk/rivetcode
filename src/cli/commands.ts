@@ -76,6 +76,7 @@ const USAGE = `usage: rivet <command>
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
+  app [--no-open]                       open the graphical app in your browser
   panes                                 show every running agent side by side
   daemon start|stop|status              run or control the background daemon
   doctor                                check what Rivet needs on this machine
@@ -851,6 +852,21 @@ async function home(io: CliIo, agents: string[] = ["claude", "codex"]): Promise<
   return showPanes(sessions, io);
 }
 
+// The app, in the browser, served by the daemon; it opens on this repository.
+async function openApp(args: string[], io: CliIo): Promise<number> {
+  const { flags } = parseFlags(args, []);
+  const repo = await repoTop(resolve(io.cwd, ".")).catch(() => "");
+  const info = await readRunFile(runFileFrom(io.env));
+  if (!info) throw new DaemonDownError();
+  const url = `http://127.0.0.1:${info.port}/${repo ? `?repo=${encodeURIComponent(repo)}` : ""}`;
+  io.out(`Rivet is at ${url}`);
+  if (flags.get("no-open") === true) return 0;
+  const [opener, ...openerArgs] = process.platform === "win32" ? ["rundll32", "url.dll,FileProtocolHandler", url] : process.platform === "darwin" ? ["open", url] : ["xdg-open", url];
+  const { spawn } = await import("node:child_process");
+  spawn(opener!, openerArgs, { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+  return 0;
+}
+
 async function slashConsole(io: CliIo): Promise<number> {
   const { runConsole } = await import("./console.js");
   return runConsole({
@@ -907,7 +923,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["app", "console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -1118,6 +1134,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       case "attach": return await attach(args, io);
       case "panes": return await panes(io);
+      case "app": return await openApp(args, io);
       case "status": return await status(args, io);
       case "resume": return await runAction("resume", args, io);
       case "pr": {

@@ -33,7 +33,7 @@ const TYPES: Record<string, string> = {
   ".svg": "image/svg+xml", ".woff2": "font/woff2", ".map": "application/json",
 };
 // Agent text and tool output are shown in this page, so it may load nothing from elsewhere.
-const PAGE_POLICY = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws://localhost:* ws://127.0.0.1:* ws://[::1]:*; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const PAGE_POLICY = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 // Serves the built app; any path that is not a file is the app's own page.
 export async function serveApp(path: string, res: ServerResponse, root = WEB_ROOT): Promise<boolean> {
