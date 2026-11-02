@@ -59,7 +59,7 @@ function Sidebar() {
           <button className="btn justify-center" onClick={() => set({ screen: "automations" })}>Schedules</button>
         </div>
       </div>
-      <nav className="flex-1 overflow-y-auto p-2 grid gap-3 content-start" aria-label="Sessions">
+      <nav className="flex-1 overflow-y-auto p-2 grid grid-cols-[minmax(0,1fr)] gap-3 content-start" aria-label="Sessions">
         {projects.length === 0 && <p className="text-muted text-sm p-2">{archived === "only" ? "Nothing archived." : "No sessions yet. Start one above."}</p>}
         {projects.map(([path, rows]) => <Project key={path} path={path} rows={rows} current={path === repo} />)}
       </nav>

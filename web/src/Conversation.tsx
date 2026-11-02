@@ -342,7 +342,7 @@ export function Conversation({ id }: { id: string }) {
           )}
         </header>
         {d && !chat && !activity && d.run.node.agent === "claude" && <p className="px-3 py-1 text-xs text-muted border-b border-line">In a terminal, Claude records only its last reply per turn. Use the terminal panel for everything.</p>}
-        <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto p-4 grid gap-4 content-start" aria-live="off">
+        <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto p-4 grid grid-cols-[minmax(0,1fr)] gap-4 content-start" aria-live="off">
           {readError && <p className="text-danger">{readError}</p>}
           {items.length === 0 && !readError && <p className="text-muted">Nothing recorded yet.</p>}
           {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
