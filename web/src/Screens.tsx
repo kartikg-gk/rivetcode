@@ -94,7 +94,7 @@ function NewSession({ close }: { close(): void }) {
       <div className="flex justify-between gap-2 flex-wrap">
         <button className="btn" disabled={busy || !f.repo.trim()} onClick={both} title="Both agents in their own terminals, side by side">Open Claude and Codex</button>
         <button className="btn btn-primary" disabled={busy || !ready} onClick={() => start({
-          repo: f.repo.trim(), task: f.task, role: f.role,
+          repo: f.repo.trim(), task: f.task, role: f.role, chat: true,
           ...(f.agent ? { agent: f.agent } : {}), ...(f.model ? { model: f.model } : {}), ...(f.name ? { name: f.name } : {}), ...(f.base ? { base: f.base } : {}), ...(f.issue ? { issue: f.issue } : {}),
         })}>{busy ? "Starting…" : "Start"}</button>
       </div>

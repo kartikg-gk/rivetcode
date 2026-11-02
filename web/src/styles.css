@@ -1,14 +1,14 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #f7f8f8; --panel: #ffffff; --raised: #eef0f1; --line: #dcdfe2; --fg: #1a1f23; --muted: #626c75;
-  --accent: #14796a; --accent-fg: #ffffff; --danger: #b3372f; --warn: #94650c; --ok: #1d7f4f;
+  --bg: #ffffff; --panel: #fafafa; --raised: #f0f0f0; --line: #e4e4e4; --fg: #171717; --muted: #6b6b6b;
+  --accent: #2f5fd6; --accent-fg: #ffffff; --danger: #b3372f; --warn: #94650c; --ok: #1d7f4f;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #101416; --panel: #161b1e; --raised: #20272b; --line: #2b3338; --fg: #e5e9ec; --muted: #929da6;
-    --accent: #45b5a0; --accent-fg: #06201b; --danger: #ef7d74; --warn: #e0b44f; --ok: #62cf95;
+    --bg: #0b0b0b; --panel: #0f0f0f; --raised: #1c1c1c; --line: #262626; --fg: #ededed; --muted: #8f8f8f;
+    --accent: #2f5fd6; --accent-fg: #ffffff; --danger: #ef7d74; --warn: #e0b44f; --ok: #62cf95;
     color-scheme: dark;
   }
 }
@@ -29,6 +29,16 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .btn-primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
 .btn-danger { color: var(--danger); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 8px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.pill:hover { background: var(--raised); color: var(--fg); }
+.icon { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; color: var(--muted); cursor: pointer; flex-shrink: 0; }
+.icon:hover { background: var(--raised); color: var(--fg); }
+.send { display: inline-grid; place-items: center; width: 34px; height: 34px; border-radius: 999px; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+.send:disabled { opacity: .45; cursor: default; }
+.composer { display: grid; gap: 10px; padding: 14px 12px 10px; border: 1px solid var(--line); border-radius: 22px; background: var(--panel); position: relative; z-index: 1; }
+.composer:focus-within { border-color: color-mix(in srgb, var(--fg) 25%, var(--line)); }
+.strip { display: flex; justify-content: flex-end; align-items: center; gap: 6px; margin: -12px 24px 0; padding: 16px 12px 6px; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 14px 14px; color: var(--muted); font-size: 12px; }
+.topbar { height: 44px; flex-shrink: 0; padding: 0 12px; display: flex; align-items: center; gap: 8px; min-width: 0; }
 .field { width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
 .label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
 .prose-agent { overflow-wrap: anywhere; }

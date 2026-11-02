@@ -5,6 +5,8 @@ import { parse as parseYaml } from "yaml";
 export type TaskSpec = {
   // Always in the agent's own terminal, whatever the project's session mode.
   terminal?: boolean;
+  // As a chat, whatever the project's session mode.
+  chat?: boolean;
   // Replaces the project's check for this task; the project's tests still run.
   doneWhen?: string;
   // Stop and escalate once the worker has worked this long (from its first start)...

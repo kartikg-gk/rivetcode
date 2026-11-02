@@ -1,120 +1,93 @@
-import { Activity, Columns2, Plus, Search, Settings, Zap } from "lucide-react";
+import { Activity, Archive, BarChart2, ChevronDown, ChevronUp, Clock, Columns2, FileText, MessageSquarePlus, PanelLeft, Search, Settings, Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, onConnection, type RunRow } from "./api";
 import { Conversation } from "./Conversation";
+import { Home } from "./Home";
 import { AskDialog, Palette, Screens } from "./Screens";
 import { ago, repoName, runLabel, useApp, useLive } from "./state";
 
 const DOT: Record<string, string> = { active: "bg-accent", blocked: "bg-warn", waiting_input: "bg-warn", idle: "bg-muted", exited: "bg-line" };
 
-function Row({ r, depth }: { r: RunRow; depth: number }) {
+function Card({ r, depth }: { r: RunRow; depth: number }) {
   const { selected, set } = useApp();
-  const color = r.needsAnswer ? "bg-warn" : r.live ? DOT[r.activity ?? "idle"] ?? "bg-muted" : r.status === "failed" || r.status === "escalated" ? "bg-danger" : "bg-line";
+  const color = r.needsAnswer ? "bg-warn" : DOT[r.activity ?? "idle"] ?? "bg-muted";
   return (
-    <button onClick={() => set({ selected: r.id })} style={{ paddingLeft: 10 + depth * 14 }}
-      className={`w-full text-left pr-2 py-1.5 rounded-md flex items-center gap-2 cursor-pointer hover:bg-raised ${selected === r.id ? "bg-raised" : ""}`}>
-      <span aria-hidden className={`size-2 rounded-full shrink-0 ${color}`} />
-      <span className="truncate flex-1">{runLabel(r)}</span>
-      {r.needsAnswer && <span className="text-[11px] text-warn">question</span>}
-      <span className="text-[11px] text-muted shrink-0">{r.role === "orchestrator" ? "orch · " : ""}{r.agent} · {ago(r.createdAt)}</span>
+    <button onClick={() => set({ selected: r.id })} style={{ marginLeft: depth * 12 }}
+      className={`text-left rounded-xl px-3 py-2 grid gap-0.5 cursor-pointer hover:bg-raised ${selected === r.id ? "bg-raised" : ""}`}>
+      <span className="flex items-center gap-2 text-xs text-muted min-w-0">
+        <span aria-hidden className={`size-1.5 rounded-full shrink-0 ${color}`} />
+        <span className="truncate">{repoName(r.repo)}{r.organization.group ? ` · ${r.organization.group}` : ""}</span>
+        <span className="ml-auto shrink-0">{r.needsAnswer ? <span className="text-warn">question</span> : r.role === "orchestrator" ? "orchestrator" : ""}</span>
+      </span>
+      <span className="truncate font-medium">{runLabel(r)}</span>
     </button>
   );
 }
 
-function SplitButton() {
-  const { selected, beside, runs, set } = useApp();
-  return (
-    <button className="btn" title="Show another session beside this one" aria-label="Show another session beside this one" disabled={!selected}
-      onClick={() => set({ ask: {
-        title: "Show side by side", confirm: "Show",
-        fields: [{ name: "run", label: "Session", type: "select", value: beside ?? "", options: ["", ...runs.filter((r) => r.id !== selected).map((r) => r.id)], hint: "Empty closes the second column." }],
-        run: async (v) => { set({ beside: v.run || null }); },
-      } })}><Columns2 size={15} /></button>
-  );
-}
-
-function Sidebar() {
-  const { runs, set, repo } = useApp();
-  const [archived, setArchived] = useState<"hide" | "only" | "all">("hide");
-  const projects = useMemo(() => {
-    const shown = runs.filter((r) => archived === "all" || (archived === "only" ? !!r.organization.archivedAt : !r.organization.archivedAt));
-    const byRepo = new Map<string, RunRow[]>();
-    for (const r of [...shown].reverse()) byRepo.set(r.repo, [...(byRepo.get(r.repo) ?? []), r]);
-    return [...byRepo.entries()];
+function Sidebar({ close }: { close(): void }) {
+  const { runs, selected, beside, set } = useApp();
+  const [archived, setArchived] = useState(false);
+  const [settledOpen, setSettledOpen] = useState(true);
+  const { active, settled } = useMemo(() => {
+    const shown = [...runs].reverse().filter((r) => !!r.organization.archivedAt === archived);
+    const ids = new Set(shown.map((r) => `${r.id}-agent`));
+    const tops = shown.filter((r) => !r.orchestrator || !ids.has(r.orchestrator));
+    const going = (r: RunRow) => r.live || r.needsAnswer || shown.some((w) => w.orchestrator === `${r.id}-agent` && w.live);
+    return { active: tops.filter(going), settled: tops.filter((r) => !going(r)) };
   }, [runs, archived]);
+  const workers = (r: RunRow) => runs.filter((w) => w.orchestrator === `${r.id}-agent` && !!w.organization.archivedAt === archived);
+  const split = () => set({ ask: {
+    title: "Show side by side", confirm: "Show",
+    fields: [{ name: "run", label: "Session", type: "select", value: beside ?? "", options: ["", ...runs.filter((r) => r.id !== selected).map((r) => r.id)], hint: "Empty closes the second column." }],
+    run: async (v) => { set({ beside: v.run || null }); },
+  } });
+  const icon = (label: string, Icon: typeof Search, run: () => void, on = false) => (
+    <button className={`icon ${on ? "text-fg bg-raised" : ""}`} title={label} aria-label={label} aria-pressed={on} onClick={run}><Icon size={16} /></button>
+  );
   return (
-    <aside className="w-72 shrink-0 border-r border-line bg-panel flex flex-col min-h-0 max-md:hidden">
-      <div className="p-3 flex items-center gap-2 border-b border-line">
-        <span className="font-semibold text-base flex-1">Rivet</span>
-        <SplitButton />
-        <button className="btn" title="Search history" aria-label="Search history" onClick={() => set({ screen: "search" })}><Search size={15} /></button>
-        <button className="btn" title="Machine and recovery" aria-label="Machine and recovery" onClick={() => set({ screen: "health" })}><Activity size={15} /></button>
-        <button className="btn" title="Settings" aria-label="Settings" onClick={() => set({ screen: "settings" })}><Settings size={15} /></button>
+    <aside className="w-72 shrink-0 border-r border-line bg-panel flex flex-col min-h-0 max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-30 max-md:shadow-xl">
+      <div className="h-11 px-2 flex items-center gap-2">
+        {icon("Hide sidebar", PanelLeft, close)}
+        <span className="font-semibold">Rivet</span>
       </div>
-      <div className="p-3 grid gap-2 border-b border-line">
-        <button className="btn btn-primary justify-center" onClick={() => set({ screen: "new" })}><Plus size={15} /> New session</button>
-        <div className="grid grid-cols-3 gap-1 text-xs">
-          <button className="btn justify-center" onClick={() => set({ screen: "tasks" })}>Task file</button>
-          <button className="btn justify-center" onClick={() => set({ screen: "cues" })}>Cues</button>
-          <button className="btn justify-center" onClick={() => set({ screen: "automations" })}>Schedules</button>
-        </div>
+      <div className="px-2 pb-2 flex items-center gap-1">
+        <button className="flex-1 flex items-center gap-2 px-2 py-1.5 text-muted cursor-pointer hover:text-fg" onClick={() => set({ screen: "search" })}><Search size={16} /> Search</button>
+        {icon("Side by side", Columns2, split)}
+        {icon("New thread", MessageSquarePlus, () => set({ selected: null, beside: null }))}
       </div>
-      <nav className="flex-1 overflow-y-auto p-2 grid grid-cols-[minmax(0,1fr)] gap-3 content-start" aria-label="Sessions">
-        {projects.length === 0 && <p className="text-muted text-sm p-2">{archived === "only" ? "Nothing archived." : "No sessions yet. Start one above."}</p>}
-        {projects.map(([path, rows]) => <Project key={path} path={path} rows={rows} current={path === repo} />)}
+      <nav className="flex-1 overflow-y-auto p-2 grid grid-cols-[minmax(0,1fr)] gap-1 content-start" aria-label="Sessions">
+        {active.length === 0 && settled.length === 0 && <p className="text-muted text-sm p-2">{archived ? "Nothing archived." : "No threads yet."}</p>}
+        {active.flatMap((r) => [<Card key={r.id} r={r} depth={0} />, ...workers(r).map((w) => <Card key={w.id} r={w} depth={1} />)])}
       </nav>
-      <label className="p-2 border-t border-line text-xs text-muted flex items-center gap-2">Show
-        <select className="field py-0.5" value={archived} onChange={(e) => setArchived(e.target.value as typeof archived)}>
-          <option value="hide">active</option><option value="only">archived</option><option value="all">all</option>
-        </select>
-      </label>
-    </aside>
-  );
-}
-
-function Project({ path, rows, current }: { path: string; rows: RunRow[]; current: boolean }) {
-  const groups = new Map<string, RunRow[]>();
-  const known = new Set(rows.map((r) => `${r.id}-agent`));
-  for (const r of rows) if (!r.orchestrator || !known.has(r.orchestrator)) {
-    const g = r.organization.group;
-    groups.set(g, [...(groups.get(g) ?? []), r]);
-  }
-  return (
-    <section>
-      <div title={path} className={`px-2 text-xs font-semibold truncate ${current ? "text-accent" : "text-muted"}`}>{repoName(path)}</div>
-      {[...groups.entries()].map(([group, list]) => (
-        <div key={group}>
-          {group && <div className="px-2 mt-1 text-[11px] text-muted">{group}</div>}
-          {list.map((r) => (
-            <div key={r.id}>
-              <Row r={r} depth={0} />
-              {rows.filter((w) => w.orchestrator === `${r.id}-agent`).map((w) => <Row key={w.id} r={w} depth={1} />)}
-            </div>
-          ))}
-        </div>
-      ))}
-    </section>
-  );
-}
-
-function Home() {
-  const { set } = useApp();
-  return (
-    <div className="flex-1 grid place-items-center p-6 text-center">
-      <div className="grid gap-3 max-w-md justify-items-center">
-        <Zap size={28} className="text-accent" />
-        <h1 className="text-xl font-semibold">Pick a session, or start one</h1>
-        <p className="text-muted">Each worker gets its own worktree and branch. Rivet checks its work before opening a pull request, and you merge.</p>
-        <button className="btn btn-primary" onClick={() => set({ screen: "new" })}><Plus size={15} /> New session</button>
-        <p className="text-xs text-muted">Ctrl+K opens every command.</p>
+      {settled.length > 0 && (
+        <section className="max-h-[40%] flex flex-col min-h-0 px-2">
+          <button className="flex items-center gap-2 px-2 py-1 text-xs text-muted cursor-pointer" aria-expanded={settledOpen} onClick={() => setSettledOpen(!settledOpen)}>
+            {archived ? "Archived" : "Settled"}<span className="flex-1 border-t border-line" />{settledOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+          </button>
+          {settledOpen && <ul className="overflow-y-auto min-h-0">{settled.flatMap((r) => [r, ...workers(r)]).map((r) => (
+            <li key={r.id}><button onClick={() => set({ selected: r.id })} className={`w-full text-left px-2 py-1.5 rounded-lg flex gap-2 cursor-pointer text-muted hover:bg-raised ${selected === r.id ? "bg-raised text-fg" : ""}`}>
+              <span className="truncate flex-1">{runLabel(r)}</span><span className="text-xs shrink-0">{ago(r.createdAt)}</span>
+            </button></li>
+          ))}</ul>}
+        </section>
+      )}
+      <div className="p-2 flex items-center gap-1">
+        {icon("Settings", Settings, () => set({ screen: "settings" }))}
+        {icon("Machine and recovery", Activity, () => set({ screen: "health" }))}
+        {icon("Conflicts between workers", BarChart2, () => set({ screen: "radar" }))}
+        {icon("Cues", Sparkles, () => set({ screen: "cues" }))}
+        {icon("Schedules", Clock, () => set({ screen: "automations" }))}
+        {icon("Task file", FileText, () => set({ screen: "tasks" }))}
+        {icon(archived ? "Show active" : "Show archived", Archive, () => setArchived(!archived), archived)}
       </div>
-    </div>
+    </aside>
   );
 }
 
 export function App() {
   const { selected, beside, set, toast } = useApp();
   const [online, setOnline] = useState(true);
+  const [sidebar, setSidebar] = useState(() => innerWidth >= 768);
   const list = useLive(() => api<{ runs: RunRow[] }>("GET", "/runs"), []);
   useEffect(() => { if (list.data) set({ runs: list.data.runs }); }, [list.data]);
   useEffect(() => onConnection(setOnline), []);
@@ -134,7 +107,9 @@ export function App() {
     <div className="h-full flex flex-col">
       {!online && <div role="status" className="bg-danger text-white text-center text-sm py-1">Lost the daemon. Reconnecting… if this stays, run: rivet daemon start</div>}
       <div className="flex-1 flex min-h-0">
-        <Sidebar />
+        {sidebar ? <Sidebar close={() => setSidebar(false)} /> : (
+          <div className="w-11 shrink-0 border-r border-line bg-panel p-1"><button className="icon" title="Show sidebar" aria-label="Show sidebar" onClick={() => setSidebar(true)}><PanelLeft size={16} /></button></div>
+        )}
         <main className="flex-1 flex min-w-0 min-h-0">
           {selected ? <Conversation key={selected} id={selected} /> : <Home />}
           {selected && beside && beside !== selected && <div className="flex-1 flex min-w-0 border-l border-line"><Conversation key={beside} id={beside} /></div>}

@@ -1,12 +1,12 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { MoreHorizontal, Pencil, Send, X } from "lucide-react";
+import { ArrowUp, FileDiff, GitBranch, Info, ListTree, MoreHorizontal, Pencil, SquareTerminal, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import Markdown from "react-markdown";
 import { send, sessionActions, type Action } from "./actions";
 import { api, openTerminal, runPath, type Item, type Page, type RunDetail } from "./api";
-import { act, runLabel, toast, useApp, useLive } from "./state";
+import { act, repoName, runLabel, toast, useApp, useLive } from "./state";
 
 const SIDE_TABS = ["details", "changes", "terminal", "events", "raw", "branches", "provider"] as const;
 type Side = (typeof SIDE_TABS)[number];
@@ -40,7 +40,7 @@ function useTimeline(id: string, activity: boolean, session: string) {
 
 const WHO: Record<string, string> = { prompt: "Task", message: "You", assistant: "Agent", tool: "Tool", result: "Result", event: "Event" };
 
-function Entry({ item, id, canEdit, canFork }: { item: Item; id: string; canEdit: boolean; canFork: boolean }) {
+function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; task?: string; canEdit: boolean; canFork: boolean }) {
   const [full, setFull] = useState<string>();
   const set = useApp((s) => s.set);
   const text = full ?? item.text;
@@ -64,7 +64,7 @@ function Entry({ item, id, canEdit, canFork }: { item: Item; id: string; canEdit
   }, "forked");
   if (item.kind === "tool" || item.kind === "result" || item.kind === "event") {
     return (
-      <details className="border-l-2 border-line pl-3 text-[13px]">
+      <details className="text-[13px]">
         <summary className="cursor-pointer text-muted truncate">{WHO[item.kind]}{item.tool ? ` · ${item.tool}` : ""} · {text.split("\n")[0]?.slice(0, 100)}</summary>
         <pre className="mono whitespace-pre-wrap break-words mt-1 text-xs max-h-96 overflow-y-auto">{text}</pre>
       </details>
@@ -72,9 +72,8 @@ function Entry({ item, id, canEdit, canFork }: { item: Item; id: string; canEdit
   }
   const mine = item.kind === "message" || item.kind === "prompt";
   return (
-    <article className={`group grid gap-1 ${mine ? "rounded-lg bg-raised px-3 py-2" : ""}`}>
-      <header className="flex items-center gap-2 text-xs text-muted">
-        <span className="font-medium">{WHO[item.kind] ?? item.kind}</span><span>#{item.position}</span>
+    <article className={`group grid gap-1 ${mine ? "rounded-2xl bg-raised px-4 py-2.5 ml-auto max-w-[85%]" : ""}`}>
+      <header className="flex items-center gap-2 text-xs text-muted h-4">
         {item.streaming && <span className="text-accent">writing…</span>}
         <span className="ml-auto flex gap-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
           {canEdit && mine && <button className="cursor-pointer inline-flex items-center gap-1" onClick={edit}><Pencil size={11} /> Edit</button>}
@@ -82,7 +81,7 @@ function Entry({ item, id, canEdit, canFork }: { item: Item; id: string; canEdit
         </span>
       </header>
       {/* Agent text is data: markdown renders without raw HTML. */}
-      {mine ? <div className="whitespace-pre-wrap break-words">{text}</div>
+      {mine ? <div className="whitespace-pre-wrap break-words">{item.kind === "prompt" && task && text.includes(task) ? task : text}</div>
         : <div className="prose-agent"><Markdown components={{ a: (p) => <a href={p.href} target="_blank" rel="noreferrer noopener">{p.children}</a> }}>{text}</Markdown></div>}
       {item.nextTextOffset != null && full === undefined && <button className="btn justify-self-start text-xs" onClick={showAll}>Show all ({item.cut?.length} characters)</button>}
     </article>
@@ -93,7 +92,7 @@ function Question({ id, request }: { id: string; request: NonNullable<RunDetail[
   const [note, setNote] = useState("");
   const answer = (choice: string) => void act(() => api("POST", runPath(id, "/answer"), { choice, ...(note ? { note } : {}) }), "answered");
   return (
-    <section role="alert" className="border border-warn rounded-lg p-3 grid gap-2 m-3 mb-0">
+    <section role="alert" className="border border-warn rounded-2xl p-3 grid gap-2 mx-4 mt-2 max-w-3xl w-[calc(100%-2rem)] self-center">
       <div className="font-medium">The agent is asking to use {request.tool}</div>
       {request.detail && <pre className="mono text-xs whitespace-pre-wrap break-words max-h-40 overflow-y-auto">{request.detail}</pre>}
       <input className="field" placeholder="Note to the agent (optional)" aria-label="Note to the agent" value={note} onChange={(e) => setNote(e.target.value)} />
@@ -147,9 +146,9 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
   };
   return (
-    <div className="p-3 relative">
+    <div className="px-4 pb-4 pt-2 relative w-full max-w-3xl mx-auto">
       {menu.length > 0 && (
-        <ul role="listbox" aria-label="Commands" className="absolute bottom-full left-3 right-3 mb-1 max-h-72 overflow-y-auto rounded-lg border border-line bg-panel shadow-lg z-20">
+        <ul role="listbox" aria-label="Commands" className="absolute bottom-full left-4 right-4 mb-1 max-h-72 overflow-y-auto rounded-lg border border-line bg-panel shadow-lg z-20">
           {menu.map((a, i) => (
             <li key={a.id} role="option" aria-selected={i === pick % menu.length}>
               <button className={`w-full text-left px-3 py-1.5 cursor-pointer flex gap-3 hover:bg-raised ${i === pick % menu.length ? "bg-raised" : ""}`} onClick={() => { setText(""); a.run(""); }}>
@@ -159,16 +158,16 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
           ))}
         </ul>
       )}
-      <div className="rounded-lg border border-line bg-panel p-2 grid gap-2">
-        <textarea aria-label="Message to this session" rows={2} className="w-full bg-transparent resize-y outline-none" placeholder="Message this session, or / for commands"
+      <div className="composer">
+        <textarea aria-label="Message to this session" rows={2} className="w-full bg-transparent resize-none outline-none px-1" placeholder="Send a follow-up, or / for commands"
           value={text} onChange={(e) => { setText(e.target.value); setPick(0); }} onKeyDown={key} />
         <div className="flex items-center gap-2">
-          <label className="text-xs text-muted flex items-center gap-1">Deliver
-            <select className="field py-0.5 w-auto" value={mode} onChange={(e) => setMode(e.target.value)}>
+          <label className="text-xs text-muted flex items-center gap-1">
+            <select aria-label="When to deliver" className="bg-transparent outline-none cursor-pointer py-1" value={mode} onChange={(e) => setMode(e.target.value)}>
               <option value="steer">as soon as it can take it</option><option value="queue">once idle</option><option value="interrupt">stop its turn first</option>
             </select>
           </label>
-          <button className="btn btn-primary ml-auto" disabled={!text.trim()} onClick={submit}><Send size={14} /> Send</button>
+          <button className="send ml-auto" aria-label="Send" disabled={!text.trim()} onClick={submit}><ArrowUp size={17} /></button>
         </div>
       </div>
     </div>
@@ -181,7 +180,7 @@ function TerminalPane({ id, session }: { id: string; session: string }) {
   useEffect(() => {
     setNote(undefined);
     const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-    const term = new Terminal({ fontSize: 13, convertEol: false, theme: dark ? { background: "#101416" } : { background: "#ffffff", foreground: "#1a1f23", cursor: "#1a1f23" } });
+    const term = new Terminal({ fontSize: 13, convertEol: false, theme: dark ? { background: "#0b0b0b" } : { background: "#ffffff", foreground: "#1a1f23", cursor: "#1a1f23" } });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current!);
@@ -320,19 +319,19 @@ export function Conversation({ id }: { id: string }) {
   return (
     <div className="flex-1 flex min-w-0 min-h-0">
       <section className="flex-1 flex flex-col min-w-0 min-h-0">
-        <header className="px-3 py-2 border-b border-line flex items-center gap-2 flex-wrap relative">
-          <div className="min-w-0 flex-1">
-            <h2 className="font-medium truncate">{d ? runLabel({ id, name: d.run.name, task: d.run.task }) : id}</h2>
-            <div className="text-xs text-muted truncate">{d ? `${d.run.role} · ${d.run.node.agent} · ${d.run.node.status}${d.run.node.activity ? ` · ${d.run.node.activity}` : ""}` : "Loading…"}</div>
-          </div>
-          <label className="text-xs text-muted flex items-center gap-1"><input type="checkbox" checked={activity} onChange={(e) => setActivity(e.target.checked)} /> Tools</label>
-          <select aria-label="Which agent's record" className="field py-0.5 w-auto text-xs" value={session} onChange={(e) => setSession(e.target.value)}>
+        <header className="topbar relative">
+          {d && <span className="text-muted shrink-0 max-sm:hidden">{repoName(d.run.repo)}</span>}
+          {d && <span className="text-muted shrink-0 max-sm:hidden">/</span>}
+          <h2 className="font-medium truncate min-w-0">{d ? runLabel({ id, name: d.run.name, task: d.run.task }) : id}</h2>
+          <span className="text-xs text-muted shrink-0 truncate ml-1 mr-auto">{d ? `${d.run.node.agent} · ${d.run.node.activity && d.live ? d.run.node.activity : d.run.node.status}` : ""}</span>
+          <button className={`icon ${activity ? "text-fg bg-raised" : ""}`} title="Show tool steps" aria-label="Show tool steps" aria-pressed={activity} onClick={() => setActivity(!activity)}><ListTree size={16} /></button>
+          <select aria-label="Which agent's record" className="bg-transparent text-xs text-muted outline-none cursor-pointer" value={session} onChange={(e) => setSession(e.target.value)}>
             <option value="agent">agent</option><option value="review">reviewer</option><option value="partner">partner</option>
           </select>
-          <select aria-label="Side panel" className="field py-0.5 w-auto text-xs" value={side ?? ""} onChange={(e) => setSide((e.target.value || null) as Side | null)}>
-            <option value="">no panel</option>{SIDE_TABS.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
-          <button className="btn" aria-label="Session actions" aria-expanded={menu} onClick={() => setMenu(!menu)}><MoreHorizontal size={15} /></button>
+          {([["changes", "Changes", FileDiff], ["terminal", "Terminal", SquareTerminal], ["details", "Details", Info]] as const).map(([t, label, Icon]) => (
+            <button key={t} className={`icon ${side === t ? "text-fg bg-raised" : ""}`} title={label} aria-label={label} aria-pressed={side === t} onClick={() => setSide(side === t ? null : t)}><Icon size={16} /></button>
+          ))}
+          <button className="icon" aria-label="Session actions" aria-expanded={menu} onClick={() => setMenu(!menu)}><MoreHorizontal size={15} /></button>
           {menu && (
             <ul className="absolute right-3 top-full mt-1 z-30 w-72 rounded-lg border border-line bg-panel shadow-lg py-1 max-h-[70vh] overflow-y-auto">
               {actions.map((a) => (
@@ -344,13 +343,14 @@ export function Conversation({ id }: { id: string }) {
           )}
         </header>
         {d && !chat && d.run.node.agent === "claude" && <p className="px-3 py-1 text-xs text-muted border-b border-line">In a terminal, only Claude's last reply per turn is recorded, and none if it reports done first. The terminal panel has everything while it runs.</p>}
-        <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto p-4 grid grid-cols-[minmax(0,1fr)] gap-4 content-start" aria-live="off">
+        <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto" aria-live="off"><div className="w-full max-w-3xl mx-auto p-4 grid grid-cols-[minmax(0,1fr)] gap-4 content-start">
           {readError && <p className="text-danger">{readError}</p>}
           {items.length === 0 && !readError && <p className="text-muted">Nothing recorded yet.</p>}
-          {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
-        </div>
+          {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} task={d?.run.task} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
+        </div></div>
         {d?.pendingRequest && <Question id={id} request={d.pendingRequest} />}
         <Composer id={id} actions={actions} openSide={(t) => setSide(t)} />
+        {d?.run.node.branch && <div className="text-xs text-muted pb-2 -mt-2 flex justify-center items-center gap-1 truncate"><GitBranch size={12} />{d.run.node.branch}</div>}
       </section>
       {side && (
         <aside className="w-[46%] max-w-[760px] min-w-[320px] border-l border-line bg-panel flex flex-col min-h-0 max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:z-30 max-lg:w-[min(92vw,560px)]">
