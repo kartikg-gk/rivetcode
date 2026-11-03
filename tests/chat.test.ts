@@ -255,3 +255,12 @@ describe("a delta model name", () => {
     expect(deltaModel(undefined)).toEqual({});
   });
 });
+
+describe("Rivet's own tools in a delta session", () => {
+  it("are answered by Rivet when delta calls them", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "TOOL please", agent: "delta" })).json.runId as string;
+    await until("the reply", async () => said(await timeline(runId), "tool said: {"));
+  }, 30_000);
+});

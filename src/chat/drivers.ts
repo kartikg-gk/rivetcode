@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mcpLaunch } from "../mcp/launch.js";
+import { mcpTools, toolCaller } from "../mcp/server.js";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { describeTool } from "../timeline.js";
@@ -39,6 +40,8 @@ export type ChatOptions = {
   emit(e: ChatEvent): void;
   // Every line the agent wrote, as it came, for the record.
   raw?(line: string): void;
+  // Whether Rivet's own tools run without asking (the session may run rivet).
+  ownToolsFree?: boolean;
   // Answers a question on its own (e.g. a command the session is allowed), or leaves it to
   // be answered by rivet answer.
   decide(a: Approval): Choice | undefined;
@@ -521,6 +524,15 @@ export function deltaChat(o: ChatOptions): ChatDriver {
   // Delta logs each run under the folder it works in unless told otherwise; in a worktree
   // those logs would be committed with the work, so they go to Rivet's data folder.
   const logs = o.env.DELTA_LOG_DIR ?? join(o.env.RIVET_DATA_DIR ?? o.cwd, "logs", "delta", o.env.RIVET_SESSION_ID ?? "session");
+  // Rivet's own tools reach delta as tools it calls and Rivet answers (the same ones Claude
+  // and Codex get over MCP), so it need not type rivet commands into a shell.
+  const call = o.env.RIVET_SESSION_ID ? toolCaller(o.env, o.cwd) : null;
+  if (call && !override(o.env)) {
+    mkdirSync(logs, { recursive: true });
+    const file = join(logs, "rivet-tools.json");
+    writeFileSync(file, JSON.stringify(mcpTools.map((t) => ({ name: t.name, description: t.description, parameters: t.inputSchema, ...(o.ownToolsFree ? { approval: false } : {}) }))));
+    argv.push("--host-tools-file", file);
+  }
   const child = launch(argv, o.cwd, { ...o.env, DELTA_LOG_DIR: logs });
   const s = streamer(o.emit);
   const waiting = new Map<string, { resolve(v: unknown): void; reject(e: Error): void }>();
@@ -593,6 +605,13 @@ export function deltaChat(o: ChatOptions): ChatDriver {
         const auto = always.has(tool) || (o.permission === "accept-edits" && DELTA_EDITS.has(tool)) ? "yes" : o.decide(approval);
         if (auto) { answer(requestId, auto); return; }
         o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
+        return;
+      }
+      case "host_tool_call": {
+        const callId = text(e.callId);
+        const reply = (output: string, isError: boolean) => void send("respond_to_host_tool", { callId, output: output.slice(0, 200_000), isError }).catch(() => {});
+        if (!call) { reply("Rivet's tools are not available to this session.", true); return; }
+        void call(text(e.name), e.arguments ?? {}).then((r) => reply(JSON.stringify(r ?? null), false), (err: Error) => reply(err.message, true));
         return;
       }
       case "approval_resolved":

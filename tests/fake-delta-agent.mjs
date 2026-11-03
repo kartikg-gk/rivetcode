@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 const send = (record) => process.stdout.write(JSON.stringify(record) + "\n");
 const respond = (r, data = null) => send({ type: "response", command: r.type, success: true, id: r.id, data });
 let approval = null;
+let hostCall = null;
 
 async function turn(message) {
   send({ type: "agent_start" });
@@ -17,7 +18,15 @@ async function turn(message) {
     send({ type: "approval_resolved", approvalId: "approval-1", allow: allowed });
     send({ type: "tool_execution_end", toolCallId: "call-1", toolName: "Bash", result: { content: [{ type: "text", text: allowed ? "published" : "denied" }] }, isError: !allowed });
   }
-  const reply = `echo: ${message.split("\n")[0]}`;
+  let told = "";
+  if (message.includes("TOOL")) {
+    const output = await new Promise((resolve) => {
+      hostCall = resolve;
+      send({ type: "host_tool_call", callId: "h1", name: "rivet_status", arguments: {} });
+    });
+    told = ` tool said: ${output.slice(0, 1)}`;
+  }
+  const reply = `echo: ${message.split("\n")[0]}${told}`;
   send({ type: "message_start", message: { role: "assistant", content: [] } });
   send({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: reply.slice(0, 4) }] } });
   send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: reply }], usage: { totalTokens: 12, input: 10, output: 2, cacheRead: 0 } } });
@@ -31,6 +40,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   else if (r.type === "get_session_stats") respond(r, { contextUsage: { tokens: 12, contextWindow: 1000 } });
   else if (r.type === "prompt") { respond(r); void turn(r.message); }
   else if (r.type === "respond_to_approval") { respond(r); approval?.resolve(r.allow); approval = null; }
+  else if (r.type === "respond_to_host_tool") { respond(r); hostCall?.(r.isError ? `!${r.output}` : r.output); hostCall = null; }
   else if (r.type === "shutdown") { respond(r); process.exit(0); }
   else respond(r);
 });
