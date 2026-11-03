@@ -1020,6 +1020,23 @@ export function createScheduler(d: SchedulerDeps) {
   // A switch waits this long for the agent to finish its turn (unless told to cut it short).
   const SWITCH_WAIT_MS = 100_000;
 
+  // A pull request opened elsewhere (by hand, or by another tool) is watched like one Rivet
+  // opened: its checks, reviews and merge reach this run. One per run; null stops watching.
+  async function linkPr(runId: string, number: number | null): Promise<{ number: number; url: string } | null> {
+    const run = await load(runId);
+    if (number === null) {
+      await d.write(() => { d.store.clearPr(runId); d.store.updateNode(runId, NODE_ID, { prStatus: null }); });
+      return null;
+    }
+    if (!d.github) throw new SchedulerError(409, "GitHub is not available to this daemon");
+    const github = await d.github(run);
+    try { await github.facts(number); } catch (e) { throw new SchedulerError(409, `cannot read pull request #${number}: ${(e as Error).message}`); }
+    const pr = { number, url: `https://github.com/${github.repo}/pull/${number}` };
+    await d.write(() => { d.store.setPr(runId, pr); d.store.updateNode(runId, NODE_ID, { prStatus: null }); });
+    void checkPr(runId).catch(report);
+    return pr;
+  }
+
   async function switchAgent(runId: string, to: Node["agent"], model?: string, now = false, waitMs = SWITCH_WAIT_MS): Promise<void> {
     let run = await load(runId);
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
@@ -1201,7 +1218,7 @@ export function createScheduler(d: SchedulerDeps) {
     try { await work; return true; } finally { startingForks.delete(runId); }
   }
 
-  return { chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { linkPr, chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

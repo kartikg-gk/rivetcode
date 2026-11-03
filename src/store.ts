@@ -91,6 +91,7 @@ export type Store = {
   // A run's pull request; "handled" remembers which feedback was already acted on.
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
+  clearPr(runId: string): void;
   // Review passes over a run's pull request, oldest first.
   startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
   endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
@@ -1498,6 +1499,10 @@ export function openStore(data: string): Store {
         ON CONFLICT (run_id) DO UPDATE SET number = excluded.number, url = excluded.url, handled = excluded.handled`)
         .run(runId, pr.number, pr.url, pr.handled ?? null);
       logEvent(runId, null, "pr", { number: pr.number, handled: pr.handled ?? null });
+    },
+
+    clearPr(runId) {
+      if (db.prepare("DELETE FROM pull_requests WHERE run_id = ?").run(runId).changes) logEvent(runId, null, "pr", { number: null });
     },
 
     getTerminateOnPrMerge(runId) {

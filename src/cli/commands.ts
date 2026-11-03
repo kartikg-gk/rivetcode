@@ -66,7 +66,7 @@ const USAGE = `usage: rivet <command>
   review submit --verdict approved|changes_requested --summary <text> [--comment "<path>:<line>: <text>" ...]
                                         submit a review (inside a reviewer)
   clean <run>                           remove a run's worktree (the branch stays)
-  switch <run> claude|codex [--model <id>] [--now]
+  switch <run> claude|codex|delta [--model <id>] [--now]
                                         hand a worker's task to another agent in the same worktree
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
   cue list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
@@ -1124,7 +1124,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "switch": {
         const { flags, rest } = parseFlags(args, ["model"]);
         const [runId, agent] = rest;
-        if (!runId || !agent) throw new UsageError("switch needs a run id and claude or codex");
+        if (!runId || !agent) throw new UsageError("switch needs a run id and claude, codex or delta");
         await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/switch`,
           { agent, ...(typeof flags.get("model") === "string" ? { model: flags.get("model") } : {}), ...(flags.get("now") === true ? { now: true } : {}) }, COMMAND_TIMEOUT_MS);
         io.out(`${runId} now runs ${agent}, picking up from where the work stands`);

@@ -30,7 +30,7 @@ export const COMMANDS: Command[] = [
   { name: "stop", args: "[run]", about: "stop a session", takesRun: true, build: (w) => ["stop", w[0]!] },
   { name: "resume", args: "[run]", about: "continue a stopped or escalated session", takesRun: true, build: (w) => ["resume", w[0]!] },
   { name: "switch", args: "[run] claude|codex", about: "hand a worker to the other agent", takesRun: true,
-    build: (w) => (w[1] === "claude" || w[1] === "codex" ? ["switch", w[0]!, w[1]] : needs("claude or codex")) },
+    build: (w) => (w[1] === "claude" || w[1] === "codex" || w[1] === "delta" ? ["switch", w[0]!, w[1]] : needs("claude, codex or delta")) },
   { name: "fork", args: "[run]", about: "branch a chat into a new session", takesRun: true, build: (w) => ["fork", w[0]!] },
   { name: "rollback", args: "[run] [turns]", about: "go back in a chat; files stay as they are", takesRun: true, build: (w) => ["rollback", w[0]!, "--turns", w[1] ?? "1"] },
   { name: "search", args: "<words>", about: "search every session's history", build: (_w, rest) => (rest ? ["search", rest] : needs("words to search for")) },

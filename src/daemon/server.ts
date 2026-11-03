@@ -1174,7 +1174,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (!job) throw new HttpError(404, "cleanup job is unavailable, possibly after restart; inspect the worktree and rerun clean for the same run (dirty worktrees remain protected)");
       reply(res, 200, job); return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|stop|merge-policy|review|switch))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|merge-policy|review|switch))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -1218,7 +1218,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const to = optionalString(payload.agent, "agent");
         if (!to || !AGENTS.includes(to as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
         const model = optionalString(payload.model, "model");
-        if (model && MODEL_FAMILIES[to === "claude" ? "codex" : "claude"]?.test(model)) throw new HttpError(400, `model "${model}" is not a ${to} model`);
+        if (model && (to === "claude" || to === "codex") && MODEL_FAMILIES[to === "claude" ? "codex" : "claude"]?.test(model)) throw new HttpError(400, `model "${model}" is not a ${to} model`);
         await scheduler.switchAgent(run.id, to as never, model, payload.now === true, opts.switchWaitMs);
         reply(res, 202, { runId: run.id, agent: to });
         return;
@@ -1229,6 +1229,12 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (action === "pr") {
         reply(res, 200, await scheduler.publish(run.id));
+        return;
+      }
+      if (action === "link-pr") {
+        const n = (await body(req)).number;
+        if (n !== null && (!Number.isSafeInteger(n) || (n as number) < 1)) throw new HttpError(400, "number must be a pull request number, or null to stop watching");
+        reply(res, 200, { pr: await scheduler.linkPr(run.id, n as number | null) });
         return;
       }
       if (action === "resume") {

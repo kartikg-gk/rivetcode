@@ -50,6 +50,11 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
       const r = await api<{ url: string }>("POST", runPath(id, "/pr"));
       toast(`pull request: ${r.url}`);
     }) },
+    { id: "link-pr", label: "Link pull request…", about: "watch an existing pull request for this run; empty stops watching", args: "[number]", run: (rest) => ask({
+      title: "Link pull request", note: "Rivet watches its checks, reviews and merge like one it opened. One per run.", confirm: "Save",
+      fields: [{ name: "number", label: "Pull request number (empty: stop watching)", type: "number", value: rest.trim() || String(d?.pr?.number ?? "") }],
+      run: (v) => api("POST", runPath(id, "/link-pr"), { number: v.number ? Number(v.number) : null }),
+    }) },
     { id: "review", label: "Review pull request", about: "have a reviewer agent review this worker's pull request", run: () => post("/review", undefined, "review started") },
     { id: "policy", label: d?.terminateOnPrMerge ? "Keep after merge" : "End on merge", about: "whether this run ends once its pull request merges", run: () => void act(
       () => api("PATCH", runPath(id, "/merge-policy"), { terminateOnPrMerge: !d?.terminateOnPrMerge }), "merge policy changed") },
