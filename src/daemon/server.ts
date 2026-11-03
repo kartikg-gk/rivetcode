@@ -68,6 +68,7 @@ function checkChatEvents(raw: unknown): ChatEvent[] {
   return out;
 }
 import type { ChatEvent } from "../chat/drivers.js";
+import { secretKeeper } from "./secrets.js";
 import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
@@ -224,10 +225,12 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     throw new Error(`daemon already running (pid ${owner.pid}, port ${owner.port}); refusing to start`);
   }
 
+  const secrets = secretKeeper(data);
   const store = openStore(data);
   try {
     store.exitStaleSessions();
     await emptyTrash(data);
+    await secrets.clear();
   } catch (error) { store.close(); throw error; }
 
   let claudeBinary: string | undefined;
@@ -266,6 +269,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   const branchChanges = new Set<string>();
   let wakeTimer: NodeJS.Timeout | undefined;
   const waitAbort = new AbortController();
+  // A secret given to a session goes when the session does.
+  runtime.onExit((sessionId) => { void secrets.forget(sessionId).catch(() => {}); });
   const scheduler = createScheduler({
     data, runFile, store, write, runtime, agents, launches, github,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
@@ -724,6 +729,36 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 200, await scheduler.agentCheck(runId));
       return;
     }
+    // An agent's request for a secret waits here until the person answers it in the app.
+    const secretAsk = /^\/api\/v1\/sessions\/([^/]+)\/secret$/.exec(path);
+    if (secretAsk) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const sessionId = secretAsk[1]!;
+      const { runId, nodeId } = session(sessionId);
+      const payload = await body(req);
+      const name = optionalString(payload.name, "name")?.trim() ?? "";
+      const why = optionalString(payload.why, "why")?.trim() ?? "";
+      if (!name || name.length > 100 || why.length > 500) throw new HttpError(400, "name (at most 100 characters) and why (at most 500) are required");
+      let wait;
+      try { wait = secrets.ask(sessionId, name, why); } catch (e) { throw new HttpError(409, (e as Error).message); }
+      await write(() => store.addTimeline(runId, nodeId, [{ kind: "event", text: `asked for a secret: ${name}` }])).catch(() => {});
+      await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
+      const r = await wait;
+      await write(() => store.addTimeline(runId, nodeId, [{ kind: "event", text: r.path ? `secret ${name} given as a file` : r.refused ? `secret ${name} refused` : `secret ${name} not answered in time` }])).catch(() => {});
+      reply(res, 200, r.path ? { path: r.path, note: "Read the file where a command needs the value. Never print, log or commit it; it is deleted when this session ends." } : { refused: true, ...(r.expired ? { expired: true } : {}) });
+      return;
+    }
+    const secretAnswer = /^\/api\/v1\/runs\/([^/]+)\/secret$/.exec(path);
+    if (secretAnswer) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const payload = await body(req);
+      const id = optionalString(payload.id, "id") ?? "";
+      const value = payload.refuse === true ? null : typeof payload.value === "string" && payload.value.length > 0 && payload.value.length <= 20_000 ? payload.value : undefined;
+      if (value === undefined) throw new HttpError(400, "value must be text of at most 20000 characters, or refuse must be true");
+      if (!(await secrets.answer(sessionIdOf(secretAnswer[1]!, NODE_ID), id, value))) throw new HttpError(409, "that request is no longer waiting");
+      reply(res, 204);
+      return;
+    }
     // Messages still waiting in Rivet for a session: listed, changed or withdrawn before they go out.
     const queued = /^\/api\/v1\/sessions\/([^/]+)\/queue(?:\/(\d+))?$/.exec(path);
     if (queued) {
@@ -1004,7 +1039,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           return {
             id: r.id, project: r.project, task: r.task, createdAt: r.createdAt, status: r.node.status, role: r.role, name: r.name,
             agent: r.node.agent, live: runtime.isAlive(sessionIdOf(r.id, r.node.id)), ...(r.orchestrator ? { orchestrator: r.orchestrator } : {}),
-            repo: r.repo, activity: r.node.activity ?? null, sessionMode: r.node.sessionMode ?? "terminal", organization: store.organization(r.id), needsAnswer: !!scheduler.pendingRequest(r.id),
+            repo: r.repo, activity: r.node.activity ?? null, sessionMode: r.node.sessionMode ?? "terminal", organization: store.organization(r.id), needsAnswer: !!scheduler.pendingRequest(r.id) || !!secrets.pending(sessionIdOf(r.id, NODE_ID)),
           };
         }));
         reply(res, 200, { runs });
@@ -1160,7 +1195,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
         const chatUsage = run.node.sessionMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {

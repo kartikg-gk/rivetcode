@@ -2,7 +2,7 @@
 export type RunRow = {
   id: string; project: string; task: string; createdAt: string; status: string; role: string; name: string; agent: string;
   live: boolean; orchestrator?: string; repo: string; activity: string | null; sessionMode: string;
-  organization: { archivedAt: string | null; group: string }; needsAnswer: boolean;
+  organization: { archivedAt: string | null; group: string; pinnedAt: string | null; snoozedUntil: string | null; unread: boolean; busy: string | null }; needsAnswer: boolean;
 };
 export type RunDetail = {
   run: {
@@ -14,6 +14,7 @@ export type RunDetail = {
   usage: { conversations: number; inputEquivalent: number; tokens: Record<string, number> };
   reviews: { id: number; sha: string; trigger: string; status?: string; verdict?: string; summary?: string }[];
   terminal: boolean; pendingRequest?: { tool: string; detail: string; at: string };
+  secretRequest?: { id: string; name: string; why: string; at: string };
   chatUsage?: { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
   fork?: { sourceRun: string; position: number; strategy: string; detached: boolean } | null;
 };

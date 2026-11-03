@@ -1,7 +1,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ArrowUp, FileDiff, GitBranch, Info, ListTree, MoreHorizontal, Pencil, SquareTerminal, X } from "lucide-react";
+import { ArrowUp, Clock, KeyRound, FileDiff, GitBranch, Info, ListTree, MoreHorizontal, Pencil, SquareTerminal, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import Markdown from "react-markdown";
 import { send, sessionActions, type Action } from "./actions";
@@ -102,6 +102,47 @@ function Question({ id, request }: { id: string; request: NonNullable<RunDetail[
         <button className="btn btn-danger" onClick={() => answer("no")}>Refuse</button>
       </div>
     </section>
+  );
+}
+
+// The value goes straight to the daemon, which writes it to a file only the agent's session
+// can use; it is never shown again, recorded, or put in the conversation.
+function SecretCard({ id, request }: { id: string; request: NonNullable<RunDetail["secretRequest"]> }) {
+  const [value, setValue] = useState("");
+  const answer = (refuse: boolean) => void act(async () => {
+    await api("POST", runPath(id, "/secret"), refuse ? { id: request.id, refuse: true } : { id: request.id, value });
+    setValue("");
+  }, refuse ? "refused" : "given privately");
+  return (
+    <form role="alert" className="border border-accent rounded-2xl p-3 grid gap-2 mx-4 mt-2 max-w-3xl w-[calc(100%-2rem)] self-center" onSubmit={(e) => { e.preventDefault(); if (value) answer(false); }}>
+      <div className="font-medium flex items-center gap-2"><KeyRound size={15} />The agent asks for a secret: {request.name}</div>
+      {request.why && <p className="text-sm text-muted whitespace-pre-wrap">{request.why}</p>}
+      <input type="password" autoComplete="off" spellCheck={false} aria-label={`Value for ${request.name}`} className="field" placeholder="Paste the value" value={value} onChange={(e) => setValue(e.target.value)} />
+      <p className="text-xs text-muted">The agent gets a file path, never the value. The file is deleted when this session ends.</p>
+      <div className="flex gap-2"><button className="btn btn-primary" disabled={!value}>Give privately</button><button type="button" className="btn btn-danger" onClick={() => answer(true)}>Refuse</button></div>
+    </form>
+  );
+}
+
+// Messages sent while the agent was busy wait here until they go out, and can still change.
+function Waiting({ id }: { id: string }) {
+  const set = useApp((s) => s.set);
+  const path = `/sessions/${encodeURIComponent(id)}-agent/queue`;
+  const { data } = useLive(() => api<{ messages: { id: number; message: string; mode: string }[] }>("GET", path), [id]);
+  if (!data?.messages.length) return null;
+  return (
+    <ul className="mx-4 mt-2 max-w-3xl w-[calc(100%-2rem)] self-center grid gap-1" aria-label="Waiting messages">
+      {data.messages.map((m) => (
+        <li key={m.id} className="flex items-center gap-2 rounded-xl border border-line px-3 py-1.5 text-sm">
+          <Clock size={13} className="text-muted shrink-0" /><span className="truncate flex-1">{m.message}</span>
+          <button className="text-xs text-muted cursor-pointer hover:text-fg" onClick={() => set({ ask: {
+            title: "Edit waiting message", confirm: "Save", fields: [{ name: "message", label: "Message", type: "textarea", value: m.message }],
+            run: (v) => api("PATCH", `${path}/${m.id}`, { message: v.message }),
+          } })}>Edit</button>
+          <button className="text-xs text-danger cursor-pointer" onClick={() => void act(() => api("DELETE", `${path}/${m.id}`), "cancelled")}>Cancel</button>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -311,7 +352,11 @@ export function Conversation({ id }: { id: string }) {
     if (d?.terminal) setSide((s) => s ?? "terminal");
   }, [d?.terminal]);
   useEffect(() => { if (stuck.current && list.current) list.current.scrollTop = list.current.scrollHeight; }, [items]);
-  const actions = useMemo(() => sessionActions(id, d), [id, d?.run.node.sessionMode, d?.run.role, d?.terminateOnPrMerge, d?.run.node.agent, d?.run.name]);
+  // Opening a session reads what was new in it.
+  const unread = useApp((s) => s.runs.find((r) => r.id === id)?.organization.unread);
+  useEffect(() => { if (unread) void api("PATCH", runPath(id, "/organization"), { unread: false }).catch(() => {}); }, [id, unread]);
+  const org = useApp((s) => s.runs.find((r) => r.id === id)?.organization);
+  const actions = useMemo(() => sessionActions(id, d), [id, d?.run.node.sessionMode, d?.run.role, d?.terminateOnPrMerge, d?.run.node.agent, d?.run.name, org?.pinnedAt, org?.snoozedUntil]);
   if (error) return (
     <div className="flex-1 grid place-items-center p-6 text-center"><div className="grid gap-2 justify-items-center"><p>{error}</p><button className="btn" onClick={() => set({ selected: null })}>Back</button></div></div>
   );
@@ -348,7 +393,9 @@ export function Conversation({ id }: { id: string }) {
           {items.length === 0 && !readError && <p className="text-muted">Nothing recorded yet.</p>}
           {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} task={d?.run.task} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
         </div></div>
+        {d?.secretRequest && <SecretCard key={d.secretRequest.id} id={id} request={d.secretRequest} />}
         {d?.pendingRequest && <Question id={id} request={d.pendingRequest} />}
+        <Waiting id={id} />
         <Composer id={id} actions={actions} openSide={(t) => setSide(t)} />
         {d?.run.node.branch && <div className="text-xs text-muted pb-2 -mt-2 flex justify-center items-center gap-1 truncate"><GitBranch size={12} />{d.run.node.branch}</div>}
       </section>

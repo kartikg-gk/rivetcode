@@ -17,10 +17,10 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
       run: (v) => api("POST", runPath(id, "/stop"), { keepWorkers: v.keep === "true" }),
     }) },
     { id: "resume", label: "Resume", about: "retry what was escalated or interrupted", run: () => post("/resume", undefined, "resuming") },
-    { id: "switch", label: "Switch agent…", about: "hand this worker to another agent in the same worktree", args: "claude|codex", run: (rest) => ask({
+    { id: "switch", label: "Switch agent…", about: "hand this worker to another agent in the same worktree", args: "claude|codex|delta", run: (rest) => ask({
       title: "Switch agent", note: "Waits for the current turn to end unless you cut it short.", confirm: "Switch",
       fields: [
-        { name: "agent", label: "Agent", type: "select", options: ["claude", "codex"], value: rest.trim() || (d?.run.node.agent === "claude" ? "codex" : "claude") },
+        { name: "agent", label: "Agent", type: "select", options: ["claude", "codex", "delta"].filter((a) => a !== d?.run.node.agent), value: rest.trim() || (d?.run.node.agent === "claude" ? "codex" : "claude") },
         { name: "model", label: "Model (optional)" }, { name: "now", label: "Cut the current turn short", type: "check" },
       ],
       run: (v) => api("POST", runPath(id, "/switch"), { agent: v.agent, ...(v.model ? { model: v.model } : {}), now: v.now === "true" }),
@@ -61,6 +61,21 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
       title: "Group session", confirm: "Save", fields: [{ name: "group", label: "Group (empty: none)", value: rest.trim() }],
       run: (v) => api("PATCH", runPath(id, "/organization"), { group: v.group ?? "" }),
     }) },
+    ...(() => {
+      const org = useApp.getState().runs.find((r) => r.id === id)?.organization;
+      const patch = (body: unknown, done: string) => void act(() => api("PATCH", runPath(id, "/organization"), body), done);
+      const later = (hours: number) => new Date(Date.now() + hours * 3600_000).toISOString();
+      return [
+        org?.pinnedAt ? { id: "unpin", label: "Unpin", about: "take this session off the pinned list", run: () => patch({ pinned: false }, "unpinned") }
+          : { id: "pin", label: "Pin", about: "keep this session at the top of the list", run: () => patch({ pinned: true }, "pinned") },
+        org?.snoozedUntil ? { id: "unsnooze", label: "Unsnooze", about: "show this session in the list again now", run: () => patch({ snoozedUntil: null }, "back in the list") }
+          : { id: "snooze", label: "Snooze…", about: "hide this session until a time", args: "[hours]", run: (rest: string) => ask({
+            title: "Snooze session", confirm: "Snooze", fields: [{ name: "hours", label: "Hours", type: "number", value: rest.trim() || "4" }],
+            run: (v) => api("PATCH", runPath(id, "/organization"), { snoozedUntil: later(Number(v.hours) || 4) }),
+          }) },
+        { id: "unread", label: "Mark unread", about: "show this session as having something new", run: () => patch({ unread: true }, "marked unread") },
+      ] as Action[];
+    })(),
     { id: "archive", label: "Archive", about: "hide this session from the list", run: () => void act(() => api("PATCH", runPath(id, "/organization"), { archived: true }), "archived") },
     { id: "unarchive", label: "Unarchive", about: "show this session in the list again", run: () => void act(() => api("PATCH", runPath(id, "/organization"), { archived: false }), "back in the list") },
     { id: "clean", label: "Remove worktree…", about: "remove this run's worktree; the branch stays and dirty worktrees are kept", run: () => ask({

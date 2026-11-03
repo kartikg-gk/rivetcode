@@ -83,6 +83,7 @@ const USAGE = `usage: rivet <command>
   login claude|codex                    log an agent's CLI in to its account (its own login)
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   report --done|--stuck|--needs-input --note <text>
+  secret <name> --why <text>            ask the person for a secret; prints a file path holding it
                                         report this session's state (inside an agent)
   check                                 run the project's check and tests on this worktree (inside a worker)
   delegate [--agent <name>] [--model <id>] [--review] [<task>]
@@ -317,6 +318,18 @@ async function report(args: string[], io: CliIo): Promise<number> {
   const sessionId = requireSession(io);
   const result = await callDaemon(io.env, "POST", "/api/v1/reports", { sessionId, kind: kinds[0], message: note }, COMMAND_TIMEOUT_MS);
   io.out(`reported ${kinds[0]} (#${(result as { id: number }).id})`);
+  return 0;
+}
+
+// The value is typed into the person's app; only the path of a file holding it comes back.
+async function secret(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args, ["why"]);
+  const why = flags.get("why");
+  if (rest.length !== 1 || typeof why !== "string" || !why.trim()) throw new UsageError("secret needs <name> and --why <text>");
+  const sessionId = requireSession(io);
+  const r = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/secret`, { name: rest[0], why }, 11 * 60_000) as { path?: string; refused?: boolean; expired?: boolean };
+  if (!r.path) { io.err(r.expired ? "not answered in time" : "refused"); return 1; }
+  io.out(r.path);
   return 0;
 }
 
@@ -1099,6 +1112,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         io.out(JSON.stringify(result)); return 0;
       }
       case "report": return await report(args, io);
+      case "secret": return await secret(args, io);
       case "send": return await send(args, io);
       case "answer": return await answer(args, io);
       case "read": return await read(args, io);
