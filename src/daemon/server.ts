@@ -548,7 +548,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const binary = (project && (await write(() => store.getConfig(project)))["delta.binary"]?.trim()) || "delta";
       const { execFile } = await import("node:child_process");
       const run = (args: string[], env: Record<string, string> = {}, input?: string) => new Promise<{ code: number; out: string }>((resolve) => {
-        const child = execFile(binary, args, { env: { ...process.env, ...env }, timeout: 60_000, windowsHide: true, shell: /\.(cmd|bat)$/i.test(binary) }, (error, stdout, stderr) =>
+        // Delta writes run logs where it starts unless told otherwise; not in whatever folder the daemon runs from.
+        const child = execFile(binary, args, { cwd: data, env: { ...process.env, DELTA_LOG_DIR: join(data, "logs", "delta", "daemon"), ...env }, timeout: 60_000, windowsHide: true, shell: /\.(cmd|bat)$/i.test(binary) }, (error, stdout, stderr) =>
           resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, out: `${stdout}${stderr}` }));
         child.stdin?.end(input ?? "");
       });
