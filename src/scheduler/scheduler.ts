@@ -192,7 +192,7 @@ export function createScheduler(d: SchedulerDeps) {
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
-    const chat = !run.spec?.terminal && (config["session.mode"] === "chat" || !!run.spec?.chat || !!fork || !!branch) && (node.agent === "claude" || node.agent === "codex");
+    const chat = !run.spec?.terminal && (config["session.mode"] === "chat" || !!run.spec?.chat || !!fork || !!branch || node.agent === "delta") && (node.agent === "claude" || node.agent === "codex" || node.agent === "delta");
     if (chat && run.spec?.denyTools?.length) {
       const summary = "task denyTools cannot be enforced by this chat provider; use terminal mode or remove the unsupported restriction explicitly";
       await d.write(() => d.store.updateNode(run.id,NODE_ID,{status:"escalated",summary}));
@@ -210,7 +210,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (chat && o.resume && !node.providerConversationId) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
     const argv = chat
       ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-host", encodeConfig({
-        inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex", binary: agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
+        inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex" | "delta", binary: node.agent === "delta" ? config["delta.binary"]?.trim() || agent.binary || "delta" : agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
         ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, ...replyAnchor(fork.items), context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.providerConversationId ? { fork: { providerId: branch.items.at(-1)?.providerConversationId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, ...replyAnchor(branch.items), context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
       })]
       : o.resume

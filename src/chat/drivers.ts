@@ -500,3 +500,157 @@ export function codexChat(o: ChatOptions): ChatDriver {
     exited: rpc.closed,
   };
 }
+
+// Delta's model is "provider/model" (its own catalog's names); either half may be left out.
+export function deltaModel(model: string | undefined): { provider?: string; model?: string } {
+  const m = model?.trim();
+  if (!m) return {};
+  const at = m.indexOf("/");
+  return at < 0 ? { model: m } : { ...(at > 0 ? { provider: m.slice(0, at) } : {}), ...(m.slice(at + 1) ? { model: m.slice(at + 1) } : {}) };
+}
+
+// Delta asks before any tool but reads; Rivet's levels decide which questions reach the user.
+const DELTA_POLICY: Record<string, string> = { "read-only": "deny", auto: "auto", "bypass-permissions": "auto" };
+const DELTA_EDITS = new Set(["Edit", "Write", "MultiEdit"]);
+
+// Delta over its own JSON-lines protocol (--mode rpc): one record per line each way.
+export function deltaChat(o: ChatOptions): ChatDriver {
+  const { provider, model } = deltaModel(o.model);
+  const argv = override(o.env) ?? [o.binary, "--mode", "rpc", "--cwd", o.cwd, "--tool-policy", DELTA_POLICY[o.permission] ?? "ask",
+    ...(provider ? ["--provider", provider] : []), ...(model ? ["--model", model] : []), ...(o.resume ? ["--resume", o.resume] : [])];
+  // Delta logs each run under the folder it works in unless told otherwise; in a worktree
+  // those logs would be committed with the work, so they go to Rivet's data folder.
+  const logs = o.env.DELTA_LOG_DIR ?? join(o.env.RIVET_DATA_DIR ?? o.cwd, "logs", "delta", o.env.RIVET_SESSION_ID ?? "session");
+  const child = launch(argv, o.cwd, { ...o.env, DELTA_LOG_DIR: logs });
+  const s = streamer(o.emit);
+  const waiting = new Map<string, { resolve(v: unknown): void; reject(e: Error): void }>();
+  const questions = new Map<string, string>();
+  const always = new Set<string>();
+  let next = 0, turns = 0, item = 0;
+  let activeTurn = "", itemId = "";
+  let settled: (() => void) | undefined;
+  const exited = new Promise<void>((resolve) => child.on("exit", () => {
+    for (const w of waiting.values()) w.reject(new Error("delta exited"));
+    waiting.clear();
+    settled?.();
+    resolve();
+  }));
+  const send = (type: string, fields: Record<string, unknown> = {}): Promise<unknown> => {
+    const id = `r${++next}`;
+    return new Promise((resolve, reject) => {
+      waiting.set(id, { resolve, reject });
+      child.stdin!.write(JSON.stringify({ id, type, ...fields }) + "\n");
+    });
+  };
+  const segments = (m: Record<string, unknown>) => (Array.isArray(m.content) ? m.content as Record<string, unknown>[] : []);
+  const said = (m: Record<string, unknown>) => segments(m).filter((c) => c.type === "text").map((c) => text(c.text)).join("");
+  function answer(requestId: string, choice: Choice): boolean {
+    const tool = questions.get(requestId);
+    if (tool === undefined) return false;
+    questions.delete(requestId);
+    if (choice === "always") always.add(tool);
+    void send("respond_to_approval", { approvalId: requestId, allow: choice !== "no" }).catch(() => {});
+    return true;
+  }
+  const onEvent = (e: Record<string, unknown>) => {
+    const m = (e.message ?? {}) as Record<string, unknown>;
+    switch (e.type) {
+      case "response": {
+        const w = waiting.get(text(e.id));
+        if (!w) return;
+        waiting.delete(text(e.id));
+        if (e.success) w.resolve(e.data); else w.reject(new Error(text(e.error) || "delta refused the request"));
+        return;
+      }
+      case "message_start":
+        if (m.role === "assistant") itemId = `delta-${activeTurn}-${++item}`;
+        return;
+      case "message_update":
+        if (m.role === "assistant" && itemId) { const t = said(m); if (t) s.grow(itemId, t, activeTurn); }
+        return;
+      case "message_end": {
+        if (m.role !== "assistant") return;
+        s.done(itemId, said(m), activeTurn);
+        const u = (m.usage ?? {}) as Record<string, unknown>;
+        if (num(u.totalTokens)) o.emit({ type: "usage", mode: "add", ...(num(u.input) !== undefined ? { input: num(u.input)! } : {}), ...(num(u.output) !== undefined ? { output: num(u.output)! } : {}), ...(num(u.cacheRead) !== undefined ? { cached: num(u.cacheRead)! } : {}), total: num(u.totalTokens)! });
+        return;
+      }
+      case "tool_execution_start":
+      case "tool_execution_end": {
+        const tool = text(e.toolName);
+        const done = e.type === "tool_execution_end";
+        const result = done ? segments((e.result ?? {}) as Record<string, unknown>).filter((c) => c.type === "text").map((c) => text(c.text)).join("") : "";
+        o.emit({ type: "activity", itemId: text(e.toolCallId), kind: DELTA_EDITS.has(tool) ? "file_change" : "command", status: !done ? "running" : e.isError ? "failed" : "completed",
+          summary: done ? tool : describeTool(e.args), tool, turnId: activeTurn, ...(result ? { output: result.slice(0, RESULT_LIMIT) } : {}) });
+        return;
+      }
+      case "approval_requested": {
+        const requestId = text(e.approvalId), tool = text(e.tool);
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse(text(e.preview)) as Record<string, unknown>; } catch { /* shown as given */ }
+        questions.set(requestId, tool);
+        const approval: Approval = { requestId, tool, detail: Object.keys(input).length ? describeTool(input) : text(e.preview), ...(typeof input.command === "string" ? { command: input.command } : {}) };
+        const auto = always.has(tool) || (o.permission === "accept-edits" && DELTA_EDITS.has(tool)) ? "yes" : o.decide(approval);
+        if (auto) { answer(requestId, auto); return; }
+        o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
+        return;
+      }
+      case "approval_resolved":
+        // Delta lets a question expire; one Rivet answered was removed when it did.
+        if (questions.delete(text(e.approvalId))) o.emit({ type: "activity", requestId: text(e.approvalId), kind: "approval", status: "resolved", summary: "expired", turnId: activeTurn });
+        return;
+      case "agent_settled": {
+        const outcome = text(e.outcome);
+        o.emit({ type: "turn", turnId: activeTurn, state: outcome === "completed" ? "completed" : outcome === "cancelled" ? "interrupted" : "failed", ...(e.error ? { error: text(e.error) } : {}) });
+        activeTurn = "";
+        void send("get_session_stats").then((st) => {
+          const c = ((st ?? {}) as Record<string, unknown>).contextUsage as Record<string, unknown> | undefined;
+          if (c) o.emit({ type: "usage", mode: "add", ...(num(c.tokens) !== undefined ? { contextUsed: num(c.tokens)! } : {}), ...(num(c.contextWindow) !== undefined ? { contextWindow: num(c.contextWindow)! } : {}) });
+        }).catch(() => {});
+        settled?.();
+        return;
+      }
+    }
+  };
+  let buffer = "";
+  child.stdout!.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let at: number;
+    while ((at = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, at).trim();
+      buffer = buffer.slice(at + 1);
+      if (!line) continue;
+      o.raw?.(line);
+      try { onEvent(JSON.parse(line) as Record<string, unknown>); } catch { /* not a record */ }
+    }
+  });
+  child.stderr!.on("data", () => {});
+  return {
+    async start() {
+      const st = (await send("get_state")) as Record<string, unknown>;
+      // The session file is what --resume takes; without one, the id at least names it.
+      o.emit({ type: "conversation", id: text(st.sessionFile) || text(st.sessionId) });
+    },
+    async prompt(message) {
+      activeTurn = `turn-${++turns}`;
+      o.emit({ type: "turn", turnId: activeTurn, state: "running" });
+      const ended = new Promise<void>((resolve) => { settled = resolve; });
+      try { await send("prompt", { message }); }
+      catch (e) { o.emit({ type: "turn", turnId: activeTurn, state: "failed", error: (e as Error).message }); activeTurn = ""; return; }
+      await Promise.race([ended, exited]);
+    },
+    async steer(message) {
+      if (!activeTurn) return false;
+      try { await send("steer", { message, requireActive: true }); return true; } catch { return false; }
+    },
+    async cancel() { if (activeTurn) await send("abort").catch(() => {}); },
+    answer,
+    get running() { return activeTurn !== ""; },
+    async compact() { await send("compact"); },
+    close() {
+      void send("shutdown").catch(() => {});
+      setTimeout(() => child.kill(), 3000).unref();
+    },
+    exited,
+  };
+}

@@ -1,6 +1,7 @@
 import type { Permission, PromptVia } from "./command.js";
 import { claudeAgent } from "./claude.js";
 import { codexAgent } from "./codex.js";
+import { deltaAgent } from "./delta.js";
 import { fakeAgent } from "./fake.js";
 
 export type AgentLaunch = {
@@ -41,7 +42,7 @@ export type Agent = {
   prepare?(o: { workspace: string; headless: boolean }): Promise<void>;
 };
 
-export type AgentName = "claude" | "codex" | "fake";
+export type AgentName = "claude" | "codex" | "fake" | "delta";
 
 export function getAgent(name: AgentName, opts: { binary?: string; claudeConfig?: string } = {}): Agent {
   switch (name) {
@@ -51,6 +52,8 @@ export function getAgent(name: AgentName, opts: { binary?: string; claudeConfig?
       return codexAgent(opts.binary ?? "codex");
     case "fake":
       return fakeAgent();
+    case "delta":
+      return deltaAgent(opts.binary ?? "delta");
     default:
       throw new Error(`unknown agent "${String(name)}"`);
   }

@@ -227,7 +227,7 @@ const STATUSES = ["pending", "running", "waiting", "integrating", "done", "faile
 
 // Numbered schema changes, applied in order and recorded once each. Never edit a
 // shipped migration; add the next number instead.
-const MIGRATIONS: { version: number; sql: string }[] = [];
+const MIGRATIONS: { version: number; sql: string; run?(db: DatabaseSync): void }[] = [];
 
 const INIT = `
 CREATE TABLE IF NOT EXISTS runs (
@@ -374,6 +374,13 @@ ALTER TABLE runs ADD COLUMN issue INTEGER;
 
 // Chat sessions: how each session runs, and the conversation of a chat session (its
 // turns, readable messages and activities), kept by Rivet.
+// Adds the "delta" agent. The nodes table is copied with its current definition, only
+// the agent list changed, since SQLite cannot change a CHECK constraint in place.
+MIGRATIONS.push({ version: 29, sql: "", run: (db) => {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get() as { sql: string };
+  const sql = row.sql.replace(/agent IN \([^)]*\)/, `agent IN (${oneOf(AGENTS)})`).replace(/^CREATE TABLE "?nodes"?/, "CREATE TABLE nodes_v29");
+  db.exec(`${sql}; INSERT INTO nodes_v29 SELECT * FROM nodes; DROP TABLE nodes; ALTER TABLE nodes_v29 RENAME TO nodes;`);
+} });
 MIGRATIONS.push({version:28,sql:`ALTER TABLE conversation_branches ADD COLUMN strategy TEXT NOT NULL DEFAULT 'original';`});
 MIGRATIONS.push({version:27,sql:`CREATE TABLE run_organization(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, archived_at TEXT, group_name TEXT NOT NULL DEFAULT '');`});
 MIGRATIONS.push({version:26,sql:`CREATE TABLE recovery_journal(sequence INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, operation TEXT NOT NULL, recorded_at TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT NOT NULL, changes BLOB NOT NULL);`});
@@ -633,6 +640,7 @@ function migrate(db: DatabaseSync): void {
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(m.sql);
+      m.run?.(db);
       record.run(m.version, new Date().toISOString());
       db.exec("COMMIT");
     } catch (e) {

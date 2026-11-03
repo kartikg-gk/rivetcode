@@ -87,6 +87,8 @@ const CONFIG_KEYS = [
   "worker.model",
   "claude.model",
   "codex.model",
+  "delta.model",
+  "delta.binary",
   "worker.allowedTools",
   "worker.mode",
   "pr",
@@ -530,6 +532,42 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         findClaude: () => findClaude(), findCodex: () => findCodex(), loadPty: () => loadPty() !== null,
         daemonUp: async () => true, githubToken: () => githubToken(process.env, remote),
       })) });
+      return;
+    }
+    // Delta keeps its own provider keys (its config file, owner-only); Rivet only hands a
+    // key over through the environment, so it is never on a command line, stored or logged.
+    if (path === "/api/v1/delta" || path === "/api/v1/delta/key") {
+      const q = new URL(req.url!, "http://x").searchParams;
+      const payload = req.method === "POST" ? await body(req) : {};
+      const project = optionalString(payload.project ?? q.get("project") ?? undefined, "project") ?? "";
+      const binary = (project && (await write(() => store.getConfig(project)))["delta.binary"]?.trim()) || "delta";
+      const { execFile } = await import("node:child_process");
+      const run = (args: string[], env: Record<string, string> = {}, input?: string) => new Promise<{ code: number; out: string }>((resolve) => {
+        const child = execFile(binary, args, { env: { ...process.env, ...env }, timeout: 60_000, windowsHide: true, shell: /\.(cmd|bat)$/i.test(binary) }, (error, stdout, stderr) =>
+          resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, out: `${stdout}${stderr}` }));
+        child.stdin?.end(input ?? "");
+      });
+      if (path === "/api/v1/delta/key") {
+        if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+        const provider = optionalString(payload.provider, "provider") ?? "";
+        const key = typeof payload.key === "string" ? payload.key.trim() : "";
+        if (!/^[a-z0-9_-]{1,40}$/.test(provider)) throw new HttpError(400, "provider must be one of delta's provider names");
+        if (!key || key.length > 1000 || /\s/.test(key)) throw new HttpError(400, "key must be one line of text");
+        const r = await run(["config", "--provider", provider], { DELTA_API_KEY: key });
+        const said = r.out.split(key).join("[key]").trim().split("\n").slice(-3).join("\n");
+        if (r.code !== 0) throw new HttpError(409, said || `delta config failed (${r.code})`);
+        reply(res, 200, { saved: provider });
+        return;
+      }
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      // Its provider names come from its own refusal of an unknown one.
+      const list = await run(["config", "--provider=unknown", "--model=unknown"]);
+      const providers = /Choose one of: (.+)/.exec(list.out)?.[1]?.split(",").map((p) => p.trim()).filter(Boolean) ?? [];
+      const models = await run(["--mode", "rpc", "--no-session"], {}, `${JSON.stringify({ id: "m", type: "get_available_models" })}\n${JSON.stringify({ id: "s", type: "shutdown" })}\n`);
+      const found = models.out.split("\n").map((l) => { try { return JSON.parse(l) as { id?: string; data?: { models?: { provider: string; id: string }[] } }; } catch { return null; } })
+        .find((r) => r?.id === "m")?.data?.models ?? [];
+      if (!providers.length && !found.length) throw new HttpError(409, `cannot run delta (${binary}): set delta.binary to a delta with --mode rpc`);
+      reply(res, 200, { providers, models: found.map((m) => ({ provider: m.provider, id: m.id })) });
       return;
     }
     if (path === "/api/v1/tasks/parse") {

@@ -1,5 +1,5 @@
 // "fake" runs a scripted stand-in instead of a model, for end-to-end tests.
-export const AGENTS = ["claude", "codex", "fake"] as const;
+export const AGENTS = ["claude", "codex", "fake", "delta"] as const;
 export const STATUSES = ["pending", "running", "done", "failed", "escalated"] as const;
 // A worker does one task in its own worktree and opens its own pull request; an
 // orchestrator only coordinates: it starts workers, messages them and reports.

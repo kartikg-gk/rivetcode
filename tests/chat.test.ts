@@ -230,3 +230,28 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s 
 it("escalates a timed-out completion without publishing or replaying consumed guidance",async()=>{
  process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"session.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("active",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="active");await api("POST","/api/v1/reports",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
 },30000);
+
+describe("a delta chat session", () => {
+  it("runs as a chat whatever the session mode, and asks Rivet before a command", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "RUN it", agent: "delta", model: "openai/gpt-5-mini" })).json.runId as string;
+    await until("the question", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest?.tool === "Bash");
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.run.node.sessionMode).toBe("chat");
+    await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" });
+    await until("the reply", async () => said(await timeline(runId), "echo: Your task: RUN it"));
+    const items = await timeline(runId);
+    expect(items.some((i) => i.kind === "tool" && i.text.includes("published"))).toBe(true);
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.chatUsage).toMatchObject({ total: 12, contextUsed: 12, contextWindow: 1000 });
+  }, 30_000);
+});
+
+describe("a delta model name", () => {
+  it("splits into provider and model", async () => {
+    const { deltaModel } = await import("../src/chat/drivers.js");
+    expect(deltaModel("openai/gpt-5-mini")).toEqual({ provider: "openai", model: "gpt-5-mini" });
+    expect(deltaModel("gpt-5")).toEqual({ model: "gpt-5" });
+    expect(deltaModel("openrouter/meta/llama")).toEqual({ provider: "openrouter", model: "meta/llama" });
+    expect(deltaModel(undefined)).toEqual({});
+  });
+});

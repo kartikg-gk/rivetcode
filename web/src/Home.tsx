@@ -82,7 +82,7 @@ export function Home() {
               <textarea autoFocus aria-label="What to build" rows={3} className="w-full bg-transparent resize-none outline-none px-1" placeholder="Describe the task"
                 value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); start(); } }} />
               <div className="flex items-center gap-1 flex-wrap">
-                <ModelPicker agent={agent} model={model} pick={(a, m) => { setAgent(a); setModel(m); }} />
+                <ModelPicker project={project} agent={agent} model={model} pick={(a, m) => { setAgent(a); setModel(m); }} />
                 {repo && <Access project={project} />}
                 <Pop label={role === "worker" ? "Worker" : "Orchestrator"}>
                   {(close) => <ul className="p-1">{[["worker", "Worker", "One task, own worktree and PR"], ["orchestrator", "Orchestrator", "Splits work into workers"]].map(([v, l, about]) => (
