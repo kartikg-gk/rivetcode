@@ -1,17 +1,10 @@
-import { ArrowUp, ChevronDown, GitBranch, Lock, Search, SlidersHorizontal } from "lucide-react";
+import { ArrowUp, ChevronDown, GitBranch, Lock, SlidersHorizontal } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { startSession } from "./actions";
 import { api } from "./api";
+import { ModelPicker } from "./ModelPicker";
 import { act, repoName, useApp, useLive } from "./state";
 
-// Claude takes these names; Codex's list is its own, so a name is typed there.
-const MODELS: Record<string, { label: string; value: string }[]> = {
-  claude: [
-    { label: "Claude Opus", value: "opus" }, { label: "Claude Sonnet", value: "sonnet" },
-    { label: "Claude Fable", value: "fable" }, { label: "Claude Haiku", value: "haiku" },
-  ],
-  codex: [{ label: "Codex default", value: "" }],
-};
 const ACCESS = [
   { value: "default", label: "Ask first" }, { value: "accept-edits", label: "Accept edits" },
   { value: "auto", label: "Auto" }, { value: "bypass-permissions", label: "Full access" },
@@ -33,37 +26,6 @@ function Pop({ label, icon, children }: { label: string; icon?: ReactNode; child
       <button className="pill" aria-expanded={open} onClick={() => setOpen(!open)}>{icon}{label}<ChevronDown size={13} /></button>
       {open && <div className="absolute top-full left-0 mt-1 z-30 w-72 rounded-xl border border-line bg-panel shadow-xl overflow-hidden">{children(() => setOpen(false))}</div>}
     </div>
-  );
-}
-
-function ModelPicker({ agent, model, pick }: { agent: string; model: string; pick(agent: string, model: string): void }) {
-  const [q, setQ] = useState("");
-  const [tab, setTab] = useState(agent);
-  const label = MODELS[agent]!.find((m) => m.value === model)?.label ?? model;
-  return (
-    <Pop label={label || "Model"}>
-      {(close) => {
-        const shown = MODELS[tab]!.filter((m) => m.label.toLowerCase().includes(q.toLowerCase()));
-        const typed = q.trim();
-        const choose = (m: string) => { pick(tab, m); setQ(""); close(); };
-        return (
-          <div className="flex">
-            <div className="grid content-start gap-1 p-1 border-r border-line">
-              {Object.keys(MODELS).map((a) => <button key={a} className={`rounded-md px-2 py-1 text-xs capitalize cursor-pointer ${tab === a ? "bg-raised" : "text-muted"}`} onClick={() => setTab(a)}>{a}</button>)}
-            </div>
-            <div className="flex-1 min-w-0">
-              <label className="flex items-center gap-2 px-3 py-2 border-b border-line"><Search size={14} className="text-muted" />
-                <input autoFocus aria-label="Search or type a model" className="bg-transparent outline-none w-full" placeholder="Search or type a model" value={q} onChange={(e) => setQ(e.target.value)} />
-              </label>
-              <ul className="max-h-64 overflow-y-auto p-1">
-                {shown.map((m) => <li key={m.label}><button className={`w-full text-left rounded-md px-2 py-1.5 cursor-pointer hover:bg-raised ${agent === tab && m.value === model ? "bg-raised" : ""}`} onClick={() => choose(m.value)}>{m.label}</button></li>)}
-                {typed && !shown.some((m) => m.value === typed) && <li><button className="w-full text-left rounded-md px-2 py-1.5 cursor-pointer hover:bg-raised" onClick={() => choose(typed)}>Use "{typed}"</button></li>}
-              </ul>
-            </div>
-          </div>
-        );
-      }}
-    </Pop>
   );
 }
 
