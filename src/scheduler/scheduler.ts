@@ -495,6 +495,8 @@ export function createScheduler(d: SchedulerDeps) {
     if (d.launches.get(sessionId) !== launchId) return;
     const waiter = exitWaiters.get(launchId);
     const runId = sessionId.slice(0, sessionId.indexOf("-"));
+    // Background work a session said it was waiting on ends with it.
+    if (sessionId === sessionIdOf(runId, NODE_ID)) await d.write(() => d.store.organization(runId).busy ? d.store.organizeRun(runId, { busy: null }) : undefined).catch(report);
     if (sessionId === reviewSession(runId)) {
       await reviewerExited(runId);
       return;

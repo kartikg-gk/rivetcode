@@ -33,9 +33,14 @@ export type Run = {
 };
 
 export type ConversationBranch = { id: string; parent: string | null; items: TimelineItem[]; snapshot: TimelineItem[]; provider: string; agent: string; active: boolean; strategy:string };
+// How a thread is kept in the list. busy: a note while the agent says background work it
+// started is still running; unread: something new since it was last opened.
+export type Organization = { archivedAt: string | null; group: string; pinnedAt: string | null; snoozedUntil: string | null; unread: boolean; busy: string | null };
+export type OrganizationPatch = { name?: string; archived?: boolean; group?: string; pinned?: boolean; snoozedUntil?: string | null; unread?: boolean; busy?: string | null };
+
 export type Store = {
-  organizeRun(runId:string,patch:{name?:string;archived?:boolean;group?:string}):void;
-  organization(runId:string):{archivedAt:string|null;group:string};
+  organizeRun(runId:string,patch:OrganizationPatch):void;
+  organization(runId:string):Organization;
   journalEntries(after:number,limit:number):{sequence:number;schemaVersion:number;operation:string;recordedAt:string;hash:string;bytes:number}[];
   recoveryStatus(): ReturnType<typeof recoveryStatus>;
   verifyJournal(): ReturnType<typeof verifyJournal>;
@@ -72,6 +77,9 @@ export type Store = {
   // interrupt (its current turn is stopped first).
   queueMessage(runId: string, nodeId: string, message: string, from?: string, mode?: SendMode): number | null;
   undeliveredMessages(runId: string, nodeId: string): { id: number; message: string; mode: SendMode }[];
+  // A message still waiting in Rivet can be changed or withdrawn; false once it has gone out.
+  editQueued(runId: string, nodeId: string, id: number, message: string): boolean;
+  cancelQueued(runId: string, nodeId: string, id: number): boolean;
   markDelivered(id: number): void;
   // After a daemon restart no agent is running; returns how many nodes were changed.
   exitStaleSessions(): number;
@@ -381,6 +389,7 @@ MIGRATIONS.push({ version: 29, sql: "", run: (db) => {
   const sql = row.sql.replace(/agent IN \([^)]*\)/, `agent IN (${oneOf(AGENTS)})`).replace(/^CREATE TABLE "?nodes"?/, "CREATE TABLE nodes_v29");
   db.exec(`${sql}; INSERT INTO nodes_v29 SELECT * FROM nodes; DROP TABLE nodes; ALTER TABLE nodes_v29 RENAME TO nodes;`);
 } });
+MIGRATIONS.push({version:30,sql:`ALTER TABLE run_organization ADD COLUMN pinned_at TEXT; ALTER TABLE run_organization ADD COLUMN snoozed_until TEXT; ALTER TABLE run_organization ADD COLUMN unread INTEGER NOT NULL DEFAULT 0; ALTER TABLE run_organization ADD COLUMN busy TEXT;`});
 MIGRATIONS.push({version:28,sql:`ALTER TABLE conversation_branches ADD COLUMN strategy TEXT NOT NULL DEFAULT 'original';`});
 MIGRATIONS.push({version:27,sql:`CREATE TABLE run_organization(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, archived_at TEXT, group_name TEXT NOT NULL DEFAULT '');`});
 MIGRATIONS.push({version:26,sql:`CREATE TABLE recovery_journal(sequence INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, operation TEXT NOT NULL, recorded_at TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT NOT NULL, changes BLOB NOT NULL);`});
@@ -759,8 +768,8 @@ export function openStore(data: string): Store {
     verifyJournal:()=>verifyJournal(db),
     snapshot:path=>snapshotStore(db,path),
     organization(runId) {
-      const row=db.prepare("SELECT archived_at AS archivedAt,group_name AS 'group' FROM run_organization WHERE run_id=?").get(runId) as {archivedAt:string|null;group:string}|undefined;
-      return row??{archivedAt:null,group:""};
+      const row=db.prepare("SELECT archived_at AS archivedAt,group_name AS 'group',pinned_at AS pinnedAt,snoozed_until AS snoozedUntil,unread,busy FROM run_organization WHERE run_id=?").get(runId) as (Omit<Organization,"unread">&{unread:number})|undefined;
+      return row?{...row,unread:!!row.unread}:{archivedAt:null,group:"",pinnedAt:null,snoozedUntil:null,unread:false,busy:null};
     },
     organizeRun(runId,patch) {
       if(!selectRun.get(runId))throw new RunStoreError("unknown run");
@@ -768,7 +777,12 @@ export function openStore(data: string): Store {
       db.prepare("INSERT OR IGNORE INTO run_organization(run_id) VALUES (?)").run(runId);
       if(patch.archived!==undefined)db.prepare("UPDATE run_organization SET archived_at=? WHERE run_id=?").run(patch.archived?new Date().toISOString():null,runId);
       if(patch.group!==undefined)db.prepare("UPDATE run_organization SET group_name=? WHERE run_id=?").run(patch.group,runId);
-      logEvent(runId,NODE_ID,"thread.organized",patch);
+      if(patch.pinned!==undefined)db.prepare("UPDATE run_organization SET pinned_at=? WHERE run_id=?").run(patch.pinned?new Date().toISOString():null,runId);
+      if(patch.snoozedUntil!==undefined)db.prepare("UPDATE run_organization SET snoozed_until=? WHERE run_id=?").run(patch.snoozedUntil,runId);
+      if(patch.unread!==undefined)db.prepare("UPDATE run_organization SET unread=? WHERE run_id=?").run(patch.unread?1:0,runId);
+      if(patch.busy!==undefined)db.prepare("UPDATE run_organization SET busy=? WHERE run_id=?").run(patch.busy,runId);
+      // Read marks and busy notes change often and say nothing about the thread itself.
+      if(Object.keys(patch).some(k=>k!=="unread"&&k!=="busy"))logEvent(runId,NODE_ID,"thread.organized",patch);
     },
     saveRun(run, fork) {
       try {
@@ -907,6 +921,20 @@ export function openStore(data: string): Store {
     undeliveredMessages(runId, nodeId) {
       return (selectUndelivered.all(runId, nodeId) as { id: number; message: string; mode: SendMode }[])
         .map((r) => ({ id: Number(r.id), message: r.message, mode: r.mode }));
+    },
+
+    editQueued(runId, nodeId, id, message) {
+      const changed = db.prepare("UPDATE outbox SET message = ? WHERE id = ? AND run_id = ? AND node_id = ? AND delivered_at IS NULL").run(message, id, runId, nodeId).changes > 0;
+      if (changed) logEvent(runId, nodeId, "message.edited", { id });
+      return changed;
+    },
+
+    cancelQueued(runId, nodeId, id) {
+      // A message that carries transferred context keeps it; withdrawing it would drop that context.
+      if (db.prepare("SELECT 1 FROM context_transfers WHERE message_id = ?").get(id)) throw new RunStoreError("this message carries transferred context; edit it instead");
+      const removed = db.prepare("DELETE FROM outbox WHERE id = ? AND run_id = ? AND node_id = ? AND delivered_at IS NULL").run(id, runId, nodeId).changes > 0;
+      if (removed) logEvent(runId, nodeId, "message.cancelled", { id });
+      return removed;
     },
 
     markDelivered(id) {

@@ -609,8 +609,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if(organizationRoute){
       if(req.method!=="PATCH")throw new HttpError(405,"method not allowed");
       const payload=await body(req);const name=optionalString(payload.name,"name");const group=optionalString(payload.group,"group");
-      if(name!==undefined&&(!name.trim()||name.length>100)||group!==undefined&&group.length>100||payload.archived!==undefined&&typeof payload.archived!=="boolean")throw new HttpError(400,"invalid organization fields");
-      await write(()=>store.organizeRun(organizationRoute[1]!,{...(name!==undefined?{name:name.trim()}:{}),...(group!==undefined?{group}:{}),...(payload.archived!==undefined?{archived:payload.archived as boolean}:{})}));
+      const flag=(k:string)=>payload[k]!==undefined&&typeof payload[k]!=="boolean";
+      const snooze=payload.snoozedUntil;const busy=payload.busy;
+      if(name!==undefined&&(!name.trim()||name.length>100)||group!==undefined&&group.length>100||flag("archived")||flag("pinned")||flag("unread")
+        ||snooze!==undefined&&snooze!==null&&(typeof snooze!=="string"||Number.isNaN(Date.parse(snooze)))||busy!==undefined&&busy!==null&&(typeof busy!=="string"||!busy.trim()||busy.length>200))throw new HttpError(400,"invalid organization fields");
+      await write(()=>store.organizeRun(organizationRoute[1]!,{...(name!==undefined?{name:name.trim()}:{}),...(group!==undefined?{group}:{}),...(payload.archived!==undefined?{archived:payload.archived as boolean}:{}),
+        ...(payload.pinned!==undefined?{pinned:payload.pinned as boolean}:{}),...(payload.unread!==undefined?{unread:payload.unread as boolean}:{}),
+        ...(snooze!==undefined?{snoozedUntil:snooze===null?null:new Date(snooze as string).toISOString()}:{}),...(busy!==undefined?{busy:busy===null?null:(busy as string).trim()}:{})}));
       reply(res,200,await write(()=>({run:store.loadRun(organizationRoute[1]!),organization:store.organization(organizationRoute[1]!)})));return;
     }
     if(path==="/api/v1/recovery/snapshot"){
@@ -636,7 +641,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (batchId && batchId.length > 128) throw new HttpError(400, "batchId is too long");
       const accepted = payload.accepted === undefined ? [] : payload.accepted;
       if (!Array.isArray(accepted) || accepted.length > 1000 || accepted.some((id) => !Number.isSafeInteger(id) || id < 1)) throw new HttpError(400, "invalid accepted message IDs");
-      const outcome = await write(() => store.recordChat(runId, nodeId, checkChatEvents(payload.events), batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
+      const events = checkChatEvents(payload.events);
+      const outcome = await write(() => store.recordChat(runId, nodeId, events, batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
+      // A finished turn is something new to read.
+      if (nodeId === NODE_ID && payload.replay !== true && events.some((e) => e.type === "turn" && e.state !== "running")) await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
       const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
       if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
       if (payload.replay === true) {
@@ -674,6 +682,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       const id = await write(() => store.createReport(runId, nodeId, payload.kind as ReportKind, message));
       if (id === null) throw new HttpError(404, "unknown session");
+      await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
       return;
@@ -714,6 +723,32 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const { runId } = session(check[1]);
       reply(res, 200, await scheduler.agentCheck(runId));
       return;
+    }
+    // Messages still waiting in Rivet for a session: listed, changed or withdrawn before they go out.
+    const queued = /^\/api\/v1\/sessions\/([^/]+)\/queue(?:\/(\d+))?$/.exec(path);
+    if (queued) {
+      const { runId, nodeId } = session(queued[1]!);
+      const id = queued[2] ? Number(queued[2]) : undefined;
+      if (id === undefined) {
+        if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+        reply(res, 200, { untrusted: true, messages: await write(() => store.undeliveredMessages(runId, nodeId)) });
+        return;
+      }
+      if (req.method === "PATCH") {
+        const message = (await body(req)).message;
+        if (typeof message !== "string" || !message.trim() || message.length > 100_000) throw new HttpError(400, "message must be text of at most 100000 characters");
+        if (!(await write(() => store.editQueued(runId, nodeId, id, message)))) throw new HttpError(409, "that message is no longer waiting");
+        reply(res, 200, { id });
+        return;
+      }
+      if (req.method === "DELETE") {
+        let removed: boolean;
+        try { removed = await write(() => store.cancelQueued(runId, nodeId, id)); } catch (e) { throw new HttpError(409, (e as Error).message); }
+        if (!removed) throw new HttpError(409, "that message is no longer waiting");
+        reply(res, 204);
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
     }
     const send = /^\/api\/v1\/sessions\/([^/]+)\/send$/.exec(path);
     if (send) {
