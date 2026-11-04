@@ -24,6 +24,7 @@ export type HostConfig = {
 };
 
 export type Control =
+  | { type: "stop-child"; id: string }
   | { type: "finish" }
   | { type: "reconcile" }
   | { type: "compact" }
@@ -140,7 +141,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   const driver: ChatDriver = config.agent === "claude" ? claudeChat(options) : config.agent === "delta" ? deltaChat(options) : codexChat(options);
 
   let said = 0;
-  const queue: { text: string; messageId?: number }[] = [];
+  const queue: { text: string; messageId?: number; queuedMode?: boolean }[] = [];
   const seen = new Set<number>();
   let busy = false;
   let finishing = false;
@@ -168,6 +169,12 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   };
 
   const onControl = async (c: Control) => {
+    if (c.type === "stop-child") {
+      const sent = driver.cancelChild?.(c.id) ?? false;
+      emit({ type: "activity", kind: "system", status: sent ? "completed" : "failed",
+        summary: sent ? "Requested stop for Claude sub-agent " + c.id : "No active cancellable Claude sub-agent with that ID" });
+      return;
+    }
     if (c.type === "finish") {
       if (finishing) return;
       finishing = true;
@@ -200,7 +207,14 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
       void pump();
       return;
     }
-    if (c.messageId !== undefined) { if (seen.has(c.messageId)) return; seen.add(c.messageId); }
+    if (c.messageId !== undefined) {
+      if (seen.has(c.messageId)) {
+        const index = c.mode === "steer" ? queue.findIndex(entry => entry.messageId === c.messageId && entry.queuedMode) : -1;
+        if (index < 0) return;
+        queue.splice(index, 1);
+      }
+      seen.add(c.messageId);
+    }
     if (c.mode === "steer" && driver.running && (await driver.steer(c.text))) {
       // Steering acceptance has no independent completion boundary: retain it until the active turn completes.
       if (c.messageId !== undefined) steered.push(c.messageId);
@@ -212,7 +226,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
       await driver.cancel();
       return;
     }
-    queue.push({ text: c.text, messageId: c.messageId });
+    queue.push({ text: c.text, messageId: c.messageId, queuedMode: c.mode === "queue" });
     void pump();
   };
 

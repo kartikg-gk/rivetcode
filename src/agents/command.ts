@@ -112,6 +112,7 @@ async function claudeCommand(o: ClaudeOptions, conversation: string[]): Promise<
   flag("--model", o.model);
   flag("--effort", o.effort);
   args.push(...claudePermissionArgs(o.permission ?? "default"));
+  if (o.permission === "read-only") args.push("--tools", "Read,Grep,Glob");
   flag("--allowedTools", o.allowedTools?.join(","));
   flag("--disallowedTools", o.disallowedTools?.join(","));
   if (o.systemPromptFile) {

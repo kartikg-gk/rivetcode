@@ -32,6 +32,7 @@ async function partialReplyObserved(t) {
 function update(u) { out({ method: "session/update", params: { sessionId: sid, update: u } }); }
 
 async function turn(text, finish) {
+  if (acp && text.includes("CHILD_STOP_PROBE")) update({ sessionUpdate: "subagent_update", sessionId: "test-child", capabilities: { cancel: {} }, state: { state: "running" } });
   const t = { id: `turn-${++turns}`, steered: [], cancelled: false };
   active = t;
   if (!acp && text.includes("LIMITFAIL")) {
@@ -113,7 +114,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     case "session/set_config_option": return reply({ configOptions: [] });
     case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));
     case "_session/steering": if (active) { active.steered.push(p.prompt[0].text); return reply({ outcome: "injected" }); } return reply({ outcome: "promptRequired" });
-    case "session/cancel": if (active) active.cancelled = true; return;
+    case "session/cancel":
+      if (p.sessionId === "test-child") {
+        update({ sessionUpdate: "subagent_update", sessionId: "test-child", capabilities: null, state: { state: "idle", stopReason: "cancelled" } });
+        return;
+      }
+      if (active) active.cancelled = true;
+      return;
     case "thread/read": return reply({thread:{id:threadId,turns:process.env.RIVET_TEST_HISTORY === "1" ? [{id:"recovered-turn",status:"completed",items:[{type:"userMessage",id:"recovered-user",content:[{type:"text",text:"recover me"}]},{type:"agentMessage",id:"recovered-answer",text:"recovered answer"}]}] : []}});
     case "thread/start": return reply({ thread: { id: "th1" } });
     case "thread/fork":

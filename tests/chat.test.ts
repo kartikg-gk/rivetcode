@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -71,6 +71,32 @@ describe("a chat session's own tools", () => {
     expect(autoApproved(["Bash(rivet:*)"], { tool: "mcp__other__delete" })).toBe(false);
     expect(autoApproved(["Bash(rivet:*)"], { tool: "Bash", command: "rivet status" })).toBe(true);
   });
+});
+
+it("cancels an advertised Claude child session without cancelling the parent", async () => {
+  process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
+  daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
+    agents: name => ({ ...getAgent("fake"), name, binary: "unused" }) });
+  await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+  const id = (await api("POST", "/api/v1/runs", { repo, task: "CHILD_STOP_PROBE", agent: "claude" })).json.runId;
+  await until("the active child", async () => (await timeline(id)).some(item => item.text.includes("test-child: running")));
+  const request = await api("POST", `/api/v1/runs/${id}/stop-subagent`, { id: "test-child" });
+  expect(request.status).toBe(202);
+  await until("the cancelled child", async () => (await timeline(id)).some(item => item.text.includes("test-child: idle")));
+  await until("the intact parent reply", async () => said(await timeline(id), "CHILD_STOP_PROBE"));
+  const sent = await api("POST", `/api/v1/sessions/${id}-agent/send`, {
+    message: "inspect this", mode: "queue", attachments: [{ name: "../sample.txt", base64: Buffer.from("attached bytes").toString("base64") }],
+  });
+  expect(sent.status).toBe(202);
+  const directory = join(data, "attachments", id);
+  const [file] = await readdir(directory);
+  expect(file).toMatch(/sample\.txt$/);
+  expect(await readFile(join(directory, file!), "utf8")).toBe("attached bytes");
+  await until("attachment in provider prompt", async () => said(await timeline(id), file!));
+  expect((await api("POST", `/api/v1/sessions/${id}-agent/send`, {
+    message: "invalid", attachments: [{ name: "bad.txt", base64: "%%%" }],
+  })).status).toBe(400);
+  expect(await readdir(directory)).toEqual([file]);
 });
 
 describe("what a chat host could not report", () => {
@@ -171,7 +197,10 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     // A steer joins the turn in progress.
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "SLOW work", mode: "queue" });
     await until("the slow turn", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "active");
-    await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also this", mode: "steer" });
+    const queued = await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also this", mode: "queue" });
+    expect(queued.status).toBe(202);
+    const promoted = await api("PATCH", `/api/v1/sessions/${runId}-agent/queue/${queued.json.id}`, { mode: "steer" });
+    expect(promoted.status).toBe(200);
     await until("the steered reply", async () => said(await timeline(runId), "echo: SLOW work + also this"));
 
     // What it may not run waits for rivet answer; a no with a note becomes its next message.

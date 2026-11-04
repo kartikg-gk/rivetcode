@@ -78,6 +78,7 @@ export type Store = {
   queueMessage(runId: string, nodeId: string, message: string, from?: string, mode?: SendMode): number | null;
   undeliveredMessages(runId: string, nodeId: string): { id: number; message: string; mode: SendMode }[];
   // A message still waiting in Rivet can be changed or withdrawn; false once it has gone out.
+  promoteQueued(runId: string, nodeId: string, id: number): boolean;
   editQueued(runId: string, nodeId: string, id: number, message: string): boolean;
   cancelQueued(runId: string, nodeId: string, id: number): boolean;
   markDelivered(id: number): void;
@@ -89,6 +90,12 @@ export type Store = {
   getConfig(project: string): Record<string, string>;
   setConfig(project: string, key: string, value: string | null): void;
   // A run's pull request; "handled" remembers which feedback was already acted on.
+  readPrGuide(runId: string, number: number): string | null;
+  writePrGuides(runId: string, guides: { number: number; text: string }[]): void;
+  linkedPrs(runId: string): LinkedPullRequest[];
+  addLinkedPr(runId: string, pr: LinkedPullRequest): void;
+  updateLinkedPr(runId: string, number: number, status: string): void;
+  removeLinkedPr(runId: string, number: number): boolean;
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
   clearPr(runId: string): void;
@@ -111,6 +118,12 @@ export type Store = {
   pruneTimeline(project: string, before: string): number;
   // Every project that has runs.
   listProjects(): string[];
+  environmentInstructions(): string;
+  setEnvironmentInstructions(text: string): void;
+  projectMetadata(id: string): ProjectMetadata | null;
+  saveProject(project: ProjectMetadata): void;
+  deleteProject(id: string): void;
+  projectDeleted(id: string): boolean;
   // A run's state changes after a position, oldest first.
   searchRuns(query: string, o: { project?: string; limit: number; offset?: number; pageSize?: number }): { runId: string; project: string; title: string; source: string; snippet: string; position?: number; history: string; branchId?: string }[];
   waitTurn(runId: string, turn?: string): { id: string; state: string } | undefined;
@@ -138,6 +151,15 @@ export type Store = {
   close(): void;
 };
 
+export type ProjectMetadata = {
+  id: string;
+  repo: string;
+  title: string;
+  instructions: string;
+  scripts: { id: string; command: string }[];
+};
+
+export type LinkedPullRequest = { number: number; url: string; status: string };
 export type PullRequest = { number: number; url: string; handled?: string };
 
 // One review pass over a worker's pull request at one commit.
@@ -390,6 +412,36 @@ MIGRATIONS.push({ version: 29, sql: "", run: (db) => {
   const sql = row.sql.replace(/agent IN \([^)]*\)/, `agent IN (${oneOf(AGENTS)})`).replace(/^CREATE TABLE "?nodes"?/, "CREATE TABLE nodes_v29");
   db.exec(`${sql}; INSERT INTO nodes_v29 SELECT * FROM nodes; DROP TABLE nodes; ALTER TABLE nodes_v29 RENAME TO nodes;`);
 } });
+MIGRATIONS.push({ version: 34, sql: `
+CREATE TABLE environment_preferences (id INTEGER PRIMARY KEY CHECK(id=1), instructions TEXT NOT NULL);
+` });
+MIGRATIONS.push({ version: 33, sql: `
+CREATE TABLE linked_pull_requests (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  number INTEGER NOT NULL CHECK (number > 0),
+  url TEXT NOT NULL,
+  status TEXT NOT NULL,
+  PRIMARY KEY (run_id, number)
+);
+` });
+MIGRATIONS.push({ version: 32, sql: `
+CREATE TABLE registered_projects (
+  id TEXT PRIMARY KEY,
+  repo TEXT NOT NULL,
+  title TEXT NOT NULL,
+  instructions TEXT NOT NULL,
+  scripts TEXT NOT NULL,
+  deleted_at TEXT
+);
+` });
+MIGRATIONS.push({ version: 31, sql: `
+CREATE TABLE pull_request_guides (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  number INTEGER NOT NULL CHECK (number > 0),
+  text TEXT NOT NULL,
+  PRIMARY KEY (run_id, number)
+);
+` });
 MIGRATIONS.push({version:30,sql:`ALTER TABLE run_organization ADD COLUMN pinned_at TEXT; ALTER TABLE run_organization ADD COLUMN snoozed_until TEXT; ALTER TABLE run_organization ADD COLUMN unread INTEGER NOT NULL DEFAULT 0; ALTER TABLE run_organization ADD COLUMN busy TEXT;`});
 MIGRATIONS.push({version:28,sql:`ALTER TABLE conversation_branches ADD COLUMN strategy TEXT NOT NULL DEFAULT 'original';`});
 MIGRATIONS.push({version:27,sql:`CREATE TABLE run_organization(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, archived_at TEXT, group_name TEXT NOT NULL DEFAULT '');`});
@@ -786,6 +838,7 @@ export function openStore(data: string): Store {
       if(Object.keys(patch).some(k=>k!=="unread"&&k!=="busy"))logEvent(runId,NODE_ID,"thread.organized",patch);
     },
     saveRun(run, fork) {
+      if (db.prepare("SELECT 1 FROM registered_projects WHERE id=? AND deleted_at IS NOT NULL").get(run.project)) throw new RunStoreError("project has been deleted");
       try {
         check(run, fork);
       } catch (e) {
@@ -922,6 +975,12 @@ export function openStore(data: string): Store {
     undeliveredMessages(runId, nodeId) {
       return (selectUndelivered.all(runId, nodeId) as { id: number; message: string; mode: SendMode }[])
         .map((r) => ({ id: Number(r.id), message: r.message, mode: r.mode }));
+    },
+
+    promoteQueued(runId, nodeId, id) {
+      const result = db.prepare("UPDATE outbox SET mode='steer' WHERE id=? AND run_id=? AND node_id=? AND delivered_at IS NULL AND mode='queue'").run(id, runId, nodeId);
+      if (result.changes) logEvent(runId, nodeId, "message.promoted", { id });
+      return result.changes > 0;
     },
 
     editQueued(runId, nodeId, id, message) {
@@ -1430,8 +1489,55 @@ export function openStore(data: string): Store {
       return { total: shown.length, items: shown.filter((i) => i.position > after).slice(0, o.limit) };
     },
 
+    environmentInstructions() {
+      const row = db.prepare("SELECT instructions FROM environment_preferences WHERE id=1").get() as { instructions: string } | undefined;
+      return row?.instructions ?? "";
+    },
+
+    setEnvironmentInstructions(text) {
+      db.prepare("INSERT INTO environment_preferences VALUES (1,?) ON CONFLICT(id) DO UPDATE SET instructions=excluded.instructions").run(text);
+    },
+
+    projectMetadata(id) {
+      const record = db.prepare("SELECT repo,title,instructions,scripts,deleted_at FROM registered_projects WHERE id=?").get(id) as
+        { repo: string; title: string; instructions: string; scripts: string; deleted_at: string | null } | undefined;
+      if (record) return record.deleted_at ? null : { id, repo: record.repo, title: record.title, instructions: record.instructions, scripts: JSON.parse(record.scripts) };
+      const roots = db.prepare("SELECT DISTINCT repo FROM runs WHERE project=? LIMIT 2").all(id) as { repo: string }[];
+      if (roots.length > 1) return null;
+      return roots[0] ? { id, repo: roots[0].repo, title: id, instructions: "", scripts: [] } : null;
+    },
+
+    projectDeleted(id) {
+      return !!db.prepare("SELECT 1 FROM registered_projects WHERE id=? AND deleted_at IS NOT NULL").get(id);
+    },
+
+    saveProject(project) {
+      assertProjectId(project.id);
+      if (db.prepare("SELECT 1 FROM runs WHERE project=? AND repo<>?").get(project.id, project.repo)) throw new RunStoreError("project ID is shared by multiple repository paths");
+      const existing = this.projectMetadata(project.id);
+      if (existing && existing.repo !== project.repo) throw new RunStoreError("project ID belongs to a different repository");
+      db.prepare("INSERT INTO registered_projects VALUES (?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET repo=excluded.repo,title=excluded.title,instructions=excluded.instructions,scripts=excluded.scripts,deleted_at=NULL")
+        .run(project.id, project.repo, project.title, project.instructions, JSON.stringify(project.scripts));
+    },
+
+    deleteProject(id) {
+      const project = this.projectMetadata(id);
+      if (!project) throw new RunStoreError("unknown project");
+      if (db.prepare("SELECT 1 FROM nodes n JOIN runs r ON r.id=n.run_id WHERE r.project=? AND n.status IN ('pending','running')").get(id)) throw new RunStoreError("stop the project's active and pending runs first");
+      const ids = "SELECT id FROM runs WHERE project=?";
+      db.prepare(`DELETE FROM context_transfers WHERE source_run IN (${ids}) OR target_run IN (${ids})`).run(id, id);
+      db.prepare(`DELETE FROM thread_forks WHERE run_id IN (${ids})`).run(id);
+      db.prepare("DELETE FROM runs WHERE project=?").run(id);
+      db.prepare("DELETE FROM project_config WHERE project=?").run(id);
+      db.prepare("DELETE FROM automations WHERE project=?").run(id);
+      db.prepare("DELETE FROM cues WHERE project=?").run(id);
+      db.prepare("INSERT INTO registered_projects VALUES (?,?,?,'','[]',?) ON CONFLICT(id) DO UPDATE SET instructions='',scripts='[]',deleted_at=excluded.deleted_at")
+        .run(id, project.repo, project.title, new Date().toISOString());
+    },
+
     listProjects() {
-      return (db.prepare("SELECT DISTINCT project FROM runs ORDER BY project").all() as { project: string }[]).map((r) => r.project);
+      const rows = db.prepare("SELECT project FROM runs UNION SELECT id FROM registered_projects WHERE deleted_at IS NULL ORDER BY 1").all() as { project: string }[];
+      return rows.map(row => row.project);
     },
 
     readTimeline(runId, o) {
@@ -1485,6 +1591,32 @@ export function openStore(data: string): Store {
         ...(r.verdict !== null ? { verdict: r.verdict } : {}), ...(r.body !== null ? { body: r.body } : {}),
         ...(r.github_review_id !== null ? { githubReviewId: Number(r.github_review_id) } : {}),
       }));
+    },
+
+    linkedPrs(runId) {
+      return db.prepare("SELECT number,url,status FROM linked_pull_requests WHERE run_id=? ORDER BY number").all(runId) as LinkedPullRequest[];
+    },
+
+    addLinkedPr(runId, pr) {
+      db.prepare("INSERT INTO linked_pull_requests VALUES (?,?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET url=excluded.url,status=excluded.status").run(runId, pr.number, pr.url, pr.status);
+    },
+
+    updateLinkedPr(runId, number, status) {
+      db.prepare("UPDATE linked_pull_requests SET status=? WHERE run_id=? AND number=? AND status<>?").run(status, runId, number, status);
+    },
+
+    removeLinkedPr(runId, number) {
+      return db.prepare("DELETE FROM linked_pull_requests WHERE run_id=? AND number=?").run(runId, number).changes > 0;
+    },
+
+    readPrGuide(runId, number) {
+      const row = db.prepare("SELECT text FROM pull_request_guides WHERE run_id=? AND number=?").get(runId, number) as { text: string } | undefined;
+      return row?.text ?? null;
+    },
+
+    writePrGuides(runId, guides) {
+      const save = db.prepare("INSERT INTO pull_request_guides (run_id, number, text) VALUES (?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET text=excluded.text");
+      for (const guide of guides) save.run(runId, guide.number, redact(guide.text));
     },
 
     getPr(runId) {

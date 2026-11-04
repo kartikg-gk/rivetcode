@@ -54,6 +54,7 @@ export type ChatDriver = {
   // Adds guidance to the turn in progress; false when there is none to join.
   steer(text: string): Promise<boolean>;
   cancel(): Promise<void>;
+  cancelChild?(id: string): boolean;
   answer(requestId: string, choice: Choice): boolean;
   readonly running: boolean;
   refresh?(): Promise<void>;
@@ -135,6 +136,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
   let turn = 0;
   let activeTurn = "";
   const commands=new Set<string>();
+  const children = new Map<string, { canCancel: boolean; state: string }>();
   // Assistant text arrives in pieces; each message is kept whole once it is complete.
   let message: { id: string; text: string } | null = null;
   const tools = new Map<string, { tool: string; summary: string }>();
@@ -150,6 +152,20 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       if (method !== "session/update") return;
       const u = (params.update ?? {}) as Record<string, unknown>;
       const kind = u.sessionUpdate;
+      if (sessionId && params.sessionId !== sessionId) return;
+      if (kind === "subagent_update" && typeof u.sessionId === "string" && u.sessionId !== sessionId) {
+        const id = u.sessionId;
+        const previous = children.get(id);
+        const capabilities = u.capabilities as { cancel?: unknown } | null | undefined;
+        const state = u.state as { state?: string } | null | undefined;
+        const childState = state === undefined ? previous?.state ?? "unknown" : state?.state ?? "unknown";
+        const canCancel = capabilities === undefined ? previous?.canCancel ?? false : !!capabilities?.cancel;
+        children.set(id, { canCancel, state: childState });
+        o.emit({ type: "activity", kind: "system", itemId: "child-" + id,
+          status: childState === "idle" ? "completed" : "running",
+          summary: `Claude sub-agent ${id}: ${childState}${canCancel ? " (stop available while active)" : ""}` });
+        return;
+      }
       if(kind==="available_commands_update"){
         commands.clear();for(const command of Array.isArray(u.availableCommands)?u.availableCommands as {name?:string}[]:[])if(command.name)commands.add(command.name);return;
       }
@@ -237,7 +253,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
     async refresh(){const items=await loadHistory(sessionId);if(o.model)await rpc.call("session/set_config_option",{sessionId,configId:"model",value:o.model});await rpc.call("session/set_config_option",{sessionId,configId:"mode",value:CLAUDE_MODES[o.permission]??"default"});o.emit({type:"history",providerId:sessionId,items});},
     async compact(){if(!commands.has("compact")||!turn)throw new Error("provider compaction is not advertised or the conversation has no turns");await driver.prompt("/compact");},
     async start() {
-      const init = await rpc.call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
+      const init = await rpc.call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false, subagents: {} } });
       const caps=(init.agentCapabilities??{}) as {loadSession?:boolean;sessionCapabilities?:{resume?:unknown;fork?:unknown}};
       canLoad=caps.loadSession===true;
       if(o.resume&&!canLoad&&caps.sessionCapabilities?.resume===undefined)throw new Error("provider does not support resuming this conversation; refusing to start a new one silently");
@@ -294,6 +310,13 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       } catch { return false; }
     },
     async cancel() { if (activeTurn) rpc.notify("session/cancel", { sessionId }); },
+    cancelChild(id) {
+      const child = children.get(id);
+      if (!child?.canCancel || !["running", "requires_action"].includes(child.state)) return false;
+      rpc.notify("session/cancel", { sessionId: id });
+      child.canCancel = false;
+      return true;
+    },
     answer,
     get running() { return activeTurn !== ""; },
     close() { child.kill(); },

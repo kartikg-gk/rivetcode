@@ -149,6 +149,9 @@ function Waiting({ id }: { id: string }) {
 function Composer({ id, actions, openSide }: { id: string; actions: Action[]; openSide(t: Side): void }) {
   const [text, setText] = useState("");
   const [mode, setMode] = useState("steer");
+  const [files, setFiles] = useState<File[]>([]);
+  const [sending, setSending] = useState(false);
+  useEffect(() => { setFiles([]); }, [id]);
   const [pick, setPick] = useState(0);
   const set = useApp((s) => s.set);
   const extra: Action[] = useMemo(() => [
@@ -164,7 +167,7 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
   const menu = head !== null && !/\s/.test(text) ? all.filter((a) => a.id.startsWith(head)) : [];
   const submit = () => {
     const value = text.trim();
-    if (!value) return;
+    if (sending || (!value && !files.length)) return;
     if (value.startsWith("/")) {
       const found = all.find((a) => a.id === head) ?? menu[pick];
       if (!found) { toast(`no command /${head}; type / to see them`, true); return; }
@@ -173,8 +176,11 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
       return;
     }
     void act(async () => {
-      const delivery = await send(id, value, mode);
+      setSending(true);
+      let delivery: string;
+      try { delivery = await send(id, value, mode, files); } finally { setSending(false); }
       setText("");
+      setFiles([]);
       if (delivery !== "now") toast({ "when-idle": "queued until it is idle", "turn-end": "delivered when this turn ends", "next-launch": "delivered at its next start", "after-answer": "delivered after its question is answered", interrupted: "interrupted and sent" }[delivery] ?? delivery);
     });
   };
@@ -208,7 +214,17 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
               <option value="steer">as soon as it can take it</option><option value="queue">once idle</option><option value="interrupt">stop its turn first</option>
             </select>
           </label>
-          <button className="send ml-auto" aria-label="Send" disabled={!text.trim()} onClick={submit}><ArrowUp size={17} /></button>
+          <label className="cursor-pointer text-xs text-muted">
+            Attach files
+            <input type="file" multiple className="sr-only" aria-label="Attach files" disabled={sending} onChange={event => {
+              const next = [...files, ...Array.from(event.target.files ?? [])];
+              event.target.value = "";
+              if (next.length > 3 || next.reduce((size, file) => size + file.size, 0) > 512 * 1024) { toast("Attach up to three files totaling 512 KiB", true); return; }
+              setFiles(next);
+            }} />
+          </label>
+          {files.map((file, index) => <button key={index} type="button" disabled={sending} className="truncate max-w-32 text-xs" title={"Remove " + file.name} onClick={() => setFiles(files.filter((_, i) => i !== index))}>{file.name} ×</button>)}
+          <button className="send ml-auto" aria-label="Send" disabled={sending || (!text.trim() && !files.length)} onClick={submit}><ArrowUp size={17} /></button>
         </div>
       </div>
     </div>

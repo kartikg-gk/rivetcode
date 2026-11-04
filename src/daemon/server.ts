@@ -1,3 +1,4 @@
+import { saveAttachments } from "./attachments.js";
 import { cleanupQueue } from "./cleanup.js";
 import { allowedRequest, liveSocket, serveApp } from "./web.js";
 import { parseTaskFile, TaskFileError } from "../scheduler/tasks.js";
@@ -289,6 +290,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
 
   // Creates a run with the project's settings and starts its agent.
   async function newRun(o: Omit<NewRun, "data" | "defaultAgentFor" | "copyFor" | "setupFor">): Promise<Run> {
+    const root = await repoRoot(o.repo);
+    if (await write(() => store.projectDeleted(defaultProjectId(root)))) throw new HttpError(409, "register the deleted project before starting new runs");
     const run = await prepareRun({
       ...o, data,
       defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
@@ -771,7 +774,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       if (req.method === "PATCH") {
-        const message = (await body(req)).message;
+        const payload = await body(req);
+        if (payload.mode === "steer") {
+          if (nodeId !== NODE_ID || !runtime.takesInput(sessionIdOf(runId, nodeId))) throw new HttpError(409, "this session cannot accept steering");
+          if (branchChanges.has(runId)) throw new HttpError(409, "conversation branch is changing");
+          if (!(await write(() => store.promoteQueued(runId, nodeId, id)))) throw new HttpError(409, "that message is no longer queued");
+          await scheduler.deliver(runId, id);
+          reply(res, 200, { id, mode: "steer" });
+          return;
+        }
+        const message = payload.message;
         if (typeof message !== "string" || !message.trim() || message.length > 100_000) throw new HttpError(400, "message must be text of at most 100000 characters");
         if (!(await write(() => store.editQueued(runId, nodeId, id, message)))) throw new HttpError(409, "that message is no longer waiting");
         reply(res, 200, { id });
@@ -797,7 +809,20 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const mode = (optionalString(payload.mode, "mode") ?? "steer") as SendMode;
       if (!SEND_MODES.includes(mode)) throw new HttpError(400, `mode must be one of ${SEND_MODES.join(", ")}`);
       if ((await write(() => store.getFork(runId)))?.detached) throw new HttpError(409, "fork was detached from its shared checkout");
-      const id = await write(() => {if (branchChanges.has(runId)) throw new HttpError(409,"conversation branch is changing");return store.queueMessage(runId, nodeId, payload.message as string, from, mode);});
+      const id = await write(() => {
+        if (branchChanges.has(runId)) throw new HttpError(409, "conversation branch is changing");
+        if (payload.attachments === undefined) return store.queueMessage(runId, nodeId, payload.message as string, from, mode);
+        if (nodeId !== NODE_ID) throw new HttpError(400, "attachments require a thread session");
+        store.loadRun(runId);
+        let saved;
+        try { saved = saveAttachments(data, runId, payload.attachments); }
+        catch (error) { throw new HttpError(400, (error as Error).message); }
+        try {
+          const queued = store.queueMessage(runId, nodeId, String(payload.message) + saved.context, from, mode);
+          if (queued === null) saved.remove();
+          return queued;
+        } catch (error) { saved.remove(); throw error; }
+      });
       if (id === null) throw new HttpError(404, "unknown session");
       if (nodeId === NODE_ID) await scheduler.startForkMessage(runId);
       const target = sessionIdOf(runId, nodeId);
@@ -840,6 +865,136 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const run=await write(()=>store.loadRun(discoveryRoute[1]!));
       if(run.node.agent!=="claude"&&run.node.agent!=="codex")throw new HttpError(409,"provider discovery is unavailable");
       const {inspectProvider}=await import("../chat/discovery.js");reply(res,200,await inspectProvider(run.node.agent,run.repo));return;
+    }
+    if (path === "/api/v1/environment-preferences") {
+      if (req.method === "GET") {
+        reply(res, 200, { instructions: await write(() => store.environmentInstructions()), untrusted: true });
+        return;
+      }
+      if (req.method === "PUT") {
+        const instructions = (await body(req)).instructions;
+        if (typeof instructions !== "string" || instructions.length > 8000) throw new HttpError(400, "instructions must have at most 8000 characters");
+        await write(() => store.setEnvironmentInstructions(instructions));
+        reply(res, 204);
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+    const projects = /^\/api\/v1\/projects(?:\/([^/]+))?$/.exec(path);
+    if (projects) {
+      const id = projects[1];
+      if (!id && req.method === "GET") {
+        const after = new URL(req.url!, "http://local").searchParams.get("after") ?? "";
+        const result = await write(() => store.listProjects().filter(key => key > after).slice(0, 51));
+        const records = await write(() => result.slice(0, 50).map(key => store.projectMetadata(key)));
+        reply(res, 200, { projects: records, next: result.length > 50 ? result[49] : null, untrusted: true });
+        return;
+      }
+      if (id && req.method === "GET") {
+        const project = await write(() => store.projectMetadata(id));
+        if (!project) throw new HttpError(404, "unknown project");
+        reply(res, 200, { project, untrusted: true });
+        return;
+      }
+      if (id && req.method === "DELETE") {
+        if ((await body(req)).confirm !== id) throw new HttpError(400, "confirm must match the project ID");
+        try {
+          await write(() => {
+            if (runtime.liveSessions().some(sessionId => {
+              const { runId } = session(sessionId);
+              return store.loadRun(runId).project === id;
+            })) throw new Error("stop the project's sessions first");
+            store.deleteProject(id);
+          });
+        } catch (e) { throw new HttpError(409, (e as Error).message); }
+        reply(res, 204);
+        return;
+      }
+      if ((!id && req.method === "POST") || (id && req.method === "PATCH")) {
+        const payload = await body(req);
+        const repo = !id && typeof payload.repo === "string" ? await repoRoot(payload.repo).catch(() => null) : null;
+        if (!id && !repo) throw new HttpError(400, "an existing Git repository is required");
+        const key = id ?? defaultProjectId(repo!);
+        const title = payload.title;
+        const instructions = payload.instructions;
+        const scripts = payload.scripts;
+        if (title !== undefined && (typeof title !== "string" || !title.trim() || title.length > 100)) throw new HttpError(400, "title must have 1–100 characters");
+        if (instructions !== undefined && (typeof instructions !== "string" || instructions.length > 8000)) throw new HttpError(400, "instructions must have at most 8000 characters");
+        if (scripts !== undefined && (!Array.isArray(scripts) || scripts.length > 30 || scripts.some(script => !script || typeof script.id !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(script.id) || typeof script.command !== "string" || !script.command.trim() || script.command.length > 1000) || new Set(scripts.map(script => script.id)).size !== scripts.length)) throw new HttpError(400, "provide at most 30 saved scripts with unique lowercase IDs and bounded commands");
+        const project = await write(() => {
+          const current = store.projectMetadata(key);
+          if (id && !current) throw new HttpError(404, "unknown project");
+          if (repo && current && current.repo !== repo) throw new HttpError(409, "project ID belongs to a different repository");
+          const value = { id: key, repo: repo ?? current!.repo, title: (title as string | undefined) ?? current?.title ?? key,
+            instructions: (instructions as string | undefined) ?? current?.instructions ?? "", scripts: (scripts as { id: string; command: string }[] | undefined)?.map(({ id, command }) => ({ id, command })) ?? current?.scripts ?? [] };
+          store.saveProject(value);
+          return value;
+        });
+        reply(res, id ? 200 : 201, { project, untrusted: true });
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+    const prLinks = /^\/api\/v1\/runs\/([^/]+)\/linked-prs(?:\/(\d+))?$/.exec(path);
+    if (prLinks) {
+      const id = prLinks[1]!;
+      await write(() => store.loadRun(id));
+      if (req.method === "GET" && !prLinks[2]) {
+        reply(res, 200, await write(() => ({ primary: store.getPr(id), linked: store.linkedPrs(id) })));
+        return;
+      }
+      if (req.method === "POST" && !prLinks[2]) {
+        const number = (await body(req)).number;
+        if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) throw new HttpError(400, "invalid pull request number");
+        reply(res, 200, await scheduler.addPrLink(id, number));
+        return;
+      }
+      if (req.method === "DELETE" && prLinks[2]) {
+        const number = Number(prLinks[2]);
+        if (!Number.isSafeInteger(number) || number < 1) throw new HttpError(400, "invalid pull request number");
+        if (!(await write(() => store.removeLinkedPr(id, number)))) throw new HttpError(404, "pull request link not found");
+        reply(res, 204);
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+    const prGuides = /^\/api\/v1\/runs\/([^/]+)\/pr-guides(?:\/(\d+))?$/.exec(path);
+    if (prGuides) {
+      const id = prGuides[1]!;
+      await write(() => store.loadRun(id));
+      if (req.method === "GET" && prGuides[2]) {
+        const number = Number(prGuides[2]);
+        if (!Number.isSafeInteger(number) || number < 1) throw new HttpError(400, "invalid pull request number");
+        const text = await write(() => store.readPrGuide(id, number));
+        if (text === null) throw new HttpError(404, "guide not found");
+        reply(res, 200, { number, text, untrusted: true });
+        return;
+      }
+      if (req.method === "PUT" && !prGuides[2]) {
+        const guides = (await body(req)).guides;
+        if (!Array.isArray(guides) || guides.length < 1 || guides.length > 10) throw new HttpError(400, "provide 1–10 pull request guides");
+        const numbers = new Set<number>();
+        for (const guide of guides) {
+          if (!guide || !Number.isSafeInteger(guide.number) || guide.number < 1 || numbers.has(guide.number) || typeof guide.text !== "string" || !guide.text.trim() || guide.text.length > 16000) throw new HttpError(400, "each guide needs a unique positive PR number and 1–16000 characters of text");
+          numbers.add(guide.number);
+        }
+        await write(() => store.writePrGuides(id, guides));
+        reply(res, 200, { saved: [...numbers] });
+        return;
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+    const childStop = /^\/api\/v1\/runs\/([^/]+)\/stop-subagent$/.exec(path);
+    if (childStop) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const run = await write(() => store.loadRun(childStop[1]!));
+      const target = sessionIdOf(run.id, NODE_ID);
+      if (run.node.agent !== "claude" || !scheduler.isChat(target) || !runtime.isAlive(target)) throw new HttpError(409, "a live Claude chat is required");
+      const id = (await body(req)).id;
+      if (typeof id !== "string" || !id.trim() || id.length > 256) throw new HttpError(400, "a sub-agent session ID is required");
+      await runtime.write(target, JSON.stringify({ type: "stop-child", id }));
+      reply(res, 202, { requested: true });
+      return;
     }
     const compactRoute=/^\/api\/v1\/runs\/([^/]+)\/compact$/.exec(path);
     if(compactRoute){

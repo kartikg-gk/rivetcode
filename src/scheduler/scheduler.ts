@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { git } from "../git.js";
 import type { Agent } from "../agents/agent.js";
 import { abortMerge, commitLeftovers, finishResolution, headOf, mergeBranch, resetTo, runCommand, workingTree } from "../merge.js";
-import { normalizePermission } from "../agents/command.js";
+import { normalizePermission, type Permission } from "../agents/command.js";
 import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
@@ -23,6 +23,15 @@ import { encodeConfig, type Control } from "../chat/host.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
 export const DEFAULT_PERMISSION = "accept-edits";
+
+export function capDelegatedPermission(parentAgent: Node["agent"], parent: Permission, childAgent: Node["agent"], requested: Permission): Permission {
+  if (parent === "read-only" || requested === "read-only") return "read-only";
+  if ((parent === "bypass-permissions" && parentAgent !== "delta") || (parentAgent === "codex" && parent === "default")) return requested;
+  if (parentAgent !== childAgent) return "read-only";
+  const order: Permission[] = ["read-only", "default", "accept-edits", "auto", "bypass-permissions"];
+  const effectiveRequest = childAgent === "codex" && requested === "default" ? "bypass-permissions" : requested;
+  return order.indexOf(effectiveRequest) > order.indexOf(parent) ? parent : requested;
+}
 // The agent's own id of the last reply: where a native fork of Claude's conversation is pinned.
 function replyAnchor(items: { kind: string; itemId?: string }[]): { messageId?: string } {
   // Stored as "<host id>:<agent's id>"; a reply the agent gave no id has more parts.
@@ -159,6 +168,7 @@ export function createScheduler(d: SchedulerDeps) {
   // Sessions run as chats (through the agent's protocol, see src/chat): messages and
   // answers go to them as control lines, and what they do comes from their host.
   const chats = new Set<string>();
+  const launchPermissions = new Map<string, { launchId: string; permission: Permission }>();
   // Run from source (tests), the host is the built one.
   const chatHostMain = () => {
     const main = fileURLToPath(new URL("../cli/main.js", import.meta.url));
@@ -177,6 +187,11 @@ export function createScheduler(d: SchedulerDeps) {
     const launchId = newLaunchId();
     const config = await d.write(() => d.store.getConfig(run.project));
     const model = run.model ?? modelFor(node.agent, config);
+    if (prompt !== undefined) {
+      const { project, instructions } = await d.write(() => ({ project: d.store.projectMetadata(run.project), instructions: d.store.environmentInstructions() }));
+      if (instructions.trim()) prompt += "\n\nEnvironment instructions:\n" + instructions;
+      if (project?.repo === run.repo && project.instructions.trim()) prompt += "\n\nProject instructions:\n" + project.instructions;
+    }
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
     const worker = run.role === "worker";
     if (worker) {
@@ -228,7 +243,9 @@ export function createScheduler(d: SchedulerDeps) {
     }
     // Recorded before the process exists, so even an instant exit is attributed to it.
     const previous = d.launches.get(sessionId);
+    const previousPermission = launchPermissions.get(sessionId);
     d.launches.set(sessionId, launchId);
+    launchPermissions.set(sessionId, { launchId, permission: cfg.permission });
     try {
       await d.runtime.start({
         sessionId, workspace: node.worktree, argv, launchId,
@@ -242,6 +259,8 @@ export function createScheduler(d: SchedulerDeps) {
       });
     } catch (e) {
       if (d.launches.get(sessionId) === launchId) {
+        if (previousPermission) launchPermissions.set(sessionId, previousPermission);
+        else launchPermissions.delete(sessionId);
         if (previous === undefined) d.launches.delete(sessionId);
         else d.launches.set(sessionId, previous);
       }
@@ -259,19 +278,21 @@ export function createScheduler(d: SchedulerDeps) {
 
   // One delivery pass per session at a time, so two sends never type a message twice.
   const delivering = new Map<string, Promise<void>>();
-  function deliverQueued(runId: string): Promise<void> {
+  function deliverQueued(runId: string, priorityId?: number): Promise<void> {
     const sessionId = sessionIdOf(runId, NODE_ID);
-    const next = (delivering.get(sessionId) ?? Promise.resolve()).then(() => deliverNow(runId));
+    const next = (delivering.get(sessionId) ?? Promise.resolve()).then(() => deliverNow(runId, priorityId));
     const tail = next.catch(() => {});
     delivering.set(sessionId, tail);
     void tail.then(() => { if (delivering.get(sessionId) === tail) delivering.delete(sessionId); });
     return next;
   }
 
-  async function deliverNow(runId: string): Promise<void> {
+  async function deliverNow(runId: string, priorityId?: number): Promise<void> {
     const sessionId = sessionIdOf(runId, NODE_ID);
     const queued = await d.write(() => d.store.undeliveredMessages(runId, NODE_ID));
     if (queued.length === 0) return;
+    const priority = queued.findIndex(message => message.id === priorityId);
+    if (priority > 0) queued.unshift(...queued.splice(priority, 1));
     // A headless agent gets its messages when its turn ends (see messagesAtTurnEnd).
     if (!d.runtime.takesInput(sessionId)) return;
     const activity = (await load(runId)).node.activity;
@@ -740,6 +761,19 @@ export function createScheduler(d: SchedulerDeps) {
   }
   async function checkPrOnce(runId: string): Promise<string | null> {
     if (!d.github) return null;
+    const links = await d.write(() => d.store.linkedPrs(runId));
+    if (links.length) {
+      const run = await load(runId);
+      const github = await d.github(run);
+      for (const link of links) {
+        if (shuttingDown) return null;
+        try {
+          const status = prStatus(await github.facts(link.number));
+          if (shuttingDown) return null;
+          if (status !== link.status) await d.write(() => d.store.updateLinkedPr(runId, link.number, status));
+        } catch (error) { report(error); }
+      }
+    }
     const pr = await d.write(() => d.store.getPr(runId));
     if (!pr) return null;
     const run = await load(runId);
@@ -941,11 +975,18 @@ export function createScheduler(d: SchedulerDeps) {
     const agent = d.agents(agentName);
     const model = o.model ?? modelFor(agentName, config);
     const allowedTools = (config["worker.allowedTools"] ?? DEFAULT_ALLOWED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean);
+    const parentSession = sessionOf(run);
+    const parentLaunch = launchPermissions.get(parentSession);
+    const parentPermission = parentLaunch && parentLaunch.launchId === d.launches.get(parentSession)
+      ? parentLaunch.permission : "read-only";
+    const permission = o.review ? "read-only" : capDelegatedPermission(
+      run.node.agent, parentPermission, agentName, normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
+    );
     const launchId = newLaunchId();
     const argv = await agent.launchCommand({
       sessionId: session, workspace: run.node.worktree, headless: true,
-      permission: o.review ? "read-only" : normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
-      allowedTools: o.review ? PARTNER_REVIEW_TOOLS : allowedTools,
+      permission,
+      allowedTools: permission === "read-only" ? PARTNER_REVIEW_TOOLS : allowedTools,
       prompt: partnerPrompt(run, o.task, !!o.review, agentName),
       ...(model ? { model } : {}),
     });
@@ -1022,6 +1063,21 @@ export function createScheduler(d: SchedulerDeps) {
 
   // A pull request opened elsewhere (by hand, or by another tool) is watched like one Rivet
   // opened: its checks, reviews and merge reach this run. One per run; null stops watching.
+  async function addPrLink(runId: string, number: number) {
+    const run = await load(runId);
+    if (!d.github) throw new SchedulerError(409, "GitHub is not available to this daemon");
+    const github = await d.github(run);
+    const status = prStatus(await github.facts(number));
+    const link = { number, url: `https://github.com/${github.repo}/pull/${number}`, status };
+    await d.write(() => {
+      if (d.store.getPr(runId)?.number === number) throw new SchedulerError(409, "this is already the primary pull request");
+      const links = d.store.linkedPrs(runId);
+      if (links.length >= 10 && !links.some(pr => pr.number === number)) throw new SchedulerError(409, "this thread already has 10 additional pull requests");
+      d.store.addLinkedPr(runId, link);
+    });
+    return link;
+  }
+
   async function linkPr(runId: string, number: number | null): Promise<{ number: number; url: string } | null> {
     const run = await load(runId);
     if (number === null) {
@@ -1032,7 +1088,7 @@ export function createScheduler(d: SchedulerDeps) {
     const github = await d.github(run);
     try { await github.facts(number); } catch (e) { throw new SchedulerError(409, `cannot read pull request #${number}: ${(e as Error).message}`); }
     const pr = { number, url: `https://github.com/${github.repo}/pull/${number}` };
-    await d.write(() => { d.store.setPr(runId, pr); d.store.updateNode(runId, NODE_ID, { prStatus: null }); });
+    await d.write(() => { d.store.setPr(runId, pr); d.store.removeLinkedPr(runId, pr.number); d.store.updateNode(runId, NODE_ID, { prStatus: null }); });
     void checkPr(runId).catch(report);
     return pr;
   }
@@ -1218,7 +1274,7 @@ export function createScheduler(d: SchedulerDeps) {
     try { await work; return true; } finally { startingForks.delete(runId); }
   }
 
-  return { linkPr, chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { addPrLink, linkPr, chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

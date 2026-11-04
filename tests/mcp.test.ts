@@ -23,6 +23,13 @@ async function exchange(messages: unknown[], call = async (_name: string, _args:
 }
 
 describe("MCP transport", () => {
+  it("exposes explicit thread-control tools", async () => {
+    const result = await exchange([frame(1, "initialize"), frame(2, "tools/list")]);
+    const names = result[1].result.tools.map((tool: { name: string }) => tool.name);
+    expect(names).toEqual(expect.arrayContaining([
+      "rivet_mark_unread", "rivet_promote_to_steer", "rivet_run_scheduled_task_now", "rivet_stop_subagent",
+    ]));
+  });
   it("negotiates, lists schemas, ignores notifications and keeps stdout as JSON", async () => {
     const r = await exchange([frame(1, "initialize", { protocolVersion: "2024-11-05" }), { jsonrpc: "2.0", method: "notifications/initialized" }, frame(2, "tools/list"), frame(3, "ping")]);
     expect(r).toHaveLength(3);

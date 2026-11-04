@@ -96,7 +96,14 @@ export async function startSession(body: Record<string, unknown>): Promise<void>
   go(r.runId);
 }
 
-export async function send(id: string, message: string, mode: string): Promise<string> {
-  const r = await api<{ delivery: string }>("POST", `/sessions/${encodeURIComponent(sessionOf(id))}/send`, { message, mode });
+export async function send(id: string, message: string, mode: string, files: File[] = []): Promise<string> {
+  if (files.length > 3 || files.reduce((total, file) => total + file.size, 0) > 512 * 1024) throw new Error("Attach up to three files totaling 512 KiB");
+  const attachments = await Promise.all(files.map(file => new Promise<{ name: string; base64: string }>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read attachment"));
+    reader.onload = () => resolve({ name: file.name, base64: String(reader.result).split(",", 2)[1] ?? "" });
+    reader.readAsDataURL(file);
+  })));
+  const r = await api<{ delivery: string }>("POST", `/sessions/${encodeURIComponent(sessionOf(id))}/send`, { message, mode, ...(attachments.length ? { attachments } : {}) });
   return r.delivery;
 }
