@@ -81,6 +81,35 @@ async function settled(runId: string, ms = 20_000): Promise<Run> {
 const show = (branch: string, file: string) => git(["show", `${branch}:${file}`], repo);
 
 describe("a worker", () => {
+  it("commits through the launch-bound broker and preserves output written after report done", async () => {
+    await start();
+    const gate = join(data, "finish-turn");
+    const id = await spawn({ files: { "change.txt": "worker edit" }, dumpEnv: true, finishGate: gate, finalReply: "final reply after reporting" }, { agent: "codex" });
+    const run = await getRun(id);
+    const envFile = join(run.node.worktree, "env.json");
+    const deadline = Date.now() + 10000;
+    while (!existsSync(envFile)) {
+      if (Date.now() >= deadline) throw new Error("worker did not start");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const { RIVET_LAUNCH_ID: launchId } = JSON.parse(await readFile(envFile, "utf8"));
+    const session = `/api/v1/sessions/${id}-agent`;
+    expect((await api("POST", session + "/commit", { launchId: "stale", message: "Save edit" })).status).toBe(403);
+    const commit = await api("POST", session + "/commit", { launchId, message: "Save edit" });
+    expect(commit.status, JSON.stringify(commit.json)).toBe(200);
+    expect(commit.json.committed).toBe(true);
+    expect((await show(run.node.branch, "change.txt")).trim()).toBe("worker edit");
+    expect((await api("POST", "/api/v1/reports", { sessionId: `${id}-agent`, kind: "done", message: "finished work" })).status).toBe(201);
+    const history = () => api("GET", `/api/v1/runs/${id}/timeline?view=activity`);
+    while (!(await history()).json.items.some((item: { text: string }) => item.text.includes("reported done"))) {
+      if (Date.now() >= deadline) throw new Error("done report was not recorded");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    expect((await getRun(id)).node.status).toBe("running");
+    await writeFile(gate, "finish");
+    expect((await settled(id)).node.status).toBe("done");
+    expect((await history()).json.items).toContainEqual(expect.objectContaining({ kind: "assistant", text: "final reply after reporting" }));
+  });
   it("works in its own worktree and branch from the base, and is done when its check and tests pass", async () => {
     await start();
     await setCfg("check", `node -e "require('fs').accessSync('a.txt')"`);

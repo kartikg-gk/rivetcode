@@ -481,6 +481,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const { runId, nodeId } = session(activity[1]);
       const payload = await body(req);
+      const launchId = optionalString(payload.launchId, "launchId");
+      if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
+        reply(res, 204);
+        return;
+      }
       // A chat session reports through its host; its agent's own hooks would say it twice.
       if (scheduler.isChat(sessionIdOf(runId, nodeId))) {
         reply(res, 204);
@@ -508,12 +513,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         }
         throw new HttpError(400, "state or agentSessionId is required");
       }
-      // Hooks of an agent from an earlier launch may still fire; only the current launch counts.
-      const launchId = optionalString(payload.launchId, "launchId");
-      if (launchId !== undefined && launches.get(sessionIdOf(runId, nodeId)) !== launchId) {
-        reply(res, 204);
-        return;
-      }
       const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
@@ -525,6 +524,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         }
       } else if (state !== null) scheduler.setPending(runId, null);
       if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
+      if (payload.turnEnded === true && state === "idle" && launchId !== undefined) {
+        reply(res, 204);
+        void scheduler.terminalTurnEnded(runId, launchId).then(() => {
+          if (runtime.isAlive(sessionIdOf(runId, nodeId))) return scheduler.deliver(runId);
+        }).catch((e) => opts.onError?.(e));
+        return;
+      }
       // An agent that went idle can take what was queued for it.
       if (state === "idle" || state === "waiting_input") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
@@ -694,6 +700,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
       reply(res, 201, { id });
+      return;
+    }
+    const commit = /^\/api\/v1\/sessions\/([^/]+)\/commit$/.exec(path);
+    if (commit) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const { runId, nodeId } = session(commit[1]);
+      const { message, launchId } = await body(req);
+      if (nodeId !== NODE_ID || typeof launchId !== "string") throw new HttpError(403, "a worker launch is required");
+      if (typeof message !== "string" || !message.trim() || message.length > 200 || /[\r\n\0]/.test(message)) throw new HttpError(400, "provide a single-line commit message of at most 200 characters");
+      reply(res, 200, await scheduler.commitWorker(runId, launchId, message.trim()));
       return;
     }
     const delegation = /^\/api\/v1\/sessions\/([^/]+)\/delegate$/.exec(path);

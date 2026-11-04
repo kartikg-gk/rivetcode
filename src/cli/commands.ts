@@ -82,6 +82,7 @@ const USAGE = `usage: rivet <command>
   doctor                                check what Rivet needs on this machine
   login claude|codex                    log an agent's CLI in to its account (its own login)
   hooks <agent> <event>                 receive an agent hook (called by the agent)
+  commit --message <text>               commit changes in this worker checkout
   report --done|--stuck|--needs-input --note <text>
   secret <name> --why <text>            ask the person for a secret; prints a file path holding it
                                         report this session's state (inside an agent)
@@ -160,13 +161,19 @@ async function hooks(args: string[], io: CliIo): Promise<number> {
   }
   const state = deriveActivity(agent, event, payload);
   const agentSessionId = agentSessionIdOf(payload);
-  const timeline = fromHook(agent, event, payload);
+  let timeline = fromHook(agent, event, payload);
+  if (agent === "claude-code" && event === "stop" && agentSessionId && io.env.RIVET_CLAUDE_TERMINAL_HISTORY === "1") {
+    const { claudeTerminalReplies } = await import("../claude-terminal-history.js");
+    const replies = claudeTerminalReplies(agentSessionId, timeline[0]?.text);
+    if (replies.length) timeline = replies;
+  }
   if (state === null && agentSessionId === undefined && timeline.length === 0) return 0;
   const launchId = io.env.RIVET_LAUNCH_ID?.trim();
   const request = state === "blocked" || event === "permission-request" ? permissionRequestOf(payload) : undefined;
   try {
     await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/activity`, {
       ...(state ? { state } : {}),
+      ...(event === "stop" ? { turnEnded: true } : {}),
       ...(request ? { request } : {}),
       ...(timeline.length ? { timeline } : {}),
       ...(agentSessionId ? { agentSessionId } : {}),
@@ -1110,6 +1117,15 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const payload = { ...(flags.has("at") ? { at: Number(flags.get("at")) } : {}), ...(flags.has("name") ? { name: flags.get("name") } : {}), ...(flags.has("target") ? { target: flags.get("target") } : {}) };
         const result = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/${command}`, payload, COMMAND_TIMEOUT_MS);
         io.out(JSON.stringify(result)); return 0;
+      }
+      case "commit": {
+        const { flags, rest } = parseFlags(args, ["message"]);
+        const message = flags.get("message");
+        if (rest.length || typeof message !== "string" || !message.trim()) throw new UsageError("commit needs --message <text>");
+        const session = requireSession(io);
+        const result = await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(session)}/commit`, { message, launchId: io.env.RIVET_LAUNCH_ID }, COMMAND_TIMEOUT_MS) as { committed: boolean; head: string };
+        io.out(result.committed ? "committed " + result.head : "no changes to commit");
+        return 0;
       }
       case "report": return await report(args, io);
       case "secret": return await secret(args, io);

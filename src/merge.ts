@@ -13,10 +13,10 @@ export async function headOf(worktree: string): Promise<string> {
 }
 
 // Whatever an agent left uncommitted is saved, never thrown away.
-export async function commitLeftovers(worktree: string, message: string): Promise<boolean> {
+export async function commitLeftovers(worktree: string, message: string, disableHooks = false): Promise<boolean> {
   if (!(await isDirty(worktree))) return false;
   await git(["add", "-A"], worktree);
-  await git(["commit", "-q", "--no-verify", "-m", message], worktree);
+  await git([...(disableHooks ? ["-c", "core.hooksPath=/dev/null"] : []), "commit", "-q", "--no-verify", "-m", message], worktree);
   return true;
 }
 

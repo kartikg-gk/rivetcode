@@ -25,8 +25,7 @@ export function workerPrompt(run: Run, retry?: string): string {
   // Codex's sandbox does not let it write a linked worktree's git data (it lives in the
   // main repository's .git), so its commits fail; Rivet commits for it.
   if (run.node.agent === "codex") {
-    lines.push("If git commit fails with \"Permission denied\" (your sandbox), leave the changes uncommitted:",
-      run.sharedWorkspace ? "Leave those changes for the source session to commit." : "Rivet commits them when you report done.");
+    lines.push(run.sharedWorkspace ? "Leave commits in this shared checkout to the source session." : 'Use rivet commit --message "<summary>" to commit changes in your assigned worktree.');
   }
   if (retry) lines.push("", "A previous attempt at this task failed:", retry, "", "Fix that and finish the task.");
   return lines.join("\n");

@@ -1,6 +1,7 @@
 import { contextText } from "./conversations.js";
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { realpath, rm } from "node:fs/promises";
+import { samePath } from "../paths.js";
 import { join } from "node:path";
 import { git } from "../git.js";
 import type { Agent } from "../agents/agent.js";
@@ -114,6 +115,16 @@ export function createScheduler(d: SchedulerDeps) {
   const testTimeout = d.testTimeoutMs ?? 30 * 60_000;
   const exitWaiters = new Map<string, (code: number | null) => void>();
   const doneReported = new Set<string>();
+  const terminalDrains = new Map<string, { launchId: string; timer: ReturnType<typeof setTimeout>; ended: boolean; timedOut: boolean }>();
+
+  async function terminalTurnEnded(runId: string, launchId: string) {
+    const session = sessionIdOf(runId, NODE_ID);
+    const drain = terminalDrains.get(session);
+    if (!drain || drain.launchId !== launchId || drain.timedOut || drain.ended || streamed.has(session)) return;
+    drain.ended = true;
+    clearTimeout(drain.timer);
+    await d.runtime.stop(session);
+  }
   // Sessions stopped on purpose (by the user or a shutdown): their exit is not a failure.
   const stoppedOnPurpose = new Set<string>();
   // Work still going on in the background (checks, pull requests), for idle().
@@ -255,6 +266,7 @@ export function createScheduler(d: SchedulerDeps) {
         env: {
           ...agentEnv({ runId: run.id, nodeId: node.id, project: run.project, dataDir: d.data, runFile: d.runFile, launchId }),
           RIVET_ATTEMPT: String(node.attempts),
+          RIVET_CLAUDE_TERMINAL_HISTORY: !headless && node.agent === "claude" ? "1" : "0",
         },
       });
     } catch (e) {
@@ -440,6 +452,7 @@ export function createScheduler(d: SchedulerDeps) {
   // decide, and a pass opens or updates its pull request. A pass the worker already got
   // from "rivet check" on these exact files counts, unless the project turned that off.
   async function workFinished(runId: string): Promise<void> {
+    await committing.get(runId)?.catch(report);
     const run = await load(runId);
     if (run.node.status !== "running" || run.node.finishedAt) return;
     if (run.sharedWorkspace) {
@@ -514,6 +527,11 @@ export function createScheduler(d: SchedulerDeps) {
 
   async function onExit(sessionId: string, launchId: string, code: number | null): Promise<void> {
     if (d.launches.get(sessionId) !== launchId) return;
+    const drain = terminalDrains.get(sessionId);
+    if (drain?.launchId === launchId) {
+      clearTimeout(drain.timer);
+      terminalDrains.delete(sessionId);
+    }
     const waiter = exitWaiters.get(launchId);
     const runId = sessionId.slice(0, sessionId.indexOf("-"));
     // Background work a session said it was waiting on ends with it.
@@ -533,7 +551,7 @@ export function createScheduler(d: SchedulerDeps) {
       return;
     }
     if (shuttingDown) return;
-    if (stoppedOnPurpose.delete(sessionId) && !doneReported.has(sessionId)) return;
+    if (stoppedOnPurpose.delete(sessionId) && (!doneReported.has(sessionId) || drain)) return;
     let run: Run;
     try { run = await load(runId); } catch { return; }
     // An orchestrator's exit ends nothing but its own conversation.
@@ -548,6 +566,12 @@ export function createScheduler(d: SchedulerDeps) {
       }
       await transition(runId, "escalated", "Chat completion is uncertain: inspect provider history and current files before an explicit resume; pending messages were preserved and were not automatically replayed.");
       await tellOrchestrator(run, `Worker ${runId} stopped with uncertain chat completion; inspect its history before resuming.`);
+      return;
+    }
+    if (drain?.launchId === launchId && (drain.timedOut || (code !== 0 && !drain.ended))) {
+      const why = drain.timedOut ? "Completion timed out while waiting for the terminal agent's final reply" : "Terminal agent exited before confirming its final turn";
+      await transition(runId, "escalated", why);
+      await tellOrchestrator(run, `Worker ${runId}: ${why}.`);
       return;
     }
     if (code === 0 || doneReported.has(sessionId)) {
@@ -612,15 +636,29 @@ export function createScheduler(d: SchedulerDeps) {
   // stops the agent and takes the work.
   async function onReport(runId: string, kind: string, said?: string): Promise<void> {
     const run = await load(runId);
+    const sessionId = sessionOf(run);
+    if (kind === "done" && run.role === "worker" && !doneReported.has(sessionId)) {
+      doneReported.add(sessionId);
+      if (d.runtime.isAlive(sessionId)) {
+        if (chats.has(sessionId)) await d.runtime.write(sessionId, JSON.stringify({ type: "finish" }));
+        else if (run.node.agent === "fake") await d.runtime.stop(sessionId);
+        else {
+          const launchId = d.launches.get(sessionId);
+          if (launchId) {
+            const timer = setTimeout(() => {
+              const pending = terminalDrains.get(sessionId);
+              if (pending?.launchId !== launchId || d.launches.get(sessionId) !== launchId || pending.ended) return;
+              pending.timedOut = true;
+              void d.runtime.stop(sessionId).catch(report);
+            }, 30000);
+            timer.unref();
+            terminalDrains.set(sessionId, { launchId, timer, ended: false, timedOut: false });
+          }
+        }
+      }
+    }
     await note(runId, NODE_ID, [{ kind: "event", text: `reported ${kind}${said ? `: ${said}` : ""}` }]);
     await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""} reports ${kind}${said ? `: ${said}` : ""}`);
-    if (kind !== "done" || run.role !== "worker") return;
-    const sessionId = sessionOf(run);
-    doneReported.add(sessionId);
-    if (d.runtime.isAlive(sessionId)) {
-      if (chats.has(sessionId)) await d.runtime.write(sessionId, JSON.stringify({type:"finish"}));
-      else await d.runtime.stop(sessionId);
-    }
   }
 
   // A worker's chat turn failed and its agent is still up: nothing more will happen on its
@@ -641,6 +679,7 @@ export function createScheduler(d: SchedulerDeps) {
   // From now on exits are only recorded; nothing is retried.
   async function shutdown(): Promise<void> {
     shuttingDown = true;
+    for (const drain of terminalDrains.values()) clearTimeout(drain.timer);
     if (watcher) clearInterval(watcher);
     if (radarTimer) clearInterval(radarTimer);
     if (limitTimer) clearInterval(limitTimer);
@@ -1247,10 +1286,39 @@ export function createScheduler(d: SchedulerDeps) {
 
   d.runtime.onExit((sessionId, launchId, code) => { void onExit(sessionId, launchId, code).catch(report); });
 
+  const committing = new Map<string, Promise<{ committed: boolean; head: string }>>();
   const cleaningWorkspaces = new Set<string>();
+
+  async function commitWorker(runId: string, launchId: string, message: string) {
+    const run = await load(runId);
+    const session = sessionOf(run);
+    const launch = launchPermissions.get(session);
+    if (run.role !== "worker" || run.sharedWorkspace || run.node.status !== "running" || doneReported.has(session)) throw new SchedulerError(409, "commit requires an active worker's own checkout");
+    if (launch?.launchId !== launchId || d.launches.get(session) !== launchId || !d.runtime.isAlive(session) || launch.permission === "read-only") throw new SchedulerError(403, "this worker launch cannot commit");
+    if (cleaningWorkspaces.has(run.node.worktree) || committing.has(runId) || d.runtime.isAlive(partnerSession(runId))) throw new SchedulerError(409, "checkout is busy");
+    const work = (async () => {
+      const path = run.node.worktree;
+      if ((await git(["symbolic-ref", "--short", "HEAD"], path)).trim() !== run.node.branch) throw new SchedulerError(409, "the worker checkout is on a different branch");
+      const commonDir = async (cwd: string) => realpath((await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)).trim());
+      if (!samePath(await commonDir(path), await commonDir(run.repo))) throw new SchedulerError(409, "checkout belongs to a different repository");
+      const gitDir = (await git(["rev-parse", "--absolute-git-dir"], path)).trim();
+      if (["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply", "rebase-merge", "sequencer"].some(name => existsSync(join(gitDir, name)))) throw new SchedulerError(409, "finish the Git operation before committing");
+      if (run.spec?.paths?.length) {
+        const changed = await git(["diff", "--name-only", "-z", "HEAD"], path);
+        const untracked = await git(["ls-files", "--others", "--exclude-standard", "-z"], path);
+        if (outsidePaths((changed + untracked).split("\0").filter(Boolean), run.spec.paths).length) throw new SchedulerError(409, "worktree changes exceed the allowed paths");
+      }
+      if (d.launches.get(session) !== launchId || !d.runtime.isAlive(session)) throw new SchedulerError(409, "worker launch has ended");
+      const committed = await commitLeftovers(path, message, true);
+      return { committed, head: await headOf(path) };
+    })();
+    committing.set(runId, work);
+    try { return await track(work); } finally { committing.delete(runId); }
+  }
   async function cleanWorkspace(run: Run): Promise<{ removed: string[]; kept: string[] }> {
     if (run.sharedWorkspace) return { removed: [], kept: [NODE_ID] };
     const preserve = await d.write(() => {
+      if (committing.has(run.id)) throw new SchedulerError(409, "checkout is committing");
       if (cleaningWorkspaces.has(run.node.worktree)) throw new SchedulerError(409, "checkout is already being cleaned");
       if (d.store.workspaceForks(run.id).length) return true;
       cleaningWorkspaces.add(run.node.worktree);
@@ -1274,7 +1342,7 @@ export function createScheduler(d: SchedulerDeps) {
     try { await work; return true; } finally { startingForks.delete(runId); }
   }
 
-  return { addPrLink, linkPr, chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { commitWorker, terminalTurnEnded, addPrLink, linkPr, chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

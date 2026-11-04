@@ -10,7 +10,7 @@
 // }
 // Prints one line per action so tests can read its output.
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -61,6 +61,12 @@ if (spec.listen) {
     console.log(`got ${line}`);
   });
   lines.on("close", exit);
+} else if (spec.finishGate) {
+  const timer = setInterval(() => {
+    if (!existsSync(spec.finishGate)) return;
+    clearInterval(timer);
+    process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: spec.finalReply } }) + "\n", exit);
+  }, 25);
 } else if (spec.stayFor) {
   setTimeout(exit, spec.stayFor);
 } else {
