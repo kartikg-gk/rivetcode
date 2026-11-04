@@ -106,10 +106,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       reply({ sessionId: sid, models:{availableModels:[{modelId:"claude-fixture",name:"Claude Fixture"}]} });
       if(process.env.RIVET_TEST_COMPACT==="1")update({sessionUpdate:"available_commands_update",availableCommands:[{name:"compact"}]});return;
     case "session/load":
+      sid = p.sessionId;
       update({sessionUpdate:"user_message_chunk",content:{type:"text",text:"recover me"}});
       update({sessionUpdate:"agent_message_chunk",content:{type:"text",text:"recovered answer"}});
       return reply({});
-    case "session/resume": return reply({});
+    case "session/resume": sid = p.sessionId; return reply({});
     case "session/fork": return p._meta?.jetbrains?.air?.fork?.messageId ? (sid = "forked", reply({ sessionId: "forked" })) : out({ id: m.id, error: { code: -32602, message: "no pin" } });
     case "session/set_config_option": return reply({ configOptions: [] });
     case "session/prompt": return void turn(p.prompt[0].text, (cancelled) => reply({ stopReason: cancelled ? "cancelled" : "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 30, cachedWriteTokens: 10, totalTokens: 150 } }));
