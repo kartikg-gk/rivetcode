@@ -51,6 +51,7 @@ export type Store = {
   saveRun(run: Run, fork?: ForkRecord): void;
   getFork(runId: string): ForkRecord | undefined;
   detachFork(runId: string): void;
+  createThreads(sourceId: string, tasks: { task: string; name?: string }[]): string[];
   ownForkWorkspace(runId: string, path: string): void;
   workspaceForks(owner: string): string[];
   inherited(runId: string): TimelineItem[];
@@ -210,7 +211,7 @@ export type AutomationRun = { id: number; automationId: string; scheduledFor: st
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
-export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; ownsWorkspace?: boolean; items: TimelineItem[] };
+export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; ownsWorkspace?: boolean; independent?: boolean; items: TimelineItem[] };
 export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; itemId?: string; turnId?: string; providerConversationId?: string };
 // A chat session's token use and context, as its agent last reported.
 export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
@@ -1149,6 +1150,35 @@ export function openStore(data: string): Store {
     },
     getFork(runId) { return forkRecord(runId); },
     inherited(runId) { return prefixFor(runId); },
+    createThreads(sourceId, tasks) {
+      if (!tasks.length || tasks.length > 8 || tasks.some(task => !task.task.trim() || task.task.length > 16000 || (task.name?.length ?? 0) > 100)) {
+        throw new RunStoreError("provide 1–8 tasks, at most 16000 characters each, with optional names up to 100 characters");
+      }
+      const source = this.loadRun(sourceId);
+      if (forkRecord(sourceId)?.detached) throw new RunStoreError("source workspace is detached");
+      const rootRun = source.sharedWorkspace ?? source.id;
+      return tasks.map(input => {
+        const id = newRunId();
+        const task = input.task.trim();
+        const name = input.name?.trim() ?? "";
+        const run: Run = {
+          id, project: source.project, repo: source.repo, base: source.base, task,
+          createdAt: new Date().toISOString(), role: "worker", name, sharedWorkspace: rootRun,
+          ...(source.model ? { model: source.model } : {}),
+          spec: { ...structuredClone(source.spec ?? {}), terminal: false, chat: true, doneWhen: undefined },
+          node: {
+            id: NODE_ID, title: name || task.slice(0, 100), prompt: task,
+            agent: source.node.agent, branch: source.node.branch, worktree: source.node.worktree,
+            status: "pending", attempts: 0, sessionMode: "chat",
+          },
+        };
+        this.saveRun(run, {
+          sourceRun: sourceId, rootRun, position: 0, providerId: "", agent: source.node.agent,
+          strategy: "pending", independent: true, items: [],
+        });
+        return id;
+      });
+    },
     ownForkWorkspace(runId, path) {
       const fork = forkRecord(runId);
       const run = this.loadRun(runId);

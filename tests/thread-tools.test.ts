@@ -35,6 +35,21 @@ async function seed() {
 }
 
 describe("durable conversation lineage", () => {
+  it("creates independent thread batches with fresh history and rejects invalid batches atomically", async () => {
+    const store = await seed();
+    const before = store.listRuns().length;
+    expect(() => store.createThreads("r1", [{ task: "valid" }, { task: "" }])).toThrow();
+    expect(store.listRuns()).toHaveLength(before);
+    const ids = store.createThreads("r1", [{ task: "Investigate tests", name: "Tests" }, { task: "Review docs" }]);
+    expect(ids).toHaveLength(2);
+    for (const id of ids) {
+      expect(store.readChat(id, { limit: 20 }).items).toEqual([]);
+      expect(store.getFork(id)).toMatchObject({ independent: true, providerId: "", items: [] });
+      expect(store.loadRun(id).sharedWorkspace).toBe("r1");
+      expect(store.loadRun(id).orchestrator).toBeUndefined();
+    }
+    expect(store.verifyJournal()).toMatchObject({ valid: true });
+  });
   it("pins inherited history, preserves ancestry after reopening, and shares only the checkout", async () => {
     const s = await seed();
     exchange(s, "r1", "t2", "later marker");

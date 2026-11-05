@@ -16,7 +16,7 @@ export type RunDetail = {
   terminal: boolean; pendingRequest?: { tool: string; detail: string; at: string };
   secretRequest?: { id: string; name: string; why: string; at: string };
   chatUsage?: { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
-  fork?: { sourceRun: string; position: number; strategy: string; detached: boolean } | null;
+  fork?: { sourceRun: string; position: number; strategy: string; independent?: boolean; detached: boolean } | null;
 };
 export type Item = {
   position: number; session: string; kind: string; tool?: string; text: string; at: string; streaming?: boolean;

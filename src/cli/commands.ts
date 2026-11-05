@@ -944,7 +944,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["worktree-handoff", "app", "console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["create-thread", "worktree-handoff", "app", "console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -1110,6 +1110,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (io.env.RIVET_SESSION_ID) q.set("wakeSession",io.env.RIVET_SESSION_ID);
         const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/wait?${q}`, undefined, 70000);
         io.out(JSON.stringify(result)); return 0;
+      }
+      case "create-thread": {
+        const { flags, rest } = parseFlags(args, ["task", "name"]);
+        if (rest.length !== 1 || typeof flags.get("task") !== "string") throw new UsageError("create-thread needs a source run and --task <text>");
+        const result = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/threads`, { tasks: [{ task: flags.get("task"), name: flags.get("name") }] }, COMMAND_TIMEOUT_MS);
+        io.out(JSON.stringify(result));
+        return 0;
       }
       case "worktree-handoff": {
         const { flags, rest } = parseFlags(args, ["base"]);

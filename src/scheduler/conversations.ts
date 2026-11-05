@@ -55,7 +55,7 @@ export function contextText(items: TimelineItem[], heading: string): string {
 export function mergeConversation(store: Store, sourceId: string, targetId?: string, at?: number) {
   const source = store.loadRun(sourceId);
   const fork = store.getFork(sourceId);
-  if (!fork) throw new Error("merge-back needs a fork as its source");
+  if (!fork || fork.independent) throw new Error("merge-back needs a conversation fork as its source");
   const target = store.loadRun(targetId ?? fork.sourceRun);
   if (source.id === target.id || source.project !== target.project) throw new Error("merge-back needs a related target in the same project");
   let ancestor = fork.sourceRun;

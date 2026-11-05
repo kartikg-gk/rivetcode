@@ -1095,6 +1095,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "pending",filesystem:"current checkout; historical files are not restored"}); return;
       } finally {branchChanges.delete(id);}
     }
+    const createThreadsRoute = /^\/api\/v1\/runs\/([^/]+)\/threads$/.exec(path);
+    if (createThreadsRoute) {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      const tasks = (await body(req)).tasks;
+      if (!Array.isArray(tasks) || tasks.some(task => !task || typeof task.task !== "string" || (task.name !== undefined && typeof task.name !== "string"))) throw new HttpError(400, "tasks must contain task text and optional names");
+      const ids = await write(() => {
+        const source = store.loadRun(createThreadsRoute[1]!);
+        if (scheduler.isCleaning(source.node.worktree) || !existsSync(source.node.worktree)) throw new HttpError(409, "source checkout is missing or being cleaned");
+        return store.createThreads(source.id, tasks);
+      });
+      reply(res, 201, { threads: ids.map(runId => ({ runId, started: false })) });
+      return;
+    }
     const conversationRoute = /^\/api\/v1\/runs\/([^/]+)\/(fork|merge-back)$/.exec(path);
     if (conversationRoute) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
@@ -1383,7 +1396,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
         const chatUsage = run.node.sessionMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
+        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, independent: f.independent ?? false, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "merge-policy") {

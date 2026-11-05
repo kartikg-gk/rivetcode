@@ -295,7 +295,7 @@ function Details({ d }: { d: RunDetail }) {
       <Fact k="On merge" v={d.terminateOnPrMerge ? "end the run" : "keep it"} />
       <Fact k="Tokens" v={c ? `${c.input.toLocaleString()} in, ${c.output.toLocaleString()} out, ${c.cached.toLocaleString()} cached` : d.usage.conversations ? `${d.usage.inputEquivalent.toLocaleString()} input-equivalent` : undefined} />
       <Fact k="Context" v={c?.contextUsed && c.contextWindow ? `${Math.round(100 * c.contextUsed / c.contextWindow)}% of ${c.contextWindow.toLocaleString()}` : undefined} />
-      <Fact k="Fork of" v={d.fork ? `${d.fork.sourceRun} at #${d.fork.position} (${d.fork.strategy}${d.fork.detached ? ", detached" : ""})` : undefined} />
+      <Fact k={d.fork?.independent ? "Workspace from" : "Fork of"} v={d.fork ? `${d.fork.sourceRun} at #${d.fork.position} (${d.fork.strategy}${d.fork.detached ? ", detached" : ""})` : undefined} />
       <Fact k="Limits" v={d.run.spec ? <code className="mono text-xs">{JSON.stringify(d.run.spec)}</code> : undefined} />
       <Fact k="Task" v={<span className="whitespace-pre-wrap">{d.run.task}</span>} />
       {d.reviews.length > 0 && <Fact k="Reviews" v={d.reviews.map((r) => <div key={r.id}>{r.verdict ?? r.status ?? "running"} · {r.sha.slice(0, 7)} · {r.trigger}{r.summary ? ` · ${r.summary}` : ""}</div>)} />}

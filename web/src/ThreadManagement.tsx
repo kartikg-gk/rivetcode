@@ -16,6 +16,7 @@ export function ThreadManagement({ detail }: { detail: RunDetail }) {
   const [scripts, setScripts] = useState("");
   const [environmentText, setEnvironmentText] = useState("");
   const [repository, setRepository] = useState("");
+  const [tasks, setTasks] = useState("");
   const [child, setChild] = useState("");
   const [number, setNumber] = useState("");
   const [guide, setGuide] = useState("");
@@ -43,6 +44,11 @@ export function ThreadManagement({ detail }: { detail: RunDetail }) {
     {[metadata.error, environment.error, links.error].filter(Boolean).map((error, index) => <p key={index} role="alert">{error}</p>)}
     <fieldset disabled={busy} className="grid gap-3">
       <legend>Project preferences</legend>
+      <label className="label">Independent threads, one task per line<textarea className="field" value={tasks} onChange={event => setTasks(event.target.value)} /></label>
+      <button className="btn" disabled={!tasks.trim()} onClick={() => perform(async () => {
+        await api("POST", runPath(id, "/threads"), { tasks: tasks.split(/\r?\n/).filter(task => task.trim()).map(task => ({ task })) });
+        setTasks("");
+      }, "Independent threads created")}>Create threads</button>
       <label className="label">Title<input className="field" value={title} maxLength={100} onChange={event => setTitle(event.target.value)} /></label>
       <label className="label">Instructions<textarea className="field" value={instructions} maxLength={8000} onChange={event => setInstructions(event.target.value)} /></label>
       <label className="label">Saved scripts, one id=command per line<textarea className="field" value={scripts} onChange={event => setScripts(event.target.value)} /></label>
