@@ -1,3 +1,5 @@
+import { AttachmentPreview } from "./AttachmentPreview";
+import { ThreadManagement } from "./ThreadManagement";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -8,7 +10,7 @@ import { send, sessionActions, type Action } from "./actions";
 import { api, openTerminal, runPath, type Item, type Page, type RunDetail } from "./api";
 import { act, repoName, runLabel, toast, useApp, useLive } from "./state";
 
-const SIDE_TABS = ["details", "changes", "terminal", "events", "raw", "branches", "provider"] as const;
+const SIDE_TABS = ["management", "details", "changes", "terminal", "events", "raw", "branches", "provider"] as const;
 type Side = (typeof SIDE_TABS)[number];
 
 // The whole history, then only what can have changed: from the first reply still being written.
@@ -109,6 +111,8 @@ function Question({ id, request }: { id: string; request: NonNullable<RunDetail[
 // can use; it is never shown again, recorded, or put in the conversation.
 function SecretCard({ id, request }: { id: string; request: NonNullable<RunDetail["secretRequest"]> }) {
   const [value, setValue] = useState("");
+  const [account, setAccount] = useState("");
+  const [reference, setReference] = useState("");
   const answer = (refuse: boolean) => void act(async () => {
     await api("POST", runPath(id, "/secret"), refuse ? { id: request.id, refuse: true } : { id: request.id, value });
     setValue("");
@@ -118,6 +122,11 @@ function SecretCard({ id, request }: { id: string; request: NonNullable<RunDetai
       <div className="font-medium flex items-center gap-2"><KeyRound size={15} />The agent asks for a secret: {request.name}</div>
       {request.why && <p className="text-sm text-muted whitespace-pre-wrap">{request.why}</p>}
       <input type="password" autoComplete="off" spellCheck={false} aria-label={`Value for ${request.name}`} className="field" placeholder="Paste the value" value={value} onChange={(e) => setValue(e.target.value)} />
+      <label className="label">1Password account<input className="field" value={account} onChange={event => setAccount(event.target.value)} /></label>
+      <label className="label">Secret reference<input className="field" placeholder="op://vault/item/field" value={reference} onChange={event => setReference(event.target.value)} /></label>
+      <button type="button" className="btn" disabled={!account || !reference} onClick={() => void act(() => api("POST", runPath(id, "/secret"), {
+        id: request.id, vault: { provider: "onepassword", account, reference }, refresh: true,
+      }), "Given privately from 1Password")}>Read from 1Password</button>
       <p className="text-xs text-muted">The agent gets a file path, never the value. The file is deleted when this session ends.</p>
       <div className="flex gap-2"><button className="btn btn-primary" disabled={!value}>Give privately</button><button type="button" className="btn btn-danger" onClick={() => answer(true)}>Refuse</button></div>
     </form>
@@ -139,6 +148,7 @@ function Waiting({ id }: { id: string }) {
             title: "Edit waiting message", confirm: "Save", fields: [{ name: "message", label: "Message", type: "textarea", value: m.message }],
             run: (v) => api("PATCH", `${path}/${m.id}`, { message: v.message }),
           } })}>Edit</button>
+          <button className="text-xs cursor-pointer" onClick={() => void act(() => api("PATCH", `${path}/${m.id}`, { mode: "steer" }), "Promoted to steering")}>Steer now</button>
           <button className="text-xs text-danger cursor-pointer" onClick={() => void act(() => api("DELETE", `${path}/${m.id}`), "cancelled")}>Cancel</button>
         </li>
       ))}
@@ -205,6 +215,7 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
           ))}
         </ul>
       )}
+      {files.map((file, index) => <AttachmentPreview key={index} file={file} />)}
       <div className="composer">
         <textarea aria-label="Message to this session" rows={2} className="w-full bg-transparent resize-none outline-none px-1" placeholder="Send a follow-up, or / for commands"
           value={text} onChange={(e) => { setText(e.target.value); setPick(0); }} onKeyDown={key} />
@@ -422,7 +433,15 @@ export function Conversation({ id }: { id: string }) {
             <button className="ml-auto cursor-pointer text-muted" aria-label="Close panel" onClick={() => setSide(null)}><X size={15} /></button>
           </div>
           <div className="flex-1 overflow-y-auto min-h-0">
-            {side === "details" && d && <Details d={d} />}
+            {side === "management" && d && <ThreadManagement detail={d} />}
+            {side === "details" && d && <>
+              <Details d={d} />
+              {d.run.sharedWorkspace && !["active", "blocked"].includes(d.run.node.activity ?? "") && !d.fork?.detached && (
+                <button className="btn" onClick={() => void act(() => api("POST", runPath(id, "/worktree-handoff"), {}), "Moved to a new worktree")}>
+                  Move to a new worktree
+                </button>
+              )}
+            </>}
             {side === "changes" && <Changes id={id} />}
             {side === "terminal" && <TerminalPane id={id} session={session} />}
             {side === "events" && <Lines id={id} tail="/events?limit=500" field="events" />}

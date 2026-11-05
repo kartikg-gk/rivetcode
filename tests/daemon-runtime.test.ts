@@ -92,6 +92,7 @@ describe("starting agents", () => {
       RIVET_RUN_FILE: runFile,
       RIVET_LAUNCH_ID: launchId,
       RIVET_ATTEMPT: "0",
+      RIVET_CLAUDE_TERMINAL_HISTORY: "0",
     });
     await until(() => activity() === "exited");
   });

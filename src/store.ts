@@ -51,6 +51,7 @@ export type Store = {
   saveRun(run: Run, fork?: ForkRecord): void;
   getFork(runId: string): ForkRecord | undefined;
   detachFork(runId: string): void;
+  ownForkWorkspace(runId: string, path: string): void;
   workspaceForks(owner: string): string[];
   inherited(runId: string): TimelineItem[];
   contextTransfer(source: string, target: string, through: number): { id: string; delivered: boolean; attached: boolean } | undefined;
@@ -209,7 +210,7 @@ export type AutomationRun = { id: number; automationId: string; scheduledFor: st
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
-export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; items: TimelineItem[] };
+export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; ownsWorkspace?: boolean; items: TimelineItem[] };
 export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; itemId?: string; turnId?: string; providerConversationId?: string };
 // A chat session's token use and context, as its agent last reported.
 export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
@@ -787,7 +788,8 @@ export function openStore(data: string): Store {
     assertProjectId(run.project);
     assertId("node", run.node.id);
     // Later steps run git on this branch, so it must be the node's own.
-    const owner = (fork ?? forkRecord(run.id))?.rootRun;
+    const lineage = fork ?? forkRecord(run.id);
+    const owner = lineage?.ownsWorkspace ? undefined : lineage?.rootRun;
     if (owner) {
       const original = (selectNodes.all(owner) as NodeRow[])[0];
       const originalRun = selectRun.get(owner) as RunRow | undefined;
@@ -905,7 +907,7 @@ export function openStore(data: string): Store {
         ...(r.model !== null ? { model: r.model } : {}),
         ...(r.issue !== null ? { issue: Number(r.issue) } : {}),
         ...(r.spec !== null ? { spec: JSON.parse(r.spec) as TaskSpec } : {}),
-        ...(forkRecord(runId) ? { sharedWorkspace: forkRecord(runId)!.rootRun } : {}),
+        ...(forkRecord(runId) && !forkRecord(runId)!.ownsWorkspace ? { sharedWorkspace: forkRecord(runId)!.rootRun } : {}),
         node: nodes[0],
       };
     },
@@ -1147,6 +1149,25 @@ export function openStore(data: string): Store {
     },
     getFork(runId) { return forkRecord(runId); },
     inherited(runId) { return prefixFor(runId); },
+    ownForkWorkspace(runId, path) {
+      const fork = forkRecord(runId);
+      const run = this.loadRun(runId);
+      if (!fork || fork.detached || fork.ownsWorkspace || run.node.status === "running") {
+        throw new RunStoreError("handoff requires a stopped shared fork");
+      }
+      db.exec("SAVEPOINT workspace_handoff");
+      try {
+        db.prepare("UPDATE nodes SET worktree = ?, branch = ?, status = 'pending', provider_conversation_id = '', agent_session_id = NULL WHERE run_id = ?")
+          .run(path, branchName(runId, NODE_ID), runId);
+        db.prepare("UPDATE thread_forks SET data_json = ? WHERE run_id = ?")
+          .run(JSON.stringify({ ...fork, ownsWorkspace: true, items: this.readChat(runId, { limit: 5000 }).items, providerId: "", providerTurn: undefined, strategy: "pending" }), runId);
+        logEvent(runId, NODE_ID, "workspace.handoff");
+        db.exec("RELEASE workspace_handoff");
+      } catch (error) {
+        db.exec("ROLLBACK TO workspace_handoff; RELEASE workspace_handoff");
+        throw error;
+      }
+    },
     detachFork(runId) {
       const fork = forkRecord(runId);
       if (!fork) return;
@@ -1158,7 +1179,7 @@ export function openStore(data: string): Store {
       logEvent(runId, NODE_ID, "conversation.detached");
     },
     workspaceForks(owner) {
-      return (db.prepare("SELECT run_id FROM thread_forks WHERE root_run = ? AND coalesce(json_extract(data_json, '$.detached'), 0) = 0").all(owner) as { run_id: string }[]).map((r) => r.run_id);
+      return (db.prepare("SELECT run_id FROM thread_forks WHERE root_run = ? AND coalesce(json_extract(data_json, '$.detached'), 0) = 0 AND coalesce(json_extract(data_json, '$.ownsWorkspace'), 0) = 0").all(owner) as { run_id: string }[]).map((r) => r.run_id);
     },
     contextTransfer(source, target, through) {
       const row = db.prepare("SELECT t.id, t.attached, o.delivered_at FROM context_transfers t JOIN outbox o ON o.id = t.message_id WHERE t.source_run = ? AND t.target_run = ? AND t.through_position = ?").get(source, target, through) as { id: string; attached: number; delivered_at: string | null } | undefined;

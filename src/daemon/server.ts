@@ -1,3 +1,4 @@
+import { linkListed } from "../links.js";
 import { saveAttachments } from "./attachments.js";
 import { cleanupQueue } from "./cleanup.js";
 import { allowedRequest, liveSocket, serveApp } from "./web.js";
@@ -12,13 +13,13 @@ import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude, findCodex } from "../agents/locate.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
-import { dataDir, assertId, defaultProjectId } from "../paths.js";
+import { dataDir, assertId, defaultProjectId, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
-import { cleanRun, MODEL_FAMILIES, prepareRun, repoRoot, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
+import { cleanRun, copyListed, MODEL_FAMILIES, prepareRun, repoRoot, runSetup, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
 import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
@@ -75,7 +76,8 @@ import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
 import { runUsage } from "../usage.js";
 import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
-import { emptyTrash } from "../worktree.js";
+import { vaultResolver } from "./vault.js";
+import { createWorktree, emptyTrash, removeWorktree } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 const DIFF_LIMIT = 2 * 1024 * 1024;
@@ -268,6 +270,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return githubClient({ repo, token: await githubToken(process.env, remote) });
   });
   const branchChanges = new Set<string>();
+  const vault = vaultResolver();
   let wakeTimer: NodeJS.Timeout | undefined;
   const waitAbort = new AbortController();
   // A secret given to a session goes when the session does.
@@ -773,6 +776,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const payload = await body(req);
       const id = optionalString(payload.id, "id") ?? "";
+      if (payload.vault !== undefined) {
+        const pending = secrets.pending(sessionIdOf(secretAnswer[1]!, NODE_ID));
+        if (!pending || pending.id !== id) throw new HttpError(409, "that request is no longer waiting");
+        const reference = payload.vault as Record<string, unknown>;
+        if (!reference || typeof reference.provider !== "string" || typeof reference.account !== "string" || typeof reference.reference !== "string") throw new HttpError(400, "invalid vault reference");
+        if (payload.refresh === true) vault.invalidate();
+        let value: string;
+        try { value = await vault.read({ provider: reference.provider, account: reference.account, reference: reference.reference }); }
+        catch { throw new HttpError(409, "Vault read failed. Check the local vault CLI authentication, account and reference."); }
+        if (!(await secrets.answer(sessionIdOf(secretAnswer[1]!, NODE_ID), id, value))) throw new HttpError(409, "that request is no longer waiting");
+        reply(res, 204);
+        return;
+      }
       const value = payload.refuse === true ? null : typeof payload.value === "string" && payload.value.length > 0 && payload.value.length <= 20_000 ? payload.value : undefined;
       if (value === undefined) throw new HttpError(400, "value must be text of at most 20000 characters, or refuse must be true");
       if (!(await secrets.answer(sessionIdOf(secretAnswer[1]!, NODE_ID), id, value))) throw new HttpError(409, "that request is no longer waiting");
@@ -1346,7 +1362,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (!job) throw new HttpError(404, "cleanup job is unavailable, possibly after restart; inspect the worktree and rerun clean for the same run (dirty worktrees remain protected)");
       reply(res, 200, job); return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|merge-policy|review|switch))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|merge-policy|review|switch|worktree-handoff))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -1395,6 +1411,41 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 202, { runId: run.id, agent: to });
         return;
       }
+      if (action === "worktree-handoff") {
+        if (branchChanges.has(run.id)) throw new HttpError(409, "workspace is changing");
+        branchChanges.add(run.id);
+        try {
+        if ((await write(() => store.readChat(run.id, { limit: 1 }))).total > 5000) throw new HttpError(409, "history exceeds the handoff context limit");
+        const payload = await body(req);
+        if (!run.sharedWorkspace || ["active", "blocked"].includes(run.node.activity ?? "")) {
+          throw new HttpError(409, "handoff requires a shared fork with a settled turn");
+        }
+        await scheduler.stopRun(run.id);
+        const ref = optionalString(payload.baseRef, "baseRef") ?? "HEAD";
+        const from = (await git(["rev-parse", "--verify", "--end-of-options", ref + "^{commit}"], run.node.worktree)).trim();
+        const branch = branchName(run.id, NODE_ID);
+        const path = worktreePath(data, run.project, run.id, NODE_ID);
+        await createWorktree({ repo: run.repo, path, branch, from });
+        try {
+          await write(() => store.ownForkWorkspace(run.id, path));
+        } catch (error) {
+          await removeWorktree(data, run.repo, path).then(() => git(["branch", "-d", branch], run.repo)).catch(() => {});
+          throw error;
+        }
+        const config = await write(() => store.getConfig(run.project));
+        const setup = config.setup ?? "";
+        const steps = setup.split(/\r?\n/).map(step => step.trim()).filter(Boolean);
+        try {
+          await copyListed(run.repo, path, (config.copy ?? "").split(",").map(value => value.trim()).filter(Boolean));
+          await linkListed(run.repo, path, (config.symlink ?? "").split(",").map(value => value.trim()).filter(Boolean));
+          await runSetup(run.repo, path, run.id, steps);
+        } catch (error) {
+          throw new HttpError(409, "Worktree created and attached, but setup failed. Inspect it before resuming: " + (error as Error).message);
+        }
+        reply(res, 201, { runId: run.id, branch, worktree: path, commit: from });
+        return;
+        } finally { branchChanges.delete(run.id); }
+      }
       if (action === "review") {
         reply(res, 202, { reviewId: await scheduler.startReview(run.id, "manual") });
         return;
@@ -1410,6 +1461,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       if (action === "resume") {
+        if (branchChanges.has(run.id)) throw new HttpError(409, "workspace is changing");
         await scheduler.resume(run.id);
         reply(res, 202, { runId: run.id });
         return;

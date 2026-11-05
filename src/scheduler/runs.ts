@@ -111,7 +111,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
 
 // Only the listed files, never everything untracked; a missing one is skipped. They are
 // local files git does not track, so they go away with the worktree.
-async function copyListed(repo: string, worktree: string, files: string[]): Promise<void> {
+export async function copyListed(repo: string, worktree: string, files: string[]): Promise<void> {
   for (const file of files) {
     const rel = file.trim().replace(/\\/g, "/");
     if (!rel || rel.startsWith("/") || /^[a-zA-Z]:/.test(rel) || rel.split("/").includes("..")) {
@@ -142,7 +142,7 @@ const SETUP_OUTPUT_TAIL = 8 * 1024;
 
 // Each step through the shell in the worktree, ten minutes at most; the first failure
 // stops the run before any agent starts, showing the end of its output.
-async function runSetup(repo: string, worktree: string, nodeId: string, steps: string[]): Promise<void> {
+export async function runSetup(repo: string, worktree: string, nodeId: string, steps: string[]): Promise<void> {
   for (const [i, step] of steps.entries()) {
     const result = await runCommand(step, worktree, SETUP_STEP_TIMEOUT_MS, {
       RIVET_SOURCE_TREE_PATH: repo,

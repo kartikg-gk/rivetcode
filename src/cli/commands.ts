@@ -75,6 +75,7 @@ const USAGE = `usage: rivet <command>
              | rm|pause|resume|run <name>   prompts run on a schedule by a new worker or orchestrator
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
+  worktree-handoff <run> [--base <ref>] move a settled shared fork to its own worktree
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
   app [--no-open]                       open the graphical app in your browser
   panes                                 show every running agent side by side
@@ -943,7 +944,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["app", "console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["worktree-handoff", "app", "console", "transfers", "search", "wait", "fork", "merge-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -1109,6 +1110,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (io.env.RIVET_SESSION_ID) q.set("wakeSession",io.env.RIVET_SESSION_ID);
         const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/wait?${q}`, undefined, 70000);
         io.out(JSON.stringify(result)); return 0;
+      }
+      case "worktree-handoff": {
+        const { flags, rest } = parseFlags(args, ["base"]);
+        if (rest.length !== 1) throw new UsageError("worktree-handoff needs one run id");
+        const result = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/worktree-handoff`, { baseRef: flags.get("base") }, COMMAND_TIMEOUT_MS);
+        io.out(JSON.stringify(result));
+        return 0;
       }
       case "fork":
       case "merge-back": {

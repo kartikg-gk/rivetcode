@@ -1,3 +1,4 @@
+import { existsSync, writeFileSync } from "node:fs";
 import { searchPage } from "../src/search.js";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
@@ -180,7 +181,7 @@ it("reconstructs a pinned Claude prefix explicitly", async () => {
 
 it("exposes lazy forks, search, wait and merge-back through daemon and CLI, protecting the shared checkout", async () => {
   const s = await seed(); repo = await makeRepo();
-  const source = s.loadRun("r1"); source.node.worktree = repo; s.saveRun(source); s.close(); store = undefined;
+  const source = s.loadRun("r1"); source.node.worktree = repo; source.repo = repo; s.saveRun(source); s.close(); store = undefined;
   process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "codex"]);
   daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
   const api = async (method: string, path: string, body?: unknown) => {
@@ -189,6 +190,14 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
     if (path.endsWith("/clean") && r.status === 202) return { status: 200, value: await cleanupResult(`http://127.0.0.1:${daemon!.port}`, value.id) };
     return { status: r.status, value };
   };
+  writeFileSync(join(repo, "local-only.txt"), "uncommitted work");
+  const isolated = (await api("POST", "/runs/r1/fork", {})).value.runId;
+  const handoff = await api("POST", `/runs/${isolated}/worktree-handoff`, {});
+  expect(handoff.status).toBe(201);
+  expect(existsSync(join(repo, "local-only.txt"))).toBe(true);
+  expect(existsSync(join(handoff.value.worktree, "local-only.txt"))).toBe(false);
+  expect((await api("GET", `/runs/${isolated}`)).value.run.sharedWorkspace).toBeUndefined();
+  expect((await api("POST", `/runs/${isolated}/worktree-handoff`, {})).status).toBe(409);
   const out: string[] = [];
   const io: CliIo = { env: { RIVET_SESSION_ID: "r1-agent", RIVET_PROJECT_ID: "proj", RIVET_RUN_FILE: join(data!, "running.json") }, cwd: repo, readStdin: async () => "", out: (l) => out.push(l), err: (l) => { throw new Error(l); } };
   expect(await runCli(["fork", "r1", "--name", "exploration"], io)).toBe(0);

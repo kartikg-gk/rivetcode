@@ -1208,7 +1208,7 @@ export function createScheduler(d: SchedulerDeps) {
   // it, then continues whatever was interrupted.
   async function resume(runId: string): Promise<void> {
     const run = await load(runId);
-    if (run.sharedWorkspace) { await startForkMessage(runId); return; }
+    if (await d.write(() => d.store.getFork(runId))) { await startForkMessage(runId); return; }
     if (run.role === "orchestrator") {
       if (d.runtime.isAlive(sessionOf(run))) return;
       if (run.node.status !== "running") await transition(runId, "running");
@@ -1330,8 +1330,9 @@ export function createScheduler(d: SchedulerDeps) {
   const startingForks = new Map<string, Promise<void>>();
   async function startForkMessage(runId: string): Promise<boolean> {
     const run = await load(runId);
-    if (!run.sharedWorkspace || d.runtime.isAlive(sessionOf(run))) return false;
-    if ((await d.write(() => d.store.getFork(runId)))?.detached) throw new SchedulerError(409, "fork was detached from its shared checkout");
+    const fork = await d.write(() => d.store.getFork(runId));
+    if (!fork || d.runtime.isAlive(sessionOf(run))) return false;
+    if (fork.detached) throw new SchedulerError(409, "fork was detached from its shared checkout");
     if (startingForks.has(runId)) { await startingForks.get(runId); return true; }
     const work = (async () => {
       if ((await load(runId)).node.status !== "running") await transition(runId, "running");

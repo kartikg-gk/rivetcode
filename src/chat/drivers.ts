@@ -1,3 +1,4 @@
+import { nativeImages } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { mcpLaunch } from "../mcp/launch.js";
 import { mcpTools, toolCaller } from "../mcp/server.js";
@@ -285,7 +286,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       activeTurn = `${identity}:t${++turn}`;
       o.emit({ type: "turn", turnId: activeTurn, state: "running" });
       try {
-        const r = await rpc.call("session/prompt", { sessionId, prompt: [{ type: "text", text: said }] });
+        const r = await rpc.call("session/prompt", { sessionId, prompt: [{ type: "text", text: said }, ...nativeImages(said, o.env).map(image => ({ type: "image", mimeType: image.mimeType, data: image.data }))] });
         flush();
         // The turn's own use; the totals are their sum.
         const u = (r.usage ?? {}) as Record<string, unknown>;
@@ -304,7 +305,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       if (!activeTurn) return false;
       try {
         const r = await rpc.call("_session/steering", {
-          sessionId, prompt: [{ type: "text", text: said }], _meta: { steering: { idleBehavior: "promptRequired" } },
+          sessionId, prompt: [{ type: "text", text: said }, ...nativeImages(said, o.env).map(image => ({ type: "image", mimeType: image.mimeType, data: image.data }))], _meta: { steering: { idleBehavior: "promptRequired" } },
         });
         return r.outcome === "injected";
       } catch { return false; }
@@ -500,7 +501,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
       const ended = new Promise<void>((resolve) => { turnEnded = resolve; });
       let id = "";
       try {
-        const r = await rpc.call("turn/start", { threadId, input: [{ type: "text", text: said }] });
+        const r = await rpc.call("turn/start", { threadId, input: [{ type: "text", text: said }, ...nativeImages(said, o.env).map(image => ({ type: "image", url: `data:${image.mimeType};base64,${image.data}` }))] });
         id = text((r.turn as { id?: string } | undefined)?.id);
         if (id && !activeTurn && !finished.has(id)) { activeTurn = id; o.emit({ type: "turn", turnId: id, state: "running" }); }
       } catch (e) {
@@ -513,7 +514,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
     async steer(said) {
       if (!activeTurn) return false;
       try {
-        await rpc.call("turn/steer", { threadId, expectedTurnId: activeTurn, input: [{ type: "text", text: said }] });
+        await rpc.call("turn/steer", { threadId, expectedTurnId: activeTurn, input: [{ type: "text", text: said }, ...nativeImages(said, o.env).map(image => ({ type: "image", url: `data:${image.mimeType};base64,${image.data}` }))] });
         return true;
       } catch { return false; }
     },
