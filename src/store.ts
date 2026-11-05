@@ -96,7 +96,7 @@ export type Store = {
   writePrGuides(runId: string, guides: { number: number; text: string }[]): void;
   linkedPrs(runId: string): LinkedPullRequest[];
   addLinkedPr(runId: string, pr: LinkedPullRequest): void;
-  updateLinkedPr(runId: string, number: number, status: string): void;
+  updateLinkedPr(runId: string, number: number, status: string, handled?: string): void;
   removeLinkedPr(runId: string, number: number): boolean;
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
@@ -161,7 +161,7 @@ export type ProjectMetadata = {
   scripts: { id: string; command: string }[];
 };
 
-export type LinkedPullRequest = { number: number; url: string; status: string };
+export type LinkedPullRequest = { number: number; url: string; status: string; handled?: string };
 export type PullRequest = { number: number; url: string; handled?: string };
 
 // One review pass over a worker's pull request at one commit.
@@ -414,6 +414,7 @@ MIGRATIONS.push({ version: 29, sql: "", run: (db) => {
   const sql = row.sql.replace(/agent IN \([^)]*\)/, `agent IN (${oneOf(AGENTS)})`).replace(/^CREATE TABLE "?nodes"?/, "CREATE TABLE nodes_v29");
   db.exec(`${sql}; INSERT INTO nodes_v29 SELECT * FROM nodes; DROP TABLE nodes; ALTER TABLE nodes_v29 RENAME TO nodes;`);
 } });
+MIGRATIONS.push({ version: 35, sql: "ALTER TABLE linked_pull_requests ADD COLUMN handled TEXT NOT NULL DEFAULT '';" });
 MIGRATIONS.push({ version: 34, sql: `
 CREATE TABLE environment_preferences (id INTEGER PRIMARY KEY CHECK(id=1), instructions TEXT NOT NULL);
 ` });
@@ -1645,15 +1646,15 @@ export function openStore(data: string): Store {
     },
 
     linkedPrs(runId) {
-      return db.prepare("SELECT number,url,status FROM linked_pull_requests WHERE run_id=? ORDER BY number").all(runId) as LinkedPullRequest[];
+      return db.prepare("SELECT number,url,status,handled FROM linked_pull_requests WHERE run_id=? ORDER BY number").all(runId) as LinkedPullRequest[];
     },
 
     addLinkedPr(runId, pr) {
-      db.prepare("INSERT INTO linked_pull_requests VALUES (?,?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET url=excluded.url,status=excluded.status").run(runId, pr.number, pr.url, pr.status);
+      db.prepare("INSERT INTO linked_pull_requests(run_id,number,url,status) VALUES (?,?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET url=excluded.url,status=excluded.status").run(runId, pr.number, pr.url, pr.status);
     },
 
-    updateLinkedPr(runId, number, status) {
-      db.prepare("UPDATE linked_pull_requests SET status=? WHERE run_id=? AND number=? AND status<>?").run(status, runId, number, status);
+    updateLinkedPr(runId, number, status, handled) {
+      db.prepare("UPDATE linked_pull_requests SET status=?, handled=coalesce(?,handled) WHERE run_id=? AND number=?").run(status, handled ?? null, runId, number);
     },
 
     removeLinkedPr(runId, number) {

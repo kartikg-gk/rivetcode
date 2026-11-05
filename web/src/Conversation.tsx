@@ -215,7 +215,7 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
           ))}
         </ul>
       )}
-      {files.map((file, index) => <AttachmentPreview key={index} file={file} />)}
+      {files.map((file, index) => <AttachmentPreview key={index} file={file} useText={preview => setText(current => current + "\n\n" + preview)} />)}
       <div className="composer">
         <textarea aria-label="Message to this session" rows={2} className="w-full bg-transparent resize-none outline-none px-1" placeholder="Send a follow-up, or / for commands"
           value={text} onChange={(e) => { setText(e.target.value); setPick(0); }} onKeyDown={key} />

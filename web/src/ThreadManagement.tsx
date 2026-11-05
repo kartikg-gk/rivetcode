@@ -10,7 +10,13 @@ export function ThreadManagement({ detail }: { detail: RunDetail }) {
   const projectPath = `/projects/${encodeURIComponent(project)}`;
   const metadata = useLive(() => api<{ project: Project }>("GET", projectPath), [project]);
   const environment = useLive(() => api<{ instructions: string }>("GET", "/environment-preferences"), []);
+  const execution = useLive(() => api<{ scripts: Project["scripts"]; running: { id: string; alive: boolean; output: string; exitCode: number | null } | null }>("GET", runPath(id, "/scripts")), [id]);
   const links = useLive(() => api<Links>("GET", runPath(id, "/linked-prs")), [id]);
+  useEffect(() => {
+    if (!execution.data?.running?.alive) return;
+    const timer = setInterval(() => execution.reload(), 1000);
+    return () => clearInterval(timer);
+  }, [id, execution.data?.running?.alive]);
   const [title, setTitle] = useState("");
   const [instructions, setInstructions] = useState("");
   const [scripts, setScripts] = useState("");
@@ -62,6 +68,17 @@ export function ThreadManagement({ detail }: { detail: RunDetail }) {
       <button className="btn btn-danger" onClick={() => {
         if (window.confirm(`Delete Rivet records and settings for ${project}? Stop its sessions first.`)) perform(() => api("DELETE", projectPath, { confirm: project }), "Project deleted");
       }}>Delete project records</button>
+      <h3>Run saved scripts</h3>
+      {execution.error && <p role="alert">{execution.error}</p>}
+      {execution.data?.scripts.map(script => <button key={script.id} className="btn" disabled={execution.data?.running?.alive} onClick={() => {
+        if (window.confirm("Run " + script.id + " in this checkout?\n" + script.command)) perform(() => api("POST", runPath(id, "/scripts/" + encodeURIComponent(script.id)), { confirm: script.id }), "Script started");
+      }}>{script.id}</button>)}
+      {execution.data?.running && <>
+        <p>{execution.data.running.id}: {execution.data.running.alive ? "Running" : "Exited " + execution.data.running.exitCode}</p>
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap">{execution.data.running.output}</pre>
+        <button className="btn" disabled={!execution.data.running.alive} onClick={() => perform(() => api("DELETE", runPath(id, "/scripts")), "Script stopped")}>Stop script</button>
+        <button className="btn" onClick={() => execution.reload()}>Refresh output</button>
+      </>}
       <label className="label">Register another repository<input className="field" value={repository} onChange={event => setRepository(event.target.value)} /></label>
       <button className="btn" onClick={() => perform(() => api("POST", "/projects", { repo: repository }), "Project registered")}>Register repository</button>
       <label className="label">Environment instructions<textarea className="field" maxLength={8000} value={environmentText} onChange={event => setEnvironmentText(event.target.value)} /></label>

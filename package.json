@@ -11,7 +11,8 @@
     "dev:web": "vite --config web/vite.config.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke:package": "node scripts/package-smoke.mjs"
+    "smoke:package": "node scripts/package-smoke.mjs",
+    "desktop:package": "npm run build && node scripts/stage-desktop.mjs && npm --prefix desktop run package"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
@@ -22,6 +23,7 @@
     "@vitejs/plugin-react": "^5.2.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
+    "jszip": "3.10.1",
     "lucide-react": "^1.66.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
@@ -37,7 +39,9 @@
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.96.0",
+    "mammoth": "1.13.0",
     "node-pty": "^1.1.0",
+    "pdf-parse": "2.4.5",
     "ws": "^8.22.1",
     "yaml": "^2.9.1"
   },

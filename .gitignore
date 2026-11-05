@@ -4,3 +4,6 @@ plans/
 node_modules/
 learning.md
 dist/
+
+desktop/runtime/
+desktop/release/

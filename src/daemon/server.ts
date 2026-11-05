@@ -1,3 +1,4 @@
+import { extractDocument } from "./documents.js";
 import { linkListed } from "../links.js";
 import { saveAttachments } from "./attachments.js";
 import { cleanupQueue } from "./cleanup.js";
@@ -23,7 +24,7 @@ import { cleanRun, copyListed, MODEL_FAMILIES, prepareRun, repoRoot, runSetup, R
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
 import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
-import { MESSAGE_KINDS, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "../timeline.js";
+import { redact, MESSAGE_KINDS, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "../timeline.js";
 
 // Timeline entries a hook sent, kept only when well formed.
 function checkEntries(raw: unknown): TimelineEntry[] {
@@ -270,6 +271,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return githubClient({ repo, token: await githubToken(process.env, remote) });
   });
   const branchChanges = new Set<string>();
+  const scriptRuns = new Map<string, { session: string; script: string; worktree: string; starting: boolean }>();
+  runtime.onExit((sessionId, _launchId, code) => {
+    for (const [runId, script] of scriptRuns) {
+      if (script.session !== sessionId) continue;
+      void write(() => store.addTimeline(runId, NODE_ID, [{ kind: "event", text: `Saved script ${script.script} exited with status ${code ?? "unknown"}` }])).catch(error => opts.onError?.(error));
+    }
+  });
   const vault = vaultResolver();
   let wakeTimer: NodeJS.Timeout | undefined;
   const waitAbort = new AbortController();
@@ -967,6 +975,49 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       throw new HttpError(405, "method not allowed");
     }
+    if (path === "/api/v1/attachments/preview") {
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
+      try { reply(res, 200, { ...await extractDocument(await body(req)), untrusted: true }); }
+      catch (error) { throw new HttpError(400, (error as Error).message); }
+      return;
+    }
+    const scriptRoute = /^\/api\/v1\/runs\/([^/]+)\/scripts(?:\/([^/]+))?$/.exec(path);
+    if (scriptRoute) {
+      const run = await write(() => store.loadRun(scriptRoute[1]!));
+      const project = await write(() => store.projectMetadata(run.project));
+      const scripts = project?.scripts ?? [];
+      const current = scriptRuns.get(run.id);
+      if (req.method === "GET" && !scriptRoute[2]) {
+        const output = current ? runtime.output(current.session, 100) : null;
+        reply(res, 200, { scripts, running: current ? { id: current.script, alive: runtime.isAlive(current.session), exitCode: output?.exitCode ?? null, output: redact(output?.lines.join("\n") ?? "") } : null, untrusted: true });
+        return;
+      }
+      if (req.method === "DELETE" && !scriptRoute[2]) {
+        if (current) await runtime.stop(current.session);
+        reply(res, 204);
+        return;
+      }
+      if (req.method !== "POST" || !scriptRoute[2]) throw new HttpError(405, "method not allowed");
+      const script = scripts.find(candidate => candidate.id === scriptRoute[2]);
+      if (!script) throw new HttpError(404, "saved script not found");
+      if ((await body(req)).confirm !== script.id) throw new HttpError(400, "confirm must match the script ID");
+      if (current && (current.starting || runtime.isAlive(current.session))) throw new HttpError(409, "stop the current script first");
+      if (branchChanges.has(run.id) || scheduler.isCleaning(run.node.worktree)) throw new HttpError(409, "workspace is changing");
+      const session = run.id + "-script";
+      const launcher = "const {spawn}=require('node:child_process');const child=spawn(process.argv[1],{shell:true,stdio:'inherit',windowsHide:true});child.on('error',error=>{console.error(error.message);process.exitCode=1});child.on('exit',code=>{process.exitCode=code??1});";
+      const execution = { session, script: script.id, worktree: run.node.worktree, starting: true };
+      scriptRuns.set(run.id, execution);
+      try {
+        await runtime.start({ sessionId: session, workspace: run.node.worktree, argv: [process.execPath, "-e", launcher, script.command], env: {} });
+        execution.starting = false;
+      } catch (error) {
+        scriptRuns.delete(run.id);
+        throw error;
+      }
+      await write(() => store.addTimeline(run.id, NODE_ID, [{ kind: "event", text: "Started saved script " + script.id }]));
+      reply(res, 202, { id: script.id });
+      return;
+    }
     const prLinks = /^\/api\/v1\/runs\/([^/]+)\/linked-prs(?:\/(\d+))?$/.exec(path);
     if (prLinks) {
       const id = prLinks[1]!;
@@ -1480,6 +1531,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       if (stopping) throw new HttpError(503, "daemon stopping");
+      if ([...scriptRuns.values()].some(script => script.worktree === run.node.worktree && (script.starting || runtime.isAlive(script.session)))) throw new HttpError(409, "stop saved scripts before cleaning this workspace");
       reply(res, 202, cleanup.submit(run.id));
       return;
     }

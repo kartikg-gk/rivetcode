@@ -179,6 +179,17 @@ describe("watching the pull request", () => {
     return runId;
   }
 
+  it("routes additional linked PR failures once and persists their handled revision", async () => {
+    const runId = await opened();
+    gh.prs.push({ ...gh.prs[0]!, number: 2, head: { ...gh.prs[0]!.head, sha: "linked-sha" } });
+    gh.checks["linked-sha"] = [{ id: 99, status: "completed", conclusion: "failure" }];
+    expect((await api("POST", `/api/v1/runs/${runId}/linked-prs`, { number: 2 })).status).toBe(200);
+    await until(() => runOf(runId), result => result.run.node.attempts === 2 && result.run.node.status === "done");
+    const links = (await api("GET", `/api/v1/runs/${runId}/linked-prs`)).json.linked;
+    expect(links[0].handled).toContain("ci_failed");
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect((await runOf(runId)).run.node.attempts).toBe(2);
+  });
   it("sends a CI failure back to the worker, once", async () => {
     const runId = await opened();
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];

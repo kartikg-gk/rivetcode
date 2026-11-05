@@ -1,3 +1,4 @@
+import { mkdir } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -112,7 +113,7 @@ describe("daemon ownership and lifecycle", () => {
     db.close();
     await start();
     expect(rows("SELECT version FROM schema_migrations ORDER BY version")).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 },
     ]);
     expect(rows("SELECT id FROM nodes WHERE run_id = 'r1'")).toHaveLength(1);
   });
@@ -223,4 +224,32 @@ it("pages an entire long item without skipping its tail and validates offsets",a
 
 it("holds interrupted native workers on restart without replaying their pending messages",async()=>{
  const s=openStore(data);const r=run();r.node.sessionMode="chat";r.node.status="running";r.node.attempts=1;r.node.providerConversationId="saved-provider";s.saveRun(r);s.queueMessage("r1","agent","possibly consumed",undefined,"queue");s.close();await start();await daemon!.idle();const reopened=openStore(data);try{expect(reopened.loadRun("r1").node).toMatchObject({status:"escalated",summary:expect.stringContaining("uncertain")});expect(reopened.undeliveredMessages("r1","agent")).toHaveLength(1);}finally{reopened.close();}
+});
+
+it("runs, inspects and stops saved scripts while protecting their checkout", async () => {
+  const fixture = run();
+  await mkdir(fixture.node.worktree, { recursive: true });
+  const store = openStore(data);
+  store.saveRun(fixture);
+  store.saveProject({ id: "proj", repo: fixture.repo, title: "Project", instructions: "", scripts: [
+    { id: "watch", command: `"${process.execPath}" -e "console.log('script-ready'); setInterval(()=>{},1000)"` },
+  ] });
+  store.close();
+  await start();
+  expect((await post("/api/v1/runs/r1/scripts/watch", { confirm: "different" })).status).toBe(400);
+  expect((await post("/api/v1/runs/r1/scripts/watch", { confirm: "watch" })).status).toBe(202);
+  let output = "";
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const response = await fetch(url("/api/v1/runs/r1/scripts"));
+    const result = await response.json() as { running: { output: string } };
+    output = result.running.output;
+    if (output.includes("script-ready")) break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  expect(output).toContain("script-ready");
+  expect((await post("/api/v1/runs/r1/clean", {})).status).toBe(409);
+  expect((await fetch(url("/api/v1/runs/r1/scripts"), { method: "DELETE" })).status).toBe(204);
+  const result = await (await fetch(url("/api/v1/runs/r1/scripts"))).json() as { running: { alive: boolean } };
+  expect(result.running.alive).toBe(false);
 });

@@ -1,1 +1,22 @@
-{"name":"rivet-desktop","version":"0.1.0","private":true,"main":"main.cjs","scripts":{"start":"electron ."},"devDependencies":{"electron":"45.2.2"}}
+{
+  "name": "rivet-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-builder --config electron-builder.cjs --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.2.2",
+    "electron-builder": "26.18.0"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "description": "Desktop workspace for Rivet coding agents",
+  "author": "kartikg-gk",
+  "overrides": {
+    "minimatch@>=7 <11.0.1": "11.0.1"
+  }
+}

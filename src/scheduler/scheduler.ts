@@ -807,9 +807,23 @@ export function createScheduler(d: SchedulerDeps) {
       for (const link of links) {
         if (shuttingDown) return null;
         try {
-          const status = prStatus(await github.facts(link.number));
+          const facts = await github.facts(link.number);
+          const status = prStatus(facts);
           if (shuttingDown) return null;
           if (status !== link.status) await d.write(() => d.store.updateLinkedPr(runId, link.number, status));
+          const current = await load(runId);
+          const key = status + ":" + facts.mergeability + ":" + facts.headSha;
+          if (facts.open && current.node.status === "done" && link.handled !== key) {
+            const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
+            let feedback: string | undefined;
+            if (status === "ci_failed") feedback = ciFeedback(link, full ? await github.failedPaths(link.number) : undefined);
+            else if (status === "changes_requested") feedback = reviewFeedback(link, full ? await github.reviewComments(link.number) : undefined);
+            else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") feedback = "Linked pull request #" + link.number + " needs its branch updated or conflicts resolved: " + link.url;
+            if (feedback) {
+              await reopen(runId, feedback);
+              await d.write(() => d.store.updateLinkedPr(runId, link.number, status, key));
+            }
+          }
         } catch (error) { report(error); }
       }
     }
