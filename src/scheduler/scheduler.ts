@@ -818,7 +818,7 @@ export function createScheduler(d: SchedulerDeps) {
         }
       }
       let allowed = true;
-      if (run.node.status === "done" && status === "ci_failed" && handled !== eventKey && state.ciKey !== eventKey) {
+      if (run.node.status === "done" && status === "ci_failed" && handled !== eventKey) {
         const cap = Number(config["reactions.ciRetries"] ?? 2);
         if ((state.ciRetries ?? 0) >= cap) {
           if (!state.ciEscalated) { alert("Pull request #"+number+" reached its CI fix retry limit ("+cap+"). Manual attention is needed."); state.ciEscalated=true; }

@@ -404,3 +404,16 @@ it("notifies approved and passing pull requests once without merging",async()=>{
   expect(notices.filter(n=>n.body.includes("approved and green"))).toHaveLength(1);
   expect(gh.prs[0]!.merged).toBe(false);
 });
+
+it("keeps the CI cap when passing checks fail again on the same commit",async()=>{
+  await start({pr:"auto","reactions.ciRetries":"1"});
+  const id=await spawn();await until(()=>runOf(id),r=>r.pr!==null);
+  gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
+  await until(()=>runOf(id),r=>r.run.node.attempts===2&&r.run.node.status==="done"&&(r.pr?.handled??"").startsWith("ci_failed"));
+  gh.checks.sha1=[{id:9,status:"completed",conclusion:"success"}];
+  await until(()=>runOf(id),r=>!(r.pr?.handled??"").startsWith("ci_failed"));
+  gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
+  await until(()=>runOf(id),r=>(r.run.node.summary??"").includes("retry limit"));
+  await new Promise(r=>setTimeout(r,500));
+  expect((await runOf(id)).run.node.attempts).toBe(2);
+});
