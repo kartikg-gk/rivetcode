@@ -98,6 +98,7 @@ export type SchedulerDeps = {
   github?(run: Run): Promise<GitHub>;
   // Called with every problem the scheduler could not handle itself (for logs and tests).
   onError?(error: unknown): void;
+  workspaceBusy?(path: string): boolean;
 };
 
 export class SchedulerError extends Error {
@@ -789,6 +790,47 @@ export function createScheduler(d: SchedulerDeps) {
     await launch(run, workerPrompt(run, feedback));
   }
 
+  async function reaction(run: Run, number: number, facts: import("../github/github.js").PrFacts, status: string, handled?: string): Promise<boolean> {
+    return d.write(() => {
+      const key = "pr-reaction:"+number;
+      const state = d.store.lifecycleState(run.id,key);
+      const before = JSON.stringify(state);
+      const eventKey = status+":"+facts.mergeability+":"+facts.headSha;
+      const config = d.store.getConfig(run.project);
+      const now = Date.now();
+      const alert = (message: string) => {
+        d.store.addTimeline(run.id,NODE_ID,[{kind:"event",text:message}]);
+        d.store.organizeRun(run.id,{unread:true});
+        d.store.updateNode(run.id,NODE_ID,{summary:message});
+        state.attention = message;
+      };
+      if (facts.review === "approved" && facts.ci === "passing" && facts.open && !facts.draft && state.approvedSha !== facts.headSha) {
+        alert("Pull request #"+number+" is approved and green; ready for your review.");
+        state.approvedSha = facts.headSha;
+      }
+      if (!facts.open || (facts.review !== "changes_requested" && !facts.reviewComments)) { delete state.reviewAt; delete state.reviewEscalated; }
+      else {
+        state.reviewAt ??= now;
+        const minutes = Number(config["reactions.reviewMinutes"] ?? 30);
+        if (!state.reviewEscalated && now-state.reviewAt >= minutes*60_000) {
+          alert("Pull request #"+number+" still needs requested review changes after "+minutes+" minutes.");
+          state.reviewEscalated = true;
+        }
+      }
+      let allowed = true;
+      if (run.node.status === "done" && status === "ci_failed" && handled !== eventKey && state.ciKey !== eventKey) {
+        const cap = Number(config["reactions.ciRetries"] ?? 2);
+        if ((state.ciRetries ?? 0) >= cap) {
+          if (!state.ciEscalated) { alert("Pull request #"+number+" reached its CI fix retry limit ("+cap+"). Manual attention is needed."); state.ciEscalated=true; }
+          allowed = false;
+        } else { state.ciRetries = (state.ciRetries ?? 0)+1; state.ciKey = eventKey; }
+      }
+      if (status === "changes_requested" && state.reviewEscalated) allowed = false;
+      if (JSON.stringify(state) !== before) d.store.saveLifecycleState(run.id,key,state);
+      return allowed;
+    });
+  }
+
   // One look at the pull request: record where it stands and act once on new feedback.
   const checkingPrs = new Map<string, Promise<string | null>>();
   function checkPr(runId: string): Promise<string | null> {
@@ -812,8 +854,9 @@ export function createScheduler(d: SchedulerDeps) {
           if (shuttingDown) return null;
           if (status !== link.status) await d.write(() => d.store.updateLinkedPr(runId, link.number, status));
           const current = await load(runId);
+          const permitted = await reaction(current,link.number,facts,status,link.handled);
           const key = status + ":" + facts.mergeability + ":" + facts.headSha;
-          if (facts.open && current.node.status === "done" && link.handled !== key) {
+          if (permitted && facts.open && current.node.status === "done" && link.handled !== key) {
             const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
             let feedback: string | undefined;
             if (status === "ci_failed") feedback = ciFeedback(link, full ? await github.failedPaths(link.number) : undefined);
@@ -842,6 +885,7 @@ export function createScheduler(d: SchedulerDeps) {
     const facts = await github.facts(pr.number);
     if (shuttingDown) return null;
     const status = prStatus(facts);
+    const permitted = await reaction(run,pr.number,facts,status,pr.handled);
     await d.write(() => d.store.updateNode(runId, NODE_ID, { prStatus: status }));
     if (status === "merged") {
       await terminateAfterMerge(await load(runId), pr);
@@ -852,7 +896,7 @@ export function createScheduler(d: SchedulerDeps) {
       await autoReview(run, facts.headSha).catch(report);
     }
     // Work is already under way, or this exact state was handled before.
-    if (pr.handled === key || node.status !== "done") return status;
+    if (!permitted || pr.handled === key || node.status !== "done") return status;
     // By default the worker is told where the feedback is and reads it itself; "full" has
     // Rivet fetch it and hand it over.
     const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
@@ -1334,7 +1378,7 @@ export function createScheduler(d: SchedulerDeps) {
     const preserve = await d.write(() => {
       if (committing.has(run.id)) throw new SchedulerError(409, "checkout is committing");
       if (cleaningWorkspaces.has(run.node.worktree)) throw new SchedulerError(409, "checkout is already being cleaned");
-      if (d.store.workspaceForks(run.id).length) return true;
+      if (d.workspaceBusy?.(run.node.worktree) || d.store.workspaceForks(run.id).length) return true;
       cleaningWorkspaces.add(run.node.worktree);
       return false;
     });

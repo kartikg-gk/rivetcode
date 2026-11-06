@@ -36,6 +36,7 @@ afterEach(async () => {
 });
 
 let errors: unknown[] = [];
+let notices: {title:string;body:string}[] = [];
 
 // What the test reviewer does: stays until the test submits for it, unless changed.
 let reviewerScript: object = { stayFor: 60_000 };
@@ -53,7 +54,9 @@ function reviewerAgent(): Agent {
 
 async function start(config: Record<string, string> = {}, rapid = false): Promise<void> {
   errors = [];
+  notices = [];
   daemon = await startDaemon({
+    notify: async notice => {notices.push(notice);},
     data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: rapid ? 1 : 150, onError: (e) => errors.push(e),
     // "claude" stands for a reviewer here (review.agent): it runs reviewerScript.
     agents: (name) => (name === "claude" ? reviewerAgent() : getAgent("fake")),
@@ -365,4 +368,39 @@ describe("the reviewer", () => {
 
 it("coalesces overlapping feedback polls and drains them before closing storage",async()=>{
  await start({pr:"auto","pr.feedback":"full"},true);const runId=await spawn();await until(()=>runOf(runId),r=>r.pr!==null);gh.comments[1]=[{commit_id:"sha1",path:"a.txt",line:1,body:"check the existing behavior"}];await until(()=>runOf(runId),r=>r.run.node.attempts===2);await new Promise(r=>setTimeout(r,300));expect((await runOf(runId)).run.node.attempts).toBe(2);await daemon!.stop();daemon=undefined;expect(errors).toEqual([]);
+});
+describe("bounded pull request reactions",()=>{
+  it("caps CI fixes across new revisions and keeps the cap after restart",async()=>{
+    await start({pr:"auto","reactions.ciRetries":"1"});
+    const id=await spawn();
+    await until(()=>runOf(id),r=>r.pr!==null);
+    gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
+    await until(()=>runOf(id),r=>r.run.node.attempts===2 && r.run.node.status==="done");
+    gh.prs[0]!.head.sha="sha2";
+    gh.checks.sha2=[{id:10,status:"completed",conclusion:"failure"}];
+    await until(()=>runOf(id),r=>(r.run.node.summary??"").includes("retry limit"));
+    await daemon!.stop();daemon=undefined;await start();
+    await new Promise(r=>setTimeout(r,500));
+    expect((await runOf(id)).run.node.attempts).toBe(2);
+  });
+  it("escalates unresolved review changes once after the configured deadline",async()=>{
+    await start({pr:"auto","reactions.reviewMinutes":"0.001"});
+    const id=await spawn();await until(()=>runOf(id),r=>r.pr!==null);
+    gh.comments[1]=[{commit_id:"sha1",path:"a.txt",line:1,body:"change this"}];
+    await until(()=>runOf(id),r=>(r.run.node.summary??"").includes("still needs requested"));
+    const attempts=(await runOf(id)).run.node.attempts;
+    await new Promise(r=>setTimeout(r,500));
+    expect((await runOf(id)).run.node.attempts).toBe(attempts);
+  });
+});
+
+it("notifies approved and passing pull requests once without merging",async()=>{
+  await start({pr:"auto"});const id=await spawn();
+  await until(()=>runOf(id),r=>r.pr!==null);
+  gh.reviews[1]=[{user:{login:"reviewer"},state:"APPROVED"}];
+  gh.checks.sha1=[{id:9,status:"completed",conclusion:"success"}];
+  await until(async()=>notices,n=>n.some(x=>x.body.includes("approved and green")));
+  await new Promise(r=>setTimeout(r,1300));
+  expect(notices.filter(n=>n.body.includes("approved and green"))).toHaveLength(1);
+  expect(gh.prs[0]!.merged).toBe(false);
 });

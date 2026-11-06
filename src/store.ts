@@ -38,7 +38,15 @@ export type ConversationBranch = { id: string; parent: string | null; items: Tim
 export type Organization = { archivedAt: string | null; group: string; pinnedAt: string | null; snoozedUntil: string | null; unread: boolean; busy: string | null };
 export type OrganizationPatch = { name?: string; archived?: boolean; group?: string; pinned?: boolean; snoozedUntil?: string | null; unread?: boolean; busy?: string | null };
 
+export type LifecycleState = {
+  state?: string; reactions?: Record<string,string>;
+  attention?: string; approvedSha?: string; reviewAt?: number; reviewEscalated?: boolean;
+  ciKey?: string; ciRetries?: number; ciEscalated?: boolean;
+};
+
 export type Store = {
+  lifecycleState(runId: string, key: string): LifecycleState;
+  saveLifecycleState(runId: string, key: string, value: LifecycleState): void;
   organizeRun(runId:string,patch:OrganizationPatch):void;
   organization(runId:string):Organization;
   journalEntries(after:number,limit:number):{sequence:number;schemaVersion:number;operation:string;recordedAt:string;hash:string;bytes:number}[];
@@ -414,6 +422,7 @@ MIGRATIONS.push({ version: 29, sql: "", run: (db) => {
   const sql = row.sql.replace(/agent IN \([^)]*\)/, `agent IN (${oneOf(AGENTS)})`).replace(/^CREATE TABLE "?nodes"?/, "CREATE TABLE nodes_v29");
   db.exec(`${sql}; INSERT INTO nodes_v29 SELECT * FROM nodes; DROP TABLE nodes; ALTER TABLE nodes_v29 RENAME TO nodes;`);
 } });
+MIGRATIONS.push({version:36,sql:`CREATE TABLE lifecycle_state (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,key));`});
 MIGRATIONS.push({ version: 35, sql: "ALTER TABLE linked_pull_requests ADD COLUMN handled TEXT NOT NULL DEFAULT '';" });
 MIGRATIONS.push({ version: 34, sql: `
 CREATE TABLE environment_preferences (id INTEGER PRIMARY KEY CHECK(id=1), instructions TEXT NOT NULL);
@@ -1699,6 +1708,13 @@ export function openStore(data: string): Store {
       if (Number(changed) === 0) throw new RunStoreError(`unknown run ${runId}`);
     },
 
+    lifecycleState(runId, key) {
+      const row = db.prepare("SELECT value FROM lifecycle_state WHERE run_id=? AND key=?").get(runId,key) as {value:string}|undefined;
+      return row ? JSON.parse(row.value) : {};
+    },
+    saveLifecycleState(runId,key,value) {
+      db.prepare("INSERT INTO lifecycle_state VALUES (?,?,?) ON CONFLICT(run_id,key) DO UPDATE SET value=excluded.value").run(runId,key,JSON.stringify(value));
+    },
     getConfig(project) {
       return Object.fromEntries((selectConfig.all(project) as { key: string; value: string }[]).map((r) => [r.key, r.value]));
     },

@@ -176,6 +176,8 @@ function useProject() {
 const NoProject = () => <p className="text-muted">Start a session in a repository first; these belong to its project.</p>;
 
 const SETTINGS: { key: string; about: string; options?: string[] }[] = [
+  { key: "reactions.ciRetries", about: "automatic CI fixes per pull request (default 2)" },
+  { key: "reactions.reviewMinutes", about: "minutes before unresolved review changes need attention (default 30)" },
   { key: "check", about: "command that must pass before a pull request" }, { key: "test", about: "tests that must pass before a pull request" },
   { key: "verify.reuse", about: "reuse a worker's own passing check", options: ["", "off"] },
   { key: "session.mode", about: "run agents as terminals or chats", options: ["", "terminal", "chat"] },

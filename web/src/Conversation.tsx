@@ -1,16 +1,15 @@
+import { TerminalPane } from "./TerminalPane";
+import { WorkspacePane } from "./WorkspacePane";
 import { AttachmentPreview } from "./AttachmentPreview";
 import { ThreadManagement } from "./ThreadManagement";
-import { FitAddon } from "@xterm/addon-fit";
-import { Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
 import { ArrowUp, Clock, KeyRound, FileDiff, GitBranch, Info, ListTree, MoreHorizontal, Pencil, SquareTerminal, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import Markdown from "react-markdown";
 import { send, sessionActions, type Action } from "./actions";
-import { api, openTerminal, runPath, type Item, type Page, type RunDetail } from "./api";
+import { api, runPath, type Item, type Page, type RunDetail } from "./api";
 import { act, repoName, runLabel, toast, useApp, useLive } from "./state";
 
-const SIDE_TABS = ["management", "details", "changes", "terminal", "events", "raw", "branches", "provider"] as const;
+const SIDE_TABS = ["files", "management", "details", "changes", "terminal", "events", "raw", "branches", "provider"] as const;
 type Side = (typeof SIDE_TABS)[number];
 
 // The whole history, then only what can have changed: from the first reply still being written.
@@ -242,36 +241,6 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
   );
 }
 
-function TerminalPane({ id, session }: { id: string; session: string }) {
-  const host = useRef<HTMLDivElement>(null);
-  const [note, setNote] = useState<string>();
-  useEffect(() => {
-    setNote(undefined);
-    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-    const term = new Terminal({ fontSize: 13, convertEol: false, theme: dark ? { background: "#0b0b0b" } : { background: "#ffffff", foreground: "#1a1f23", cursor: "#1a1f23" } });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(host.current!);
-    const link = openTerminal(`${id}-${session}`, (m) => {
-      if (m.type === "output") term.write(m.data);
-      else if (m.type === "exit") setNote("This terminal has ended.");
-      else if (m.type === "error") setNote(m.error);
-    });
-    const resize = () => { try { fit.fit(); link.resize(term.cols, term.rows); } catch { /* hidden */ } };
-    const typing = term.onData((d) => link.input(d));
-    const seen = new ResizeObserver(resize);
-    seen.observe(host.current!);
-    resize();
-    return () => { seen.disconnect(); typing.dispose(); link.close(); term.dispose(); };
-  }, [id, session]);
-  return (
-    <div className="h-full flex flex-col min-h-0">
-      {note && <p className="p-2 text-sm text-muted">{note}</p>}
-      <div ref={host} className="flex-1 min-h-0 p-1" aria-label="Terminal" />
-    </div>
-  );
-}
-
 function Fact({ k, v }: { k: string; v: React.ReactNode }) {
   return v === undefined || v === "" || v === null ? null : <div className="grid grid-cols-[110px_1fr] gap-2"><dt className="text-muted">{k}</dt><dd className="break-words min-w-0">{v}</dd></div>;
 }
@@ -433,6 +402,7 @@ export function Conversation({ id }: { id: string }) {
             <button className="ml-auto cursor-pointer text-muted" aria-label="Close panel" onClick={() => setSide(null)}><X size={15} /></button>
           </div>
           <div className="flex-1 overflow-y-auto min-h-0">
+            {side === "files" && <WorkspacePane id={id} />}
             {side === "management" && d && <ThreadManagement detail={d} />}
             {side === "details" && d && <>
               <Details d={d} />

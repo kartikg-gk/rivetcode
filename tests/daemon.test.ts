@@ -109,11 +109,11 @@ describe("daemon ownership and lifecycle", () => {
   it("upgrades a version 1 database on startup", async () => {
     seed();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DROP TABLE environment_preferences; DROP TABLE linked_pull_requests; DROP TABLE registered_projects; DROP TABLE pull_request_guides; DROP TABLE run_organization; DROP TABLE recovery_journal; DROP TABLE conversation_branches; DROP TABLE wait_subscriptions; DROP TABLE chat_receipts; DROP TRIGGER chat_search_insert; DROP TRIGGER chat_search_update; DROP TRIGGER chat_search_delete; DROP TRIGGER timeline_search_insert; DROP TRIGGER timeline_search_delete; DROP TABLE chat_search; DROP TABLE timeline_search; DROP TABLE context_transfers; DROP TABLE thread_forks; ALTER TABLE chat_turns DROP COLUMN agent; DROP TABLE chat_provider_events; DROP TABLE chat_activities; DROP TABLE chat_messages; DROP TABLE chat_turns; DROP TABLE chat_conversations; ALTER TABLE nodes DROP COLUMN provider_conversation_id; ALTER TABLE nodes DROP COLUMN session_mode; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("DROP TABLE lifecycle_state; DROP TABLE environment_preferences; DROP TABLE linked_pull_requests; DROP TABLE registered_projects; DROP TABLE pull_request_guides; DROP TABLE run_organization; DROP TABLE recovery_journal; DROP TABLE conversation_branches; DROP TABLE wait_subscriptions; DROP TABLE chat_receipts; DROP TRIGGER chat_search_insert; DROP TRIGGER chat_search_update; DROP TRIGGER chat_search_delete; DROP TRIGGER timeline_search_insert; DROP TRIGGER timeline_search_delete; DROP TABLE chat_search; DROP TABLE timeline_search; DROP TABLE context_transfers; DROP TABLE thread_forks; ALTER TABLE chat_turns DROP COLUMN agent; DROP TABLE chat_provider_events; DROP TABLE chat_activities; DROP TABLE chat_messages; DROP TABLE chat_turns; DROP TABLE chat_conversations; ALTER TABLE nodes DROP COLUMN provider_conversation_id; ALTER TABLE nodes DROP COLUMN session_mode; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     await start();
     expect(rows("SELECT version FROM schema_migrations ORDER BY version")).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 },
     ]);
     expect(rows("SELECT id FROM nodes WHERE run_id = 'r1'")).toHaveLength(1);
   });
@@ -252,4 +252,56 @@ it("runs, inspects and stops saved scripts while protecting their checkout", asy
   expect((await fetch(url("/api/v1/runs/r1/scripts"), { method: "DELETE" })).status).toBe(204);
   const result = await (await fetch(url("/api/v1/runs/r1/scripts"))).json() as { running: { alive: boolean } };
   expect(result.running.alive).toBe(false);
+});
+it("browses files, detects stale saves and runs an independent workspace shell", async () => {
+  const fixture = run();
+  await mkdir(fixture.node.worktree, { recursive: true });
+  seed();
+  await start();
+  const file = "/api/v1/runs/r1/file?path=example.txt";
+  const save = (text: string, version: string | null) => fetch(url(file), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ text, version }) });
+  expect((await save("first", null)).status).toBe(200);
+  const opened = await (await fetch(url(file))).json() as { text: string; version: string };
+  expect(opened.text).toBe("first");
+  expect((await save("second", opened.version)).status).toBe(200);
+  expect((await save("stale", opened.version)).status).toBe(409);
+  const files = await (await fetch(url("/api/v1/runs/r1/files"))).json() as { entries: { name: string }[] };
+  expect(files.entries.some(entry => entry.name === "example.txt")).toBe(true);
+  expect((await post("/api/v1/runs/r1/shell", {})).status).toBe(201);
+  const command = `"${process.execPath}" -e "console.log('shell-'+'ready')"` + (process.platform === "win32" ? "\r" : "\n");
+  expect((await post("/api/v1/sessions/r1-shell/input", { data: command })).status).toBe(204);
+  let output = "";
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const result = await (await fetch(url("/api/v1/sessions/r1-shell/output"))).json() as { lines: string[] };
+    output = result.lines.join("\n");
+    if (output.includes("shell-ready")) break;
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  expect(output).toContain("shell-ready");
+  expect((await post("/api/v1/runs/r1/clean", {})).status).toBe(409);
+  expect((await fetch(url("/api/v1/runs/r1/shell"), { method: "DELETE" })).status).toBe(204);
+});
+it("notifies completed work once across daemon restarts without exposing task text",async()=>{
+  const store=openStore(data);const r=run();r.node.status="done";r.task="private task text";store.saveRun(r);store.close();
+  const notices:{title:string;body:string}[]=[];
+  const opts={data,runFile,port:0,notify:async(n:{title:string;body:string})=>{notices.push(n);}};
+  daemon=await startDaemon(opts);
+  const deadline=Date.now()+5000;
+  while(!notices.length && Date.now()<deadline) await new Promise(r=>setTimeout(r,25));
+  expect(notices).toEqual([{title:"Rivet",body:"r1: Task finished. Open Rivet to review."}]);
+  await daemon.stop();daemon=await startDaemon(opts);
+  await new Promise(r=>setTimeout(r,1300));
+  expect(notices).toHaveLength(1);
+});
+
+it("notifies permission and question activity without including private request details",async()=>{
+  seed();const notices:{title:string;body:string}[]=[];
+  daemon=await startDaemon({data,runFile,port:0,notify:async n=>{notices.push(n);}});
+  const wait=async(text:string)=>{const end=Date.now()+4000;while(!notices.some(n=>n.body.includes(text))&&Date.now()<end)await new Promise(r=>setTimeout(r,25));expect(notices.some(n=>n.body.includes(text))).toBe(true);};
+  expect((await post("/api/v1/sessions/r1-agent/activity",{state:"blocked",request:{tool:"Bash",detail:"private command"}})).status).toBe(204);
+  await wait("Approval is requested");
+  expect((await post("/api/v1/sessions/r1-agent/activity",{state:"waiting_input"})).status).toBe(204);
+  await wait("An answer is requested");
+  expect(JSON.stringify(notices)).not.toContain("private command");
 });

@@ -1,3 +1,4 @@
+import { listFiles, readTextFile, saveTextFile, WorkspaceError } from "./workspace.js";
 import { extractDocument } from "./documents.js";
 import { linkListed } from "../links.js";
 import { saveAttachments } from "./attachments.js";
@@ -23,7 +24,7 @@ import { radar } from "../scheduler/radar.js";
 import { cleanRun, copyListed, MODEL_FAMILIES, prepareRun, repoRoot, runSetup, RunInputError, SetupError, type NewRun } from "../scheduler/runs.js";
 import { IssueRefError, issueNumber, issueTask } from "../scheduler/issue.js";
 import { checkCue } from "../scheduler/cues.js";
-import { checkSpec, type TaskSpec } from "../scheduler/tasks.js";
+import { checkSpec, outsidePaths, type TaskSpec } from "../scheduler/tasks.js";
 import { redact, MESSAGE_KINDS, TIMELINE_KINDS, type TimelineEntry, type TimelineKind } from "../timeline.js";
 
 // Timeline entries a hook sent, kept only when well formed.
@@ -84,6 +85,8 @@ const BODY_LIMIT = 1024 * 1024;
 const DIFF_LIMIT = 2 * 1024 * 1024;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
 const CONFIG_KEYS = [
+  "reactions.ciRetries",
+  "reactions.reviewMinutes",
   "check",
   "test",
   "verify.reuse",
@@ -115,6 +118,7 @@ type ReportKind = (typeof REPORT_KINDS)[number];
 // stopped resolves once the daemon has fully shut down (by stop(), a signal or /shutdown).
 export type Daemon = { port: number; stop(): Promise<void>; stopped: Promise<void>; idle(): Promise<void> };
 export type DaemonOptions = {
+  notify?(notice: import("./notifications.js").DesktopNotice): Promise<void>;
   data?: string;
   runFile?: string;
   port?: number;
@@ -275,10 +279,52 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   runtime.onExit((sessionId, _launchId, code) => {
     for (const [runId, script] of scriptRuns) {
       if (script.session !== sessionId) continue;
-      void write(() => store.addTimeline(runId, NODE_ID, [{ kind: "event", text: `Saved script ${script.script} exited with status ${code ?? "unknown"}` }])).catch(error => opts.onError?.(error));
+      void write(() => store.addTimeline(runId.split(":")[0]!, NODE_ID, [{ kind: "event", text: `Workspace process ${script.script} exited with status ${code ?? "unknown"}` }])).catch(error => opts.onError?.(error));
     }
   });
+  const subagents = new Map<string, { launch: string; children: Map<string, { id: string; label: string; status: string; canCancel: boolean }> }>();
   const vault = vaultResolver();
+  runtime.onExit((sessionId,launchId) => { const id = sessionId.replace(/-agent$/, ""); if (subagents.get(id)?.launch === launchId) subagents.delete(id); });
+  let notificationScanAt = 0;
+  let notificationWork: Promise<void> | undefined;
+  async function checkNotifications() {
+    if (Date.now() - notificationScanAt < 1000) return;
+    notificationScanAt = Date.now();
+    const notices = await write(() => {
+      const result: import("./notifications.js").DesktopNotice[] = [];
+      for (const id of store.listRuns()) {
+        const run = store.loadRun(id), node = run.node;
+        const request = scheduler.pendingRequest(id);
+        const secret = secrets.pending(sessionIdOf(id,NODE_ID));
+        const state = secret ? "secret:"+secret.id : request ? "approval:"+request.at : node.activity === "blocked" ? "approval:"+node.activityAt : node.activity === "waiting_input" ? "question:"+node.activityAt : ["done","escalated"].includes(node.status) ? node.status+":"+node.attempts : "";
+        const previous = store.lifecycleState(id,"desktop-notice");
+        const seen = {...previous.reactions};
+        const numbers = new Set([store.getPr(id)?.number,...store.linkedPrs(id).map(pr=>pr.number)]);
+        for (const number of numbers) {
+          if (number === undefined) continue;
+          const reaction = store.lifecycleState(id,"pr-reaction:"+number);
+          const identity = reaction.attention ? reaction.attention+":"+(reaction.approvedSha ?? "") : "";
+          if (identity && seen[number] !== identity) {
+            result.push({title:"Rivet",body:id+": "+reaction.attention});
+            seen[number] = identity;
+          }
+        }
+        if (JSON.stringify(seen) !== JSON.stringify(previous.reactions ?? {})) store.saveLifecycleState(id,"desktop-notice",{...previous,reactions:seen});
+        if (previous.state === state) continue;
+        store.saveLifecycleState(id,"desktop-notice",{state,reactions:seen});
+        if (!state) continue;
+        store.organizeRun(id,{unread:true});
+        const reason = secret ? "A secret is requested" : request || node.activity === "blocked" ? "Approval is requested" : node.activity === "waiting_input" ? "An answer is requested" : node.status === "done" ? "Task finished" : "Task needs attention";
+        result.push({title:"Rivet",body:id+": "+reason+". Open Rivet to review."});
+      }
+      return result;
+    });
+    if (opts.notify) { for (const notice of notices) await opts.notify(notice); }
+    else if (notices.length) {
+      const notice = notices.length === 1 ? notices[0]! : {title:"Rivet",body:notices.length+" updates need your attention. Open Rivet to review."};
+      await import("./notifications.js").then(m=>m.desktopNotify(notice));
+    }
+  }
   let wakeTimer: NodeJS.Timeout | undefined;
   const waitAbort = new AbortController();
   // A secret given to a session goes when the session does.
@@ -287,6 +333,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     data, runFile, store, write, runtime, agents, launches, github,
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
+    workspaceBusy: path => [...scriptRuns.values()].some(process => process.worktree === path && (process.starting || runtime.isAlive(process.session))),
   });
 
   const cleanup = cleanupQueue(async (runId) => {
@@ -387,6 +434,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       await cleanup.close();
       await scheduler.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await notificationWork;
       await queue;
       store.close();
       await releaseRunFile(runFile, process.pid);
@@ -668,6 +716,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const accepted = payload.accepted === undefined ? [] : payload.accepted;
       if (!Array.isArray(accepted) || accepted.length > 1000 || accepted.some((id) => !Number.isSafeInteger(id) || id < 1)) throw new HttpError(400, "invalid accepted message IDs");
       const events = checkChatEvents(payload.events);
+      if (nodeId === NODE_ID && launchId && launches.get(sessionIdOf(runId, nodeId)) === launchId) {
+        let observed = subagents.get(runId);
+        if (!observed || observed.launch !== launchId) { observed = { launch: launchId, children: new Map() }; subagents.set(runId, observed); }
+        for (const event of events) {
+          if (event.type !== "activity" || !event.itemId?.startsWith("child-")) continue;
+          const id = event.itemId.slice(6);
+          if (!id || id.length > 256) continue;
+          observed.children.set(id, { id, label: event.summary, status: event.status, canCancel: event.status === "running" && event.summary.includes("stop available") });
+        }
+      }
       const outcome = await write(() => store.recordChat(runId, nodeId, events, batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
       // A finished turn is something new to read.
       if (nodeId === NODE_ID && payload.replay !== true && events.some((e) => e.type === "turn" && e.state !== "running")) await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
@@ -981,6 +1039,59 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       catch (error) { throw new HttpError(400, (error as Error).message); }
       return;
     }
+    const workspaceRoute = /^\/api\/v1\/runs\/([^/]+)\/(files|file|shell)$/.exec(path);
+    if (workspaceRoute) {
+      const run = await write(() => store.loadRun(workspaceRoute[1]!));
+      const action = workspaceRoute[2];
+      const query = new URL(req.url!, "http://local").searchParams;
+      const selected = query.get("path") ?? "";
+      try {
+        if (action === "files" && req.method === "GET") {
+          reply(res, 200, { ...await listFiles(run.node.worktree, selected, query.get("after") ?? ""), untrusted: true });
+          return;
+        }
+        if (action === "file" && req.method === "GET") {
+          reply(res, 200, { ...await readTextFile(run.node.worktree, selected), untrusted: true });
+          return;
+        }
+        if (action === "file" && req.method === "PUT") {
+          const input = await body(req);
+          if (typeof input.text !== "string" || (input.version !== null && typeof input.version !== "string")) throw new HttpError(400, "text and the expected version are required");
+          if (branchChanges.has(run.id) || scheduler.isCleaning(run.node.worktree)) throw new HttpError(409, "workspace is changing");
+          if (run.spec?.paths?.length && outsidePaths([selected.replaceAll("\\", "/")], run.spec.paths).length) throw new HttpError(403, "file is outside this task's allowed paths");
+          reply(res, 200, await saveTextFile(run.node.worktree, selected, input.text, input.version as string | null));
+          return;
+        }
+        if (action === "shell") {
+          const shellSession = run.id + "-shell";
+          if (req.method === "GET") { reply(res, 200, { alive: runtime.isAlive(shellSession) }); return; }
+          if (req.method === "DELETE") { await runtime.stop(shellSession); reply(res, 204); return; }
+          if (req.method === "POST") {
+            if (branchChanges.has(run.id) || scheduler.isCleaning(run.node.worktree)) throw new HttpError(409, "workspace is changing");
+            const key = run.id + ":shell";
+            if (scriptRuns.get(key)?.starting || runtime.isAlive(shellSession)) throw new HttpError(409, "workspace shell is already running");
+            const entry = { session: shellSession, script: "workspace shell", worktree: run.node.worktree, starting: true };
+            scriptRuns.set(key, entry);
+            try {
+              const argv = process.platform === "win32" ? [process.env.ComSpec ?? "cmd.exe", "/d", "/q"] : [process.env.SHELL ?? "/bin/sh", "-i"];
+              await runtime.start({ sessionId: shellSession, workspace: run.node.worktree, argv, env: { RIVET_SESSION_ID: shellSession }, terminal: { cols: 100, rows: 28 } });
+              entry.starting = false;
+            } catch (error) { scriptRuns.delete(key); throw error; }
+            await write(() => store.addTimeline(run.id, NODE_ID, [{ kind: "event", text: "Opened workspace shell" }]));
+            reply(res, 201, { session: shellSession });
+            return;
+          }
+        }
+      } catch (error) {
+        if (error instanceof WorkspaceError) throw new HttpError(error.status, error.message);
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") throw new HttpError(404,"workspace path no longer exists");
+        if (code === "EACCES" || code === "EPERM") throw new HttpError(403,"workspace path is not accessible");
+        if (code === "ENOTDIR" || code === "EISDIR") throw new HttpError(400,"choose the correct file or directory type");
+        throw error;
+      }
+      throw new HttpError(405, "method not allowed");
+    }
     const scriptRoute = /^\/api\/v1\/runs\/([^/]+)\/scripts(?:\/([^/]+))?$/.exec(path);
     if (scriptRoute) {
       const run = await write(() => store.loadRun(scriptRoute[1]!));
@@ -1069,12 +1180,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     }
     const childStop = /^\/api\/v1\/runs\/([^/]+)\/stop-subagent$/.exec(path);
     if (childStop) {
-      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const run = await write(() => store.loadRun(childStop[1]!));
+      const observed = subagents.get(run.id);
+      const current = observed?.launch === launches.get(sessionIdOf(run.id, NODE_ID)) && runtime.isAlive(sessionIdOf(run.id, NODE_ID));
+      if (req.method === "GET") {
+        reply(res, 200, { children: current ? [...observed!.children.values()] : [], untrusted: true });
+        return;
+      }
+      if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const target = sessionIdOf(run.id, NODE_ID);
       if (run.node.agent !== "claude" || !scheduler.isChat(target) || !runtime.isAlive(target)) throw new HttpError(409, "a live Claude chat is required");
       const id = (await body(req)).id;
       if (typeof id !== "string" || !id.trim() || id.length > 256) throw new HttpError(400, "a sub-agent session ID is required");
+      if (!current || !observed?.children.get(id)?.canCancel) throw new HttpError(409, "this child has no active stop capability");
       await runtime.write(target, JSON.stringify({ type: "stop-child", id }));
       reply(res, 202, { requested: true });
       return;
@@ -1579,6 +1697,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         throw new HttpError(400, `key must be one of ${CONFIG_KEYS.join(", ")}`);
       }
       if (payload.value !== null && typeof payload.value !== "string") throw new HttpError(400, "value must be a string or null");
+      if (payload.value !== null && payload.key === "reactions.ciRetries" && !/^(0|[1-9][0-9]?)$/.test(String(payload.value))) throw new HttpError(400,"ciRetries must be an integer from 0 to 99");
+      if (payload.value !== null && payload.key === "reactions.reviewMinutes" && (!Number.isFinite(Number(payload.value)) || Number(payload.value) <= 0 || Number(payload.value) > 10080)) throw new HttpError(400,"reviewMinutes must be positive and at most 10080");
       try {
         await write(() => store.setConfig(project, payload.key as string, payload.value as string | null));
       } catch (error) { throw new HttpError(400, (error as Error).message); }
@@ -1604,6 +1724,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (checkingWakes || stopping) return;
       checkingWakes = true;
       void (async () => {
+        notificationWork ??= checkNotifications().catch(error=>opts.onError?.(error)).finally(()=>{notificationWork=undefined;});
         const callers = await write(() => {
           const ready = new Set<string>();
           for (const subscription of store.waitSubscriptions()) {

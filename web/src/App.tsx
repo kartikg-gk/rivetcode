@@ -103,6 +103,12 @@ export function App() {
   useEffect(() => { if (list.data) set({ runs: list.data.runs }); }, [list.data]);
   useEffect(() => onConnection(setOnline), []);
   useEffect(() => {
+    const count = list.data?.runs.filter(r=>!r.organization.archivedAt && (r.needsAnswer || r.activity === "blocked" || r.activity === "waiting_input" || r.organization.unread)).length ?? 0;
+    document.title = count ? "("+count+") Rivet · needs attention" : "Rivet";
+    const badge = navigator as Navigator & {setAppBadge?(count:number):Promise<void>;clearAppBadge?():Promise<void>};
+    void (count ? badge.setAppBadge?.(count) : badge.clearAppBadge?.())?.catch(()=>{});
+  }, [list.data]);
+  useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); set({ palette: !useApp.getState().palette }); }
     };

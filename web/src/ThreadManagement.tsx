@@ -11,6 +11,7 @@ export function ThreadManagement({ detail }: { detail: RunDetail }) {
   const metadata = useLive(() => api<{ project: Project }>("GET", projectPath), [project]);
   const environment = useLive(() => api<{ instructions: string }>("GET", "/environment-preferences"), []);
   const execution = useLive(() => api<{ scripts: Project["scripts"]; running: { id: string; alive: boolean; output: string; exitCode: number | null } | null }>("GET", runPath(id, "/scripts")), [id]);
+  const children = useLive(() => api<{ children: { id: string; label: string; status: string; canCancel: boolean }[] }>("GET", runPath(id, "/stop-subagent")), [id]);
   const links = useLive(() => api<Links>("GET", runPath(id, "/linked-prs")), [id]);
   useEffect(() => {
     if (!execution.data?.running?.alive) return;
@@ -84,8 +85,12 @@ export function ThreadManagement({ detail }: { detail: RunDetail }) {
       <label className="label">Environment instructions<textarea className="field" maxLength={8000} value={environmentText} onChange={event => setEnvironmentText(event.target.value)} /></label>
       <button className="btn" disabled={!environment.data} onClick={() => perform(() => api("PUT", "/environment-preferences", { instructions: environmentText }), "Environment saved")}>Save environment</button>
       {detail.run.node.agent === "claude" && <>
-        <label className="label">Sub-agent session ID from activity history<input className="field" value={child} onChange={event => setChild(event.target.value)} /></label>
-        <button className="btn" disabled={!detail.live || !child.trim()} onClick={() => perform(() => api("POST", runPath(id, "/stop-subagent"), { id: child }), "Stop requested")}>Stop sub-agent</button>
+        <label className="label">Sub-agent<select className="field" value={child} onChange={event => setChild(event.target.value)}>
+          <option value="">Choose a sub-agent</option>
+          {children.data?.children.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+        </select></label>
+        {children.error && <p role="alert">{children.error}</p>}
+        <button className="btn" disabled={!detail.live || !children.data?.children.find(item => item.id === child)?.canCancel} onClick={() => perform(() => api("POST", runPath(id, "/stop-subagent"), { id: child }), "Stop requested")}>Stop sub-agent</button>
       </>}
       <h3>Pull requests</h3>
       {links.data?.primary && <p>Primary PR #{links.data.primary.number}</p>}

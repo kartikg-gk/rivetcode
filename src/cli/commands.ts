@@ -80,6 +80,8 @@ const USAGE = `usage: rivet <command>
   app [--no-open]                       open the graphical app in your browser
   panes                                 show every running agent side by side
   daemon start|stop|status              run or control the background daemon
+  init [--agent claude|codex|delta] [--model <id>] [--check <command>] [--test <command>]
+                                        initialize this project and run doctor
   doctor                                check what Rivet needs on this machine
   login claude|codex                    log an agent's CLI in to its account (its own login)
   hooks <agent> <event>                 receive an agent hook (called by the agent)
@@ -601,6 +603,29 @@ async function projectOf(io: CliIo): Promise<string> {
   } catch {
     throw new Error("run this inside the project's git repository");
   }
+}
+
+async function initProject(args: string[], io: CliIo): Promise<number> {
+  const { flags, rest } = parseFlags(args,["agent","model","check","test"]);
+  if (rest.length || [...flags.keys()].some(k=>!["agent","model","check","test"].includes(k))) throw new UsageError("init accepts --agent, --model, --check and --test");
+  const project = await projectOf(io);
+  const agent = flags.get("agent");
+  if (agent && !["claude","codex","delta"].includes(String(agent))) throw new UsageError("agent must be claude, codex or delta");
+  await ensureDaemon(io);
+  const path = `/api/v1/projects/${encodeURIComponent(project)}/config`;
+  const existing = await callDaemon(io.env,"GET",path,undefined,COMMAND_TIMEOUT_MS) as Record<string,string>;
+  const root = (await git(["rev-parse","--show-toplevel"],io.cwd)).trim();
+  let scripts: Record<string,string> = {};
+  try { scripts = JSON.parse(await readFile(join(root,"package.json"),"utf8")).scripts ?? {}; } catch {}
+  const defaults: Record<string,string> = {"worker.agent":"claude","worker.model":"","check":scripts.typecheck ? "npm run typecheck" : scripts.lint ? "npm run lint" : "","test":scripts.test ? "npm test" : ""};
+  const names: Record<string,string> = {agent:"worker.agent",model:"worker.model",check:"check",test:"test"};
+  for (const [flag,key] of Object.entries(names)) {
+    if (!flags.has(flag) && existing[key] !== undefined) continue;
+    const value = String(flags.get(flag) ?? defaults[key]);
+    await callDaemon(io.env,"PUT",path,{key,value},COMMAND_TIMEOUT_MS);
+    io.out(key+" = "+(value || "(not configured)"));
+  }
+  return doctorCommand(io);
 }
 
 async function project(args: string[], io: CliIo): Promise<number> {
@@ -1164,6 +1189,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "run": return await runFile(args, io);
       case "automation": return await automation(args, io);
       case "daemon": return await daemon(args, io);
+      case "init": return await initProject(args,io);
       case "doctor": return await doctorCommand(io);
       case "login": return await login(args, io);
       case "spawn": return await startSession(args, io, "worker");
