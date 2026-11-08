@@ -46,7 +46,7 @@ it("keeps full-text indexes consistent when a snapshot compacts rowid gaps",asyn
  store.recordChat("r2","agent",[{type:"message",itemId:"remaining",role:"assistant",text:"remaining searchable marker"}]);
  store.updateNode("r1","agent",{status:"done",finishedAt:"2000-01-01T00:00:00.000Z"});store.pruneTimeline("proj","2001-01-01T00:00:00.000Z");
  const snapshot=store.snapshot(join(target,"snapshot.db"));const db=new DatabaseSync(snapshot.path);
- try{expect(db.prepare("SELECT m.text FROM chat_search JOIN chat_messages m ON m.rowid=chat_search.rowid WHERE chat_search MATCH 'searchable'").all()).toHaveLength(1);}finally{db.close();}
+ try{expect(db.prepare("SELECT m.body FROM chat_search JOIN chat_log m ON m.rowid=chat_search.rowid WHERE chat_search MATCH 'searchable'").all()).toHaveLength(1);}finally{db.close();}
 });
 
 it("refuses an unclassified store operation rather than silently bypassing the journal",async()=>{

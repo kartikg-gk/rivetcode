@@ -481,17 +481,17 @@ ALTER TABLE context_transfers ADD COLUMN attached INTEGER NOT NULL DEFAULT 0 CHE
 ` });
 
 MIGRATIONS.push({ version: 20, sql: `
-CREATE VIRTUAL TABLE chat_search USING fts5(text, content='chat_messages', content_rowid='rowid', tokenize='trigram');
-INSERT INTO chat_search(rowid, text) SELECT rowid, text FROM chat_messages WHERE streaming = 0;
-CREATE TRIGGER chat_search_insert AFTER INSERT ON chat_messages WHEN new.streaming = 0 BEGIN
-  INSERT INTO chat_search(rowid, text) VALUES (new.rowid, new.text);
+CREATE VIRTUAL TABLE chat_search USING fts5(body, content='chat_log', content_rowid='rowid', tokenize='trigram');
+INSERT INTO chat_search(rowid, body) SELECT rowid, body FROM chat_log WHERE step IS NULL AND progress = 'final';
+CREATE TRIGGER chat_search_insert AFTER INSERT ON chat_log WHEN new.step IS NULL AND new.progress = 'final' BEGIN
+  INSERT INTO chat_search(rowid, body) VALUES (new.rowid, new.body);
 END;
-CREATE TRIGGER chat_search_update AFTER UPDATE OF text, streaming ON chat_messages BEGIN
-  INSERT INTO chat_search(chat_search, rowid, text) SELECT 'delete', old.rowid, old.text WHERE old.streaming = 0;
-  INSERT INTO chat_search(rowid, text) SELECT new.rowid, new.text WHERE new.streaming = 0;
+CREATE TRIGGER chat_search_update AFTER UPDATE OF body, progress ON chat_log WHEN new.step IS NULL BEGIN
+  INSERT INTO chat_search(chat_search, rowid, body) SELECT 'delete', old.rowid, old.body WHERE old.progress = 'final';
+  INSERT INTO chat_search(rowid, body) SELECT new.rowid, new.body WHERE new.progress = 'final';
 END;
-CREATE TRIGGER chat_search_delete AFTER DELETE ON chat_messages WHEN old.streaming = 0 BEGIN
-  INSERT INTO chat_search(chat_search, rowid, text) VALUES ('delete', old.rowid, old.text);
+CREATE TRIGGER chat_search_delete AFTER DELETE ON chat_log WHEN old.step IS NULL AND old.progress = 'final' BEGIN
+  INSERT INTO chat_search(chat_search, rowid, body) VALUES ('delete', old.rowid, old.body);
 END;
 CREATE VIRTUAL TABLE timeline_search USING fts5(text, content='timeline', content_rowid='id', tokenize='trigram');
 INSERT INTO timeline_search(rowid, text) SELECT id, text FROM timeline WHERE session = 'agent' AND kind IN ('prompt', 'message', 'assistant');
@@ -559,42 +559,31 @@ CREATE TABLE chat_turns (
 );
 CREATE INDEX chat_turns_conversation ON chat_turns (conversation_id, requested_at);
 CREATE UNIQUE INDEX chat_turns_provider ON chat_turns (conversation_id, provider_turn_id) WHERE provider_turn_id <> '';
-CREATE TABLE chat_messages (
+-- A conversation's log, in the order things happened. A row is either something said
+-- (said_by set) or something done: a command, an edit, a question (step set).
+CREATE TABLE chat_log (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
   turn_id TEXT REFERENCES chat_turns(id) ON DELETE SET NULL,
-  sequence INTEGER NOT NULL,
-  revision INTEGER NOT NULL DEFAULT 0,
-  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-  origin TEXT NOT NULL CHECK (origin IN ('human', 'automation', 'daemon', 'provider')),
-  text TEXT NOT NULL DEFAULT '',
-  -- A reply still being written: its text grows and revision goes up each time.
-  streaming INTEGER NOT NULL DEFAULT 0,
-  provider_item_id TEXT NOT NULL DEFAULT '',
+  said_by TEXT CHECK (said_by IN ('user', 'assistant')),
+  step TEXT,
+  -- Something said is 'writing' until its last words arrive, then 'final'; a step keeps
+  -- its own state (running, completed, failed, pending, resolved).
+  progress TEXT NOT NULL DEFAULT 'final',
+  body TEXT NOT NULL DEFAULT '',
+  details TEXT NOT NULL DEFAULT '',
+  -- The agent's own id for the item, and for a question it asked.
+  item_key TEXT NOT NULL DEFAULT '',
+  question_key TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE (conversation_id, sequence)
+  UNIQUE (conversation_id, position),
+  CHECK ((said_by IS NULL) <> (step IS NULL))
 );
-CREATE UNIQUE INDEX chat_messages_provider_item ON chat_messages (conversation_id, provider_item_id) WHERE provider_item_id <> '';
-CREATE TABLE chat_activities (
-  id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
-  turn_id TEXT REFERENCES chat_turns(id) ON DELETE SET NULL,
-  sequence INTEGER NOT NULL,
-  revision INTEGER NOT NULL DEFAULT 0,
-  kind TEXT NOT NULL CHECK (kind IN ('command', 'file_change', 'plan', 'reasoning', 'approval', 'usage', 'error', 'system')),
-  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'pending', 'resolved')),
-  summary TEXT NOT NULL DEFAULT '',
-  detail_json TEXT NOT NULL DEFAULT '',
-  request_id TEXT NOT NULL DEFAULT '',
-  provider_item_id TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  UNIQUE (conversation_id, sequence)
-);
-CREATE UNIQUE INDEX chat_activities_provider_item ON chat_activities (conversation_id, provider_item_id) WHERE provider_item_id <> '';
-CREATE UNIQUE INDEX chat_activities_request ON chat_activities (conversation_id, request_id) WHERE request_id <> '';
-CREATE INDEX chat_activities_pending ON chat_activities (conversation_id, kind, status);
+CREATE UNIQUE INDEX chat_log_said ON chat_log (conversation_id, item_key) WHERE step IS NULL AND item_key <> '';
+CREATE UNIQUE INDEX chat_log_done ON chat_log (conversation_id, item_key) WHERE step IS NOT NULL AND item_key <> '';
+CREATE UNIQUE INDEX chat_log_question ON chat_log (conversation_id, question_key) WHERE question_key <> '';
 -- Every line the agent wrote, as it came: the evidence when Rivet's reading of it is wrong.
 -- Never shown as the conversation and never given back to an agent.
 CREATE TABLE chat_provider_events (
@@ -1288,9 +1277,9 @@ export function openStore(data: string): Store {
         WHERE instr(lower(r.name || ' ' || r.task || ' ' || n.branch || ' ' || r.project || ' ' || coalesce('#' || p.number || ' ' || p.url, '')), @query)>0
           AND (@project IS NULL OR r.project=@project)
         UNION ALL
-        SELECT r.id, r.project, r.name, m.role, m.text, m.sequence, m.created_at, NULL, 'live', 1
-        FROM chat_messages m JOIN chat_conversations c ON c.id=m.conversation_id JOIN runs r ON r.id=c.run_id
-        WHERE c.session='agent' AND m.streaming=0 AND instr(lower(m.text),@query)>0
+        SELECT r.id, r.project, r.name, m.said_by, m.body, m.position, m.created_at, NULL, 'live', 1
+        FROM chat_log m JOIN chat_conversations c ON c.id=m.conversation_id JOIN runs r ON r.id=c.run_id
+        WHERE c.session='agent' AND m.step IS NULL AND m.progress='final' AND instr(lower(m.body),@query)>0
           ${messageFilter} AND (@project IS NULL OR r.project=@project)
         UNION ALL
         SELECT r.id, r.project, r.name, CASE WHEN t.kind='assistant' THEN 'assistant' ELSE 'user' END,
@@ -1363,8 +1352,8 @@ export function openStore(data: string): Store {
           : null;
         // State the partial-index predicate explicitly: SQLite cannot infer that a
         // bound provider item id is nonempty, otherwise large imports scan each prefix.
-        const namedMessage = db.prepare("SELECT id FROM chat_messages WHERE conversation_id=? AND provider_item_id=? AND provider_item_id<>''");
-        const emptyMessage = db.prepare("SELECT id FROM chat_messages WHERE conversation_id=? AND provider_item_id=''");
+        const namedMessage = db.prepare("SELECT id FROM chat_log WHERE conversation_id=? AND step IS NULL AND item_key=? AND item_key<>''");
+        const emptyMessage = db.prepare("SELECT id FROM chat_log WHERE conversation_id=? AND step IS NULL AND item_key=''");
         const messageRow = (itemId: string) => (itemId ? namedMessage.get(c, itemId) : emptyMessage.get(c)) as { id: string } | undefined;
         for (const e of events) {
           if (e.type === "conversation") {
@@ -1397,20 +1386,20 @@ export function openStore(data: string): Store {
           } else if (e.type === "message") {
             let text = redact(e.text);
             if (e.role === "user" && !e.itemId.startsWith("rivet-") && !messageRow(e.itemId)) {
-              const hostPrompts = db.prepare("SELECT id,text FROM chat_messages WHERE conversation_id=? AND role='user' AND provider_item_id LIKE 'rivet-%' ORDER BY sequence").all(c) as {id:string;text:string}[];
+              const hostPrompts = db.prepare("SELECT id,body AS text FROM chat_log WHERE conversation_id=? AND said_by='user' AND item_key LIKE 'rivet-%' ORDER BY position").all(c) as {id:string;text:string}[];
               const host = hostPrompts.find(p=>text === p.text || text.endsWith("\n\n"+p.text));
               if (host) {
-                db.prepare("UPDATE chat_messages SET provider_item_id=?,turn_id=? WHERE id=?").run(e.itemId,turnRow(e.turnId),host.id);
+                db.prepare("UPDATE chat_log SET item_key=?,turn_id=? WHERE id=?").run(e.itemId,turnRow(e.turnId),host.id);
                 text = host.text;
               }
             }
             const found = messageRow(e.itemId);
-            const streaming = e.streaming ? 1 : 0;
-            if (found) db.prepare("UPDATE chat_messages SET text = ?, streaming = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(text, streaming, now, found.id);
-            else db.prepare(`INSERT INTO chat_messages (id, conversation_id, turn_id, sequence, role, origin, text, streaming, provider_item_id, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, e.role === "user" ? "daemon" : "provider", text, streaming, e.itemId, now, now);
+            const progress = e.streaming ? "writing" : "final";
+            if (found) db.prepare("UPDATE chat_log SET body = ?, progress = ?, updated_at = ? WHERE id = ?").run(text, progress, now, found.id);
+            else db.prepare(`INSERT INTO chat_log (id, conversation_id, turn_id, position, said_by, body, progress, item_key, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, text, progress, e.itemId, now, now);
           } else if(e.type==="history") {
-            const existing=db.prepare("SELECT id,role,text,streaming,provider_item_id AS providerId FROM chat_messages WHERE conversation_id=? ORDER BY sequence").all(c) as {id:string;role:string;text:string;streaming:number;providerId:string}[];
+            const existing=db.prepare("SELECT id,said_by AS role,body AS text,progress='writing' AS streaming,item_key AS providerId FROM chat_log WHERE conversation_id=? AND step IS NULL ORDER BY position").all(c) as {id:string;role:string;text:string;streaming:number;providerId:string}[];
             const used=new Set<string>();
             for(const [index,item] of e.items.entries()){
               const whole=redact(item.text);
@@ -1419,10 +1408,10 @@ export function openStore(data: string): Store {
               const matched=exact??existing.find(row=>!used.has(row.id)&&row.role===item.role&&(row.text===whole || item.role==="user"&&whole.endsWith("\n\n"+row.text) || item.role==="assistant"&&row.streaming===1&&row.text.length>0&&whole.startsWith(row.text)));
               if(matched){
                 used.add(matched.id);
-                if(matched.streaming)db.prepare("UPDATE chat_messages SET text=?,streaming=0,revision=revision+1,updated_at=? WHERE id=?").run(whole,now,matched.id);
+                if(matched.streaming)db.prepare("UPDATE chat_log SET body=?,progress='final',updated_at=? WHERE id=?").run(whole,now,matched.id);
               }else{
                 const id=randomBytes(8).toString("hex");
-                db.prepare("INSERT INTO chat_messages(id,conversation_id,sequence,role,origin,text,streaming,provider_item_id,created_at,updated_at) VALUES (?,?,?,?,'provider',?,0,?,?,?)").run(id,c,nextSeq(),item.role,whole,providerId,now,now);
+                db.prepare("INSERT INTO chat_log(id,conversation_id,position,said_by,body,progress,item_key,created_at,updated_at) VALUES (?,?,?,?,?,'final',?,?,?)").run(id,c,nextSeq(),item.role,whole,providerId,now,now);
                 existing.push({id,role:item.role,text:whole,streaming:0,providerId});used.add(id);
               }
             }
@@ -1436,14 +1425,14 @@ export function openStore(data: string): Store {
               e.contextUsed !== undefined ? `context_used = ${Math.round(e.contextUsed)}` : "", e.contextWindow !== undefined ? `context_window = ${Math.round(e.contextWindow)}` : ""].filter(Boolean);
             if (sets.length) db.prepare(`UPDATE chat_conversations SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`).run(now, c);
           } else {
-            const key = e.requestId ? "request_id" : "provider_item_id";
+            const key = e.requestId ? "question_key" : "item_key";
             const keyValue = e.requestId ?? e.itemId ?? "";
             const detail = e.output !== undefined || e.tool !== undefined ? JSON.stringify({ ...(e.tool ? { tool: e.tool } : {}), ...(e.output !== undefined ? { output: redact(e.output) } : {}) }) : "";
-            const found = keyValue ? db.prepare(`SELECT id, summary FROM chat_activities WHERE conversation_id = ? AND ${key} = ?`).get(c, keyValue) as { id: string; summary: string } | undefined : undefined;
+            const found = keyValue ? db.prepare(`SELECT id, body AS summary FROM chat_log WHERE conversation_id = ? AND step IS NOT NULL AND ${key} = ?`).get(c, keyValue) as { id: string; summary: string } | undefined : undefined;
             const summary = redact(e.summary);
-            if (found) db.prepare("UPDATE chat_activities SET status = ?, summary = ?, detail_json = CASE WHEN ? = '' THEN detail_json ELSE ? END, revision = revision + 1, updated_at = ? WHERE id = ?")
+            if (found) db.prepare("UPDATE chat_log SET progress = ?, body = ?, details = CASE WHEN ? = '' THEN details ELSE ? END, updated_at = ? WHERE id = ?")
               .run(e.status, e.kind === "approval" && e.status === "resolved" ? `${found.summary} (${summary})` : summary || found.summary, detail, detail, now, found.id);
-            else db.prepare(`INSERT INTO chat_activities (id, conversation_id, turn_id, sequence, kind, status, summary, detail_json, request_id, provider_item_id, created_at, updated_at)
+            else db.prepare(`INSERT INTO chat_log (id, conversation_id, turn_id, position, step, progress, body, details, question_key, item_key, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.kind, e.status, summary, detail,
                 e.requestId ?? "", e.requestId ? "" : e.itemId ?? "", now, now);
             if (e.kind === "approval" && e.status === "pending") {
@@ -1522,11 +1511,11 @@ export function openStore(data: string): Store {
       }
       type Row = { sequence: number; source: string; role: string | null; kind: string | null; status: string | null; text: string; detail: string; at: string; streaming: number; agent: string | null; turn_id: string | null; provider: string | null; item_id: string | null };
       const rows = db.prepare(`
-        SELECT sequence, 'message' AS source, role, NULL AS kind, NULL AS status, text, '' AS detail, created_at AS at, streaming,
-          (SELECT agent FROM chat_turns t WHERE t.id = turn_id) AS agent, (SELECT provider_turn_id FROM chat_turns t WHERE t.id = turn_id) AS turn_id, (SELECT provider_conversation_id FROM chat_turns t WHERE t.id = turn_id) AS provider, provider_item_id AS item_id FROM chat_messages WHERE conversation_id = ?
-        UNION ALL
-        SELECT sequence, 'activity', NULL, kind, status, summary, detail_json, created_at, 0, NULL, NULL, NULL, NULL FROM chat_activities WHERE conversation_id = ?
-        ORDER BY sequence`).all(conv.id, conv.id) as Row[];
+        SELECT l.position AS sequence, CASE WHEN l.step IS NULL THEN 'message' ELSE 'activity' END AS source, l.said_by AS role, l.step AS kind,
+          l.progress AS status, l.body AS text, l.details AS detail, l.created_at AS at, l.step IS NULL AND l.progress = 'writing' AS streaming,
+          CASE WHEN l.step IS NULL THEN t.agent END AS agent, CASE WHEN l.step IS NULL THEN t.provider_turn_id END AS turn_id,
+          CASE WHEN l.step IS NULL THEN t.provider_conversation_id END AS provider, CASE WHEN l.step IS NULL THEN l.item_key END AS item_id
+        FROM chat_log l LEFT JOIN chat_turns t ON t.id = l.turn_id WHERE l.conversation_id = ? ORDER BY l.position`).all(conv.id) as Row[];
       let firstUser = !inherited.some((i) => i.kind === "prompt" || i.kind === "message");
       const all: TimelineItem[] = [...inherited];
       for (const r of rows) {
