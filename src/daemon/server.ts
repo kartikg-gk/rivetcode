@@ -564,16 +564,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         throw new HttpError(400, "invalid activity state");
       }
       const state = (payload.state as ActivityState | undefined) ?? null;
-      const agentSessionId = optionalString(payload.agentSessionId, "agentSessionId");
-      if (state === null && agentSessionId === undefined) {
+      const agentOwnId = optionalString(payload.agentOwnId, "agentOwnId");
+      if (state === null && agentOwnId === undefined) {
         if (entries.length) {
           reply(res, 204);
           return;
         }
-        throw new HttpError(400, "state or agentSessionId is required");
+        throw new HttpError(400, "state or agentOwnId is required");
       }
       const before = state === "approval" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
-      const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
+      const found = await write(() => store.recordSignal(runId, nodeId, state, agentOwnId));
       if (!found) throw new HttpError(404, "unknown session");
       // What a permission question asks, when the hook says; forgotten once the agent moves on.
       if (state === "approval") {
@@ -1201,7 +1201,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if(compactRoute){
       if(req.method!=="POST")throw new HttpError(405,"method not allowed");
       const run=await write(()=>store.loadRun(compactRoute[1]!));
-      if(!["claude","codex"].includes(run.node.agent)||run.node.sessionMode!=="chat")throw new HttpError(409,"native compaction requires a supported chat provider");
+      if(!["claude","codex"].includes(run.node.agent)||run.node.runMode!=="chat")throw new HttpError(409,"native compaction requires a supported chat provider");
       const pending=await write(()=>store.pendingContextSize(run.id)>0||store.undeliveredMessages(run.id,NODE_ID).length>0||store.listRuns().some(id=>{const child=store.loadRun(id);return child.orchestrator===sessionIdOf(run.id,NODE_ID)&&["pending","running"].includes(child.node.status);}));
       if(run.node.activity!=="idle"||pending||runtime.isAlive(sessionIdOf(run.id,"partner"))||runtime.isAlive(sessionIdOf(run.id,"review")))throw new HttpError(409,"compaction requires idle with no pending context, messages or child work");
       await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"compact"}));reply(res,202,{requested:true,runId:run.id});return;
@@ -1210,7 +1210,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     if (reconcileRoute) {
       if (req.method !== "POST") throw new HttpError(405,"method not allowed");
       const run = await write(()=>store.loadRun(reconcileRoute[1]!));
-      if (run.node.sessionMode !== "chat" || !["claude","codex"].includes(run.node.agent)) throw new HttpError(409,"provider history refresh requires a supported chat provider");
+      if (run.node.runMode !== "chat" || !["claude","codex"].includes(run.node.agent)) throw new HttpError(409,"provider history refresh requires a supported chat provider");
       if (run.node.activity !== "idle") throw new HttpError(409,"wait for idle before reconciliation");
       await runtime.write(sessionIdOf(run.id,NODE_ID),JSON.stringify({type:"reconcile"}));
       reply(res,202,{requested:true,runId:run.id});return;
@@ -1228,7 +1228,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       try {
       const source = await write(()=>store.loadRun(id));
       if ((await write(()=>store.getFork(id)))?.detached) throw new HttpError(409,"fork is detached");
-      if (source.node.sessionMode !== "chat") throw new HttpError(409,"conversation editing requires chat mode");
+      if (source.node.runMode !== "chat") throw new HttpError(409,"conversation editing requires chat mode");
       if (["busy","approval"].includes(source.node.activity ?? "")) throw new HttpError(409,"wait for the active turn or answer its permission request first");
       if ((await write(()=>store.undeliveredMessages(id,NODE_ID))).length) throw new HttpError(409,"settle pending messages before changing conversation branches");
       const history = await write(()=>store.readChat(id,{limit:5001}).items);
@@ -1260,7 +1260,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const branch = await write(()=>store.changeBranch(id,prefix,history,restore));
       if (replacement) await write(()=>store.queueMessage(id,NODE_ID,replacement,undefined,"queue"));
       const fresh = await write(()=>store.loadRun(id));
-      await scheduler.launch(fresh,undefined,fresh.node.providerConversationId ? {resume:true} : {});
+      await scheduler.launch(fresh,undefined,fresh.node.agentChatId ? {resume:true} : {});
       reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "pending",filesystem:"current checkout; historical files are not restored"}); return;
       } finally {branchChanges.delete(id);}
     }
@@ -1348,7 +1348,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const maxChars = num("maxChars", 20_000, 50_000);
       const session = q.get("session") ?? undefined;
       // A chat session's conversation is its timeline.
-      const chat = run.node.sessionMode === "chat" && (!session || session === NODE_ID);
+      const chat = run.node.runMode === "chat" && (!session || session === NODE_ID);
       const page = await write(() => (chat ? store.readChat : store.readTimeline)(run.id, {
         after: item !== undefined ? item - 1 : Number(q.get("after") ?? 0) || 0, limit: item !== undefined ? 1 : limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
       }));
@@ -1409,7 +1409,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           return {
             id: r.id, project: r.project, task: r.task, createdAt: r.createdAt, status: r.node.status, role: r.role, name: r.name,
             agent: r.node.agent, live: runtime.isAlive(sessionIdOf(r.id, r.node.id)), ...(r.orchestrator ? { orchestrator: r.orchestrator } : {}),
-            repo: r.repo, activity: r.node.activity ?? null, sessionMode: r.node.sessionMode ?? "terminal", organization: store.organization(r.id), needsAnswer: !!scheduler.pendingRequest(r.id) || !!secrets.pending(sessionIdOf(r.id, NODE_ID)),
+            repo: r.repo, activity: r.node.activity ?? null, runMode: r.node.runMode ?? "terminal", organization: store.organization(r.id), needsAnswer: !!scheduler.pendingRequest(r.id) || !!secrets.pending(sessionIdOf(r.id, NODE_ID)),
           };
         }));
         reply(res, 200, { runs });
@@ -1564,7 +1564,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
-        const chatUsage = run.node.sessionMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
+        const chatUsage = run.node.runMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
         reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, independent: f.independent ?? false, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
         return;
       }

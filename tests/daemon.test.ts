@@ -109,7 +109,7 @@ describe("daemon ownership and lifecycle", () => {
   it("upgrades a version 1 database on startup", async () => {
     seed();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DROP TABLE lifecycle_state; DROP TABLE environment_preferences; DROP TABLE linked_pull_requests; DROP TABLE registered_projects; DROP TABLE pull_request_guides; DROP TABLE run_organization; DROP TABLE recovery_journal; DROP TABLE conversation_branches; DROP TABLE wait_subscriptions; DROP TABLE chat_receipts; DROP TRIGGER chat_search_insert; DROP TRIGGER chat_search_update; DROP TRIGGER chat_search_delete; DROP TRIGGER timeline_search_insert; DROP TRIGGER timeline_search_delete; DROP TABLE chat_search; DROP TABLE timeline_search; DROP TABLE context_transfers; DROP TABLE thread_forks; ALTER TABLE chat_turns DROP COLUMN agent; DROP TABLE chat_provider_events; DROP TABLE chat_log; DROP TABLE chat_turns; DROP TABLE chat_conversations; ALTER TABLE nodes DROP COLUMN provider_conversation_id; ALTER TABLE nodes DROP COLUMN session_mode; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_session_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("DROP TABLE lifecycle_state; DROP TABLE environment_preferences; DROP TABLE linked_pull_requests; DROP TABLE registered_projects; DROP TABLE pull_request_guides; DROP TABLE run_organization; DROP TABLE recovery_journal; DROP TABLE conversation_branches; DROP TABLE wait_subscriptions; DROP TABLE chat_receipts; DROP TRIGGER chat_search_insert; DROP TRIGGER chat_search_update; DROP TRIGGER chat_search_delete; DROP TRIGGER timeline_search_insert; DROP TRIGGER timeline_search_delete; DROP TABLE chat_search; DROP TABLE timeline_search; DROP TABLE context_transfers; DROP TABLE thread_forks; ALTER TABLE chat_turns DROP COLUMN agent; DROP TABLE chat_provider_events; DROP TABLE chat_log; DROP TABLE chat_turns; DROP TABLE chat_conversations; ALTER TABLE nodes DROP COLUMN agent_chat_id; ALTER TABLE nodes DROP COLUMN run_mode; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_own_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     await start();
     expect(rows("SELECT version FROM schema_migrations ORDER BY version")).toEqual([
@@ -153,14 +153,14 @@ describe("daemon routes", () => {
 
   it("saves activity and an agent session id", async () => {
     const response = await post("/api/v1/sessions/r1-agent/activity", {
-      state: "approval", agentSessionId: "agent-42",
+      state: "approval", agentOwnId: "agent-42",
     });
     expect(response.status).toBe(204);
     await daemon!.stop();
     daemon = undefined;
     const store = openStore(data);
     try {
-      expect(store.loadRun("r1").node).toMatchObject({ activity: "approval", agentSessionId: "agent-42" });
+      expect(store.loadRun("r1").node).toMatchObject({ activity: "approval", agentOwnId: "agent-42" });
     } finally { store.close(); }
   });
 
@@ -217,13 +217,13 @@ describe("daemon routes", () => {
 
 
 it("pages an entire long item without skipping its tail and validates offsets",async()=>{
- const s=openStore(data);const r=run();r.node.sessionMode="chat";s.saveRun(r);const text="prefix "+"long history ".repeat(6000)+" UNIQUE_TAIL";s.recordChat("r1","agent",[{type:"message",itemId:"long",role:"assistant",text}]);const position=s.readChat("r1",{limit:1}).items[0]!.position;s.close();await start();
+ const s=openStore(data);const r=run();r.node.runMode="chat";s.saveRun(r);const text="prefix "+"long history ".repeat(6000)+" UNIQUE_TAIL";s.recordChat("r1","agent",[{type:"message",itemId:"long",role:"assistant",text}]);const position=s.readChat("r1",{limit:1}).items[0]!.position;s.close();await start();
  let offset=0,recovered="";for(;;){const response=await fetch(url(`/api/v1/runs/r1/timeline?item=${position}&textOffset=${offset}&maxChars=4000`));expect(response.status).toBe(200);const page=await response.json();const item=page.items[0];recovered+=item.text;if(item.nextTextOffset===null)break;expect(item.nextTextOffset).toBeGreaterThan(offset);offset=item.nextTextOffset;}expect(recovered).toBe(text);
  expect((await fetch(url("/api/v1/runs/r1/timeline?textOffset=3"))).status).toBe(400);expect((await fetch(url("/api/v1/runs/r1/timeline?item=999"))).status).toBe(404);
 });
 
 it("holds interrupted native workers on restart without replaying their pending messages",async()=>{
- const s=openStore(data);const r=run();r.node.sessionMode="chat";r.node.status="running";r.node.attempts=1;r.node.providerConversationId="saved-provider";s.saveRun(r);s.queueMessage("r1","agent","possibly consumed",undefined,"queue");s.close();await start();await daemon!.idle();const reopened=openStore(data);try{expect(reopened.loadRun("r1").node).toMatchObject({status:"escalated",summary:expect.stringContaining("uncertain")});expect(reopened.undeliveredMessages("r1","agent")).toHaveLength(1);}finally{reopened.close();}
+ const s=openStore(data);const r=run();r.node.runMode="chat";r.node.status="running";r.node.attempts=1;r.node.agentChatId="saved-provider";s.saveRun(r);s.queueMessage("r1","agent","possibly consumed",undefined,"queue");s.close();await start();await daemon!.idle();const reopened=openStore(data);try{expect(reopened.loadRun("r1").node).toMatchObject({status:"escalated",summary:expect.stringContaining("uncertain")});expect(reopened.undeliveredMessages("r1","agent")).toHaveLength(1);}finally{reopened.close();}
 });
 
 it("runs, inspects and stops saved scripts while protecting their checkout", async () => {

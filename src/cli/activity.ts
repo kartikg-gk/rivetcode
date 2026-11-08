@@ -45,7 +45,7 @@ export function deriveActivity(agent: string, event: string, payload: Payload): 
 }
 
 // The agent's own conversation id, so the session can be resumed later.
-export function agentSessionIdOf(payload: Payload): string | undefined {
+export function agentOwnIdOf(payload: Payload): string | undefined {
   const id = payload.session_id ?? payload.sessionId;
   return typeof id === "string" && id.trim() ? id.trim() : undefined;
 }

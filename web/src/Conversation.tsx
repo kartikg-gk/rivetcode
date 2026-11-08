@@ -254,7 +254,7 @@ function Details({ d }: { d: RunDetail }) {
       <Fact k="Summary" v={n.summary} />
       <Fact k="Role" v={d.run.role} />
       <Fact k="Agent" v={`${n.agent}${d.run.model ? ` (${d.run.model})` : ""}`} />
-      <Fact k="Mode" v={n.sessionMode ?? "terminal"} />
+      <Fact k="Mode" v={n.runMode ?? "terminal"} />
       <Fact k="Attempts" v={n.attempts} />
       <Fact k="Branch" v={<code className="mono">{n.branch}</code>} />
       <Fact k="Base" v={d.run.base} />
@@ -336,7 +336,7 @@ export function Conversation({ id }: { id: string }) {
   const { data: d, error } = useLive(() => api<RunDetail>("GET", runPath(id)), [id]);
   // A terminal session records its steps but few words, so its steps show unless turned off.
   const [picked, setActivity] = useState<boolean | null>(null);
-  const activity = picked ?? (!!d && d.run.node.sessionMode !== "chat");
+  const activity = picked ?? (!!d && d.run.node.runMode !== "chat");
   const [session, setSession] = useState("agent");
   const [side, setSide] = useState<Side | null>(null);
   const [menu, setMenu] = useState(false);
@@ -352,11 +352,11 @@ export function Conversation({ id }: { id: string }) {
   const unread = useApp((s) => s.runs.find((r) => r.id === id)?.organization.unread);
   useEffect(() => { if (unread) void api("PATCH", runPath(id, "/organization"), { unread: false }).catch(() => {}); }, [id, unread]);
   const org = useApp((s) => s.runs.find((r) => r.id === id)?.organization);
-  const actions = useMemo(() => sessionActions(id, d), [id, d?.run.node.sessionMode, d?.run.role, d?.terminateOnPrMerge, d?.run.node.agent, d?.run.name, org?.pinnedAt, org?.snoozedUntil]);
+  const actions = useMemo(() => sessionActions(id, d), [id, d?.run.node.runMode, d?.run.role, d?.terminateOnPrMerge, d?.run.node.agent, d?.run.name, org?.pinnedAt, org?.snoozedUntil]);
   if (error) return (
     <div className="flex-1 grid place-items-center p-6 text-center"><div className="grid gap-2 justify-items-center"><p>{error}</p><button className="btn" onClick={() => set({ selected: null })}>Back</button></div></div>
   );
-  const chat = d?.run.node.sessionMode === "chat";
+  const chat = d?.run.node.runMode === "chat";
   return (
     <div className="flex-1 flex min-w-0 min-h-0">
       <section className="flex-1 flex flex-col min-w-0 min-h-0">

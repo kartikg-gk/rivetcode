@@ -1,7 +1,7 @@
 import { newRunId, type Run, type Store, type TimelineItem } from "../store.js";
 
 export function stableHistory(store: Store, run: Run, at?: number): TimelineItem[] {
-  const page = (run.node.sessionMode === "chat" ? store.readChat : store.readTimeline)(run.id, { limit: 5001, session: "agent" });
+  const page = (run.node.runMode === "chat" ? store.readChat : store.readTimeline)(run.id, { limit: 5001, session: "agent" });
   if (page.total > 5000 && (at === undefined || !page.items.some((i) => i.position === at))) throw new Error("conversation exceeds the 5000-entry transfer limit; page source history with read --after, then choose an earlier completed reply with fork --at <position>; no context was transferred");
   const candidates = page.items.filter((i) => i.kind === "assistant" && !i.streaming && (at === undefined || i.position === at));
   const anchor = candidates.reverse().find((i) => {
@@ -28,10 +28,10 @@ export function forkConversation(store: Store, sourceId: string, o: { at?: numbe
     ...(source.model ? { model: source.model } : {}), ...(source.spec ? { spec: structuredClone(source.spec) } : {}), sharedWorkspace: rootRun,
     node: { id: "agent", title: o.name ?? `${source.node.title} fork`, prompt: source.task,
       agent: source.node.agent, branch: source.node.branch, worktree: source.node.worktree,
-      status: "pending", attempts: 0, sessionMode: "chat" },
+      status: "pending", attempts: 0, runMode: "chat" },
   };
   store.saveRun(run, { sourceRun: source.id, rootRun, position: anchor.position,
-    providerId: anchor.providerConversationId ?? "", ...(anchor.turnId ? { providerTurn: anchor.turnId } : {}),
+    providerId: anchor.agentChatId ?? "", ...(anchor.turnId ? { providerTurn: anchor.turnId } : {}),
     agent: anchor.agent || source.node.agent, strategy: "pending", items });
   return { runId: id, sourceRun: source.id, position: anchor.position, workspace: "shared", started: false };
 }

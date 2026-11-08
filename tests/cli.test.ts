@@ -87,8 +87,8 @@ describe("rivet hooks", () => {
     const code = await runCli(["hooks", "claude-code", "permission-request"],
       io({ RIVET_SESSION_ID: "r1-agent" }, JSON.stringify({ session_id: "conv-9" })));
     expect(code).toBe(0);
-    expect(query("SELECT activity, agent_session_id FROM nodes WHERE run_id = 'r1' AND id = 'agent'")).toEqual([
-      { activity: "approval", agent_session_id: "conv-9" },
+    expect(query("SELECT activity, agent_own_id FROM nodes WHERE run_id = 'r1' AND id = 'agent'")).toEqual([
+      { activity: "approval", agent_own_id: "conv-9" },
     ]);
   });
 

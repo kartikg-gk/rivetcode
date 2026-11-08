@@ -74,10 +74,10 @@ export type Store = {
   loadRun(runId: string): Run;
   listRuns(project?: string): string[];
   // state null keeps the current activity (a hook that only reports the agent's own session id).
-  setActivity(runId: string, nodeId: string, state: ActivityState | null, agentSessionId?: string): boolean;
+  setActivity(runId: string, nodeId: string, state: ActivityState | null, agentOwnId?: string): boolean;
   // A hook from the agent itself: activity, the first-signal time for this launch, and the
   // agent's conversation id (kept for every launch, so usage counts retries too).
-  recordSignal(runId: string, nodeId: string, state: ActivityState | null, agentSessionId?: string): boolean;
+  recordSignal(runId: string, nodeId: string, state: ActivityState | null, agentOwnId?: string): boolean;
   // A launch: idle until the agent's hooks say otherwise; it must prove its signal again.
   markLaunched(runId: string, nodeId: string, active?: boolean): void;
   // Every agent conversation a run's nodes have had.
@@ -220,7 +220,7 @@ export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
 
 export type ForkRecord = { sourceRun: string; rootRun: string; position: number; providerId: string; providerTurn?: string; agent: string; strategy: "pending" | "native" | "reconstructed"; detached?: boolean; ownsWorkspace?: boolean; independent?: boolean; items: TimelineItem[] };
-export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; itemId?: string; turnId?: string; providerConversationId?: string };
+export type TimelineItem = { position: number; session: string; kind: TimelineKind; tool?: string; text: string; at: string; streaming?: boolean; agent?: string; itemId?: string; turnId?: string; agentChatId?: string };
 // A chat session's token use and context, as its agent last reported.
 export type ChatUsage = { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
 export type ChatOutcome = { activity?: ActivityState; question?: { tool: string; detail: string; requestId: string } | null; conversationId?: string };
@@ -237,14 +237,14 @@ export type NodeUpdate = {
   prStatus?: Node["prStatus"] | null;
   // The agent running the session (changed by a switch), and its own conversation id.
   agent?: Node["agent"];
-  agentSessionId?: string | null;
-  sessionMode?: Node["sessionMode"];
-  providerConversationId?: string | null;
+  agentOwnId?: string | null;
+  runMode?: Node["runMode"];
+  agentChatId?: string | null;
 };
 
 const UPDATE_COLUMNS: Record<keyof NodeUpdate, string> = {
   status: "status", attempts: "attempts", summary: "summary", finishedAt: "finished_at", prompt: "prompt", prStatus: "pr_status",
-  agent: "agent", agentSessionId: "agent_session_id", sessionMode: "session_mode", providerConversationId: "provider_conversation_id",
+  agent: "agent", agentOwnId: "agent_own_id", runMode: "run_mode", agentChatId: "agent_chat_id",
 };
 
 export class RunStoreError extends Error {
@@ -302,7 +302,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 `;
 MIGRATIONS.push({ version: 1, sql: INIT });
 MIGRATIONS.push({ version: 2, sql: `
-ALTER TABLE nodes ADD COLUMN agent_session_id TEXT;
+ALTER TABLE nodes ADD COLUMN agent_own_id TEXT;
 CREATE TABLE reports (
   id INTEGER PRIMARY KEY,
   run_id TEXT NOT NULL,
@@ -346,15 +346,15 @@ CREATE TABLE nodes_v3 (
   summary TEXT,
   activity TEXT CHECK (activity IS NULL OR activity IN (${oneOf(ACTIVITY_STATES)})),
   pr_status TEXT CHECK (pr_status IS NULL OR pr_status IN (${oneOf(PR_STATUSES)})),
-  agent_session_id TEXT,
+  agent_own_id TEXT,
   activity_at TEXT,
   finished_at TEXT,
   PRIMARY KEY (run_id, id)
 );
 INSERT INTO nodes_v3 (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch,
-  worktree, status, attempts, summary, activity, pr_status, agent_session_id)
+  worktree, status, attempts, summary, activity, pr_status, agent_own_id)
 SELECT run_id, id, position, parent_id, depth, kind, title, prompt, files, agent, branch,
-  worktree, status, attempts, summary, activity, pr_status, agent_session_id FROM nodes;
+  worktree, status, attempts, summary, activity, pr_status, agent_own_id FROM nodes;
 DROP TABLE nodes;
 ALTER TABLE nodes_v3 RENAME TO nodes;
 CREATE TABLE project_config (
@@ -473,7 +473,7 @@ CREATE TABLE chat_receipts (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE C
 ` });
 
 MIGRATIONS.push({ version: 22, sql: `
-ALTER TABLE chat_turns ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE chat_turns ADD COLUMN agent_chat_id TEXT NOT NULL DEFAULT '';
 ` });
 
 MIGRATIONS.push({ version: 21, sql: `
@@ -526,8 +526,8 @@ ALTER TABLE chat_turns ADD COLUMN agent TEXT NOT NULL DEFAULT '';
 ` });
 
 MIGRATIONS.push({ version: 17, sql: `
-ALTER TABLE nodes ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'terminal' CHECK (session_mode IN ('terminal', 'chat'));
-ALTER TABLE nodes ADD COLUMN provider_conversation_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE nodes ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'terminal' CHECK (run_mode IN ('terminal', 'chat'));
+ALTER TABLE nodes ADD COLUMN agent_chat_id TEXT NOT NULL DEFAULT '';
 CREATE TABLE chat_conversations (
   id TEXT PRIMARY KEY,
   scope TEXT NOT NULL CHECK (scope IN ('session', 'project')),
@@ -720,9 +720,9 @@ type RunRow = {
 type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
-  summary: string | null; activity: string | null; agent_session_id: string | null; pr_status: string | null;
+  summary: string | null; activity: string | null; agent_own_id: string | null; pr_status: string | null;
   activity_at: string | null; finished_at: string | null; started_at: string | null; first_signal_at: string | null;
-  shared: string; session_mode: string; provider_conversation_id: string;
+  shared: string; run_mode: string; agent_chat_id: string;
 };
 
 // One database for all projects. The daemon is meant to be its only writer.
@@ -743,14 +743,14 @@ export function openStore(data: string): Store {
   const deleteNodes = db.prepare("DELETE FROM nodes WHERE run_id = ?");
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
-      branch, worktree, status, attempts, summary, activity, pr_status, agent_session_id, activity_at, finished_at,
-      started_at, first_signal_at, shared, session_mode, provider_conversation_id)
+      branch, worktree, status, attempts, summary, activity, pr_status, agent_own_id, activity_at, finished_at,
+      started_at, first_signal_at, shared, run_mode, agent_chat_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
   const updateActivity = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
     activity_at = CASE WHEN ? IS NULL THEN activity_at ELSE ? END,
-    agent_session_id = COALESCE(?, agent_session_id)
+    agent_own_id = COALESCE(?, agent_own_id)
     WHERE run_id = ? AND id = ?`);
   const selectConfig = db.prepare("SELECT key, value FROM project_config WHERE project = ? ORDER BY key");
   const upsertConfig = db.prepare(`INSERT INTO project_config (project, key, value) VALUES (?, ?, ?)
@@ -767,7 +767,7 @@ export function openStore(data: string): Store {
   const updateDelivered = db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
   const updateSignal = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
     activity_at = CASE WHEN ? IS NULL THEN activity_at ELSE ? END,
-    agent_session_id = COALESCE(?, agent_session_id),
+    agent_own_id = COALESCE(?, agent_own_id),
     first_signal_at = COALESCE(first_signal_at, ?)
     WHERE run_id = ? AND id = ?`);
   const insertConversation = db.prepare(`INSERT INTO conversations (run_id, node_id, agent, conversation_id, seen_at)
@@ -857,9 +857,9 @@ export function openStore(data: string): Store {
         insertNode.run(
           run.id, n.id, 0, null, 0, "leaf", n.title, n.prompt,
           "[]", n.agent, n.branch, n.worktree, n.status, n.attempts,
-          n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentSessionId ?? null,
+          n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentOwnId ?? null,
           n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
-          "[]", n.sessionMode ?? "terminal", n.providerConversationId ?? "",
+          "[]", n.runMode ?? "terminal", n.agentChatId ?? "",
         );
         if (fork) {
           db.prepare("INSERT INTO thread_forks (run_id, source_run, root_run, data_json) VALUES (?, ?, ?, ?)").run(run.id, fork.sourceRun, fork.rootRun, JSON.stringify(fork));
@@ -890,14 +890,14 @@ export function openStore(data: string): Store {
         attempts: n.attempts,
         ...(n.summary !== null ? { summary: n.summary } : {}),
         ...(n.activity !== null ? { activity: n.activity as Node["activity"] } : {}),
-        ...(n.agent_session_id !== null ? { agentSessionId: n.agent_session_id } : {}),
+        ...(n.agent_own_id !== null ? { agentOwnId: n.agent_own_id } : {}),
         ...(n.pr_status !== null ? { prStatus: n.pr_status as Node["prStatus"] } : {}),
         ...(n.activity_at !== null ? { activityAt: n.activity_at } : {}),
         ...(n.finished_at !== null ? { finishedAt: n.finished_at } : {}),
         ...(n.started_at !== null ? { startedAt: n.started_at } : {}),
         ...(n.first_signal_at !== null ? { firstSignalAt: n.first_signal_at } : {}),
-        ...(n.session_mode === "chat" ? { sessionMode: "chat" as const } : {}),
-        ...(n.provider_conversation_id ? { providerConversationId: n.provider_conversation_id } : {}),
+        ...(n.run_mode === "chat" ? { runMode: "chat" as const } : {}),
+        ...(n.agent_chat_id ? { agentChatId: n.agent_chat_id } : {}),
       }));
       if (!nodes[0]) throw new RunStoreError(`run ${runId} has no session`);
       return {
@@ -919,20 +919,20 @@ export function openStore(data: string): Store {
       return rows.map((r) => r.id);
     },
 
-    setActivity(runId, nodeId, state, agentSessionId) {
+    setActivity(runId, nodeId, state, agentOwnId) {
       const before = activityBefore(runId, nodeId);
       const now = state === null ? null : new Date().toISOString();
-      const found = updateActivity.run(state, now, now, agentSessionId ?? null, runId, nodeId).changes > 0;
+      const found = updateActivity.run(state, now, now, agentOwnId ?? null, runId, nodeId).changes > 0;
       if (found && state !== null && state !== before) logEvent(runId, nodeId, "activity", { from: before ?? null, to: state });
       return found;
     },
 
-    recordSignal(runId, nodeId, state, agentSessionId) {
+    recordSignal(runId, nodeId, state, agentOwnId) {
       const before = activityBefore(runId, nodeId);
       const now = new Date().toISOString();
       const at = state === null ? null : now;
-      const found = updateSignal.run(state, at, at, agentSessionId ?? null, now, runId, nodeId).changes > 0;
-      if (found && agentSessionId) insertConversation.run(agentSessionId, now, runId, nodeId);
+      const found = updateSignal.run(state, at, at, agentOwnId ?? null, now, runId, nodeId).changes > 0;
+      if (found && agentOwnId) insertConversation.run(agentOwnId, now, runId, nodeId);
       if (found && state !== null && state !== before) logEvent(runId, nodeId, "activity", { from: before ?? null, to: state });
       return found;
     },
@@ -1104,7 +1104,7 @@ export function openStore(data: string): Store {
     activeBranch(runId) {return branches(runId).find(b=>b.active);},
     branches,
     changeBranch(runId, prefix, history, restore) {
-      const node = db.prepare("SELECT provider_conversation_id AS provider, agent FROM nodes WHERE run_id=? AND id='agent'").get(runId) as {provider:string;agent:string};
+      const node = db.prepare("SELECT agent_chat_id AS provider, agent FROM nodes WHERE run_id=? AND id='agent'").get(runId) as {provider:string;agent:string};
       const target = restore ? branches(runId).find(b=>b.id===restore) : undefined;
       if (restore && !target) throw new RunStoreError("unknown conversation branch");
       if (target?.active) return target.id;
@@ -1124,7 +1124,7 @@ export function openStore(data: string): Store {
           db.prepare("UPDATE conversation_branches SET active=1 WHERE id=?").run(id);
           db.prepare("UPDATE chat_conversations SET session='agent' WHERE run_id=? AND session=?").run(runId,'branch-'+id);
         } else db.prepare("INSERT INTO conversation_branches(id,run_id,parent,items,snapshot,provider,agent,active) VALUES (?,?,?,?,?,?,?,1)").run(id,runId,current.id,JSON.stringify(prefix),JSON.stringify(prefix),'',node.agent);
-        db.prepare("UPDATE nodes SET provider_conversation_id=?,status='running',finished_at=NULL,activity='idle' WHERE run_id=? AND id='agent'").run(target?.provider ?? '',runId);
+        db.prepare("UPDATE nodes SET agent_chat_id=?,status='running',finished_at=NULL,activity='idle' WHERE run_id=? AND id='agent'").run(target?.provider ?? '',runId);
         if(!target)db.prepare("UPDATE conversation_branches SET strategy='pending' WHERE id=?").run(id);
         logEvent(runId,NODE_ID,"conversation.branch",{id,parent:current.id,strategy:target ? "restore" : "reconstructed"});
         db.exec("RELEASE store_write");return id;
@@ -1168,7 +1168,7 @@ export function openStore(data: string): Store {
           node: {
             id: NODE_ID, title: name || task.slice(0, 100), prompt: task,
             agent: source.node.agent, branch: source.node.branch, worktree: source.node.worktree,
-            status: "pending", attempts: 0, sessionMode: "chat",
+            status: "pending", attempts: 0, runMode: "chat",
           },
         };
         this.saveRun(run, {
@@ -1186,7 +1186,7 @@ export function openStore(data: string): Store {
       }
       db.exec("SAVEPOINT workspace_handoff");
       try {
-        db.prepare("UPDATE nodes SET worktree = ?, branch = ?, status = 'pending', provider_conversation_id = '', agent_session_id = NULL WHERE run_id = ?")
+        db.prepare("UPDATE nodes SET worktree = ?, branch = ?, status = 'pending', agent_chat_id = '', agent_own_id = NULL WHERE run_id = ?")
           .run(path, branchName(runId, NODE_ID), runId);
         db.prepare("UPDATE thread_forks SET data_json = ? WHERE run_id = ?")
           .run(JSON.stringify({ ...fork, ownsWorkspace: true, items: this.readChat(runId, { limit: 5000 }).items, providerId: "", providerTurn: undefined, strategy: "pending" }), runId);
@@ -1285,7 +1285,7 @@ export function openStore(data: string): Store {
         SELECT r.id, r.project, r.name, CASE WHEN t.kind='assistant' THEN 'assistant' ELSE 'user' END,
           t.text, t.id, t.at, NULL, 'live', 1
         FROM timeline t JOIN runs r ON r.id=t.run_id JOIN nodes n ON n.run_id=r.id
-        WHERE n.session_mode<>'chat' AND t.session='agent' AND t.kind IN ('prompt','message','assistant')
+        WHERE n.run_mode<>'chat' AND t.session='agent' AND t.kind IN ('prompt','message','assistant')
           AND instr(lower(t.text),@query)>0 ${timelineFilter} AND (@project IS NULL OR r.project=@project)
         UNION ALL
         SELECT r.id, r.project, r.name,
@@ -1366,7 +1366,7 @@ export function openStore(data: string): Store {
               logEvent(runId, NODE_ID, "conversation.initialized", { strategy: fork.strategy });
             }
             if (session === NODE_ID) {
-              db.prepare("UPDATE nodes SET provider_conversation_id = ? WHERE run_id = ? AND id = ?").run(e.id, runId, NODE_ID);
+              db.prepare("UPDATE nodes SET agent_chat_id = ? WHERE run_id = ? AND id = ?").run(e.id, runId, NODE_ID);
               logEvent(runId, NODE_ID, "chat.conversation", { id: e.id });
               // Its agent keeps the conversation on disk too, so usage is counted from it as for a
               // terminal session: complete even when a turn is cut short.
@@ -1376,7 +1376,7 @@ export function openStore(data: string): Store {
             const id = turnRow(e.turnId);
             if (e.state === "running") {
               const agent = (db.prepare("SELECT agent FROM nodes WHERE run_id = ? AND id = ?").get(runId, NODE_ID) as { agent: string } | undefined)?.agent ?? "";
-              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent, provider_conversation_id) VALUES (?, ?, ?, 'running', ?, ?, ?, (SELECT provider_conversation_id FROM nodes WHERE run_id = ? AND id = 'agent'))")
+              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent, agent_chat_id) VALUES (?, ?, ?, 'running', ?, ?, ?, (SELECT agent_chat_id FROM nodes WHERE run_id = ? AND id = 'agent'))")
                 .run(randomBytes(8).toString("hex"), c, e.turnId, now, now, agent, runId);
               out.activity = "busy";
             } else {
@@ -1514,7 +1514,7 @@ export function openStore(data: string): Store {
         SELECT l.position AS sequence, CASE WHEN l.step IS NULL THEN 'message' ELSE 'activity' END AS source, l.said_by AS role, l.step AS kind,
           l.progress AS status, l.body AS text, l.details AS detail, l.created_at AS at, l.step IS NULL AND l.progress = 'writing' AS streaming,
           CASE WHEN l.step IS NULL THEN t.agent END AS agent, CASE WHEN l.step IS NULL THEN t.provider_turn_id END AS turn_id,
-          CASE WHEN l.step IS NULL THEN t.provider_conversation_id END AS provider, CASE WHEN l.step IS NULL THEN l.item_key END AS item_id
+          CASE WHEN l.step IS NULL THEN t.agent_chat_id END AS provider, CASE WHEN l.step IS NULL THEN l.item_key END AS item_id
         FROM chat_log l LEFT JOIN chat_turns t ON t.id = l.turn_id WHERE l.conversation_id = ? ORDER BY l.position`).all(conv.id) as Row[];
       let firstUser = !inherited.some((i) => i.kind === "prompt" || i.kind === "message");
       const all: TimelineItem[] = [...inherited];
@@ -1523,7 +1523,7 @@ export function openStore(data: string): Store {
         if (r.source === "message") {
           const kind: TimelineKind = r.role === "assistant" ? "assistant" : firstUser ? "prompt" : "message";
           if (r.role === "user") firstUser = false;
-          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}), ...(r.provider ? { providerConversationId: r.provider } : {}), ...(r.item_id ? { itemId: r.item_id } : {}) });
+          all.push({ ...base, kind, text: r.text, ...(r.streaming ? { streaming: true } : {}), ...(r.agent ? { agent: r.agent } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}), ...(r.provider ? { agentChatId: r.provider } : {}), ...(r.item_id ? { itemId: r.item_id } : {}) });
           continue;
         }
         const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};

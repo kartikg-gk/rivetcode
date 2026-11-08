@@ -1,14 +1,14 @@
 // The daemon's HTTP API and its live socket.
 export type RunRow = {
   id: string; project: string; task: string; createdAt: string; status: string; role: string; name: string; agent: string;
-  live: boolean; orchestrator?: string; repo: string; activity: string | null; sessionMode: string;
+  live: boolean; orchestrator?: string; repo: string; activity: string | null; runMode: string;
   organization: { archivedAt: string | null; group: string; pinnedAt: string | null; snoozedUntil: string | null; unread: boolean; busy: string | null }; needsAnswer: boolean;
 };
 export type RunDetail = {
   run: {
     id: string; project: string; repo: string; base: string; task: string; role: string; name: string; orchestrator?: string; model?: string; issue?: number;
     spec?: Record<string, unknown>; sharedWorkspace?: string;
-    node: { agent: string; branch: string; worktree: string; status: string; attempts: number; summary?: string; activity?: string; activityAt?: string; sessionMode?: string; prStatus?: string };
+    node: { agent: string; branch: string; worktree: string; status: string; attempts: number; summary?: string; activity?: string; activityAt?: string; runMode?: string; prStatus?: string };
   };
   live: boolean; pr: { number: number; url: string } | null; terminateOnPrMerge: boolean; noSignal: unknown;
   usage: { conversations: number; inputEquivalent: number; tokens: Record<string, number> };

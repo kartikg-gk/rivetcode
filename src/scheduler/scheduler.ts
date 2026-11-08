@@ -234,14 +234,14 @@ export function createScheduler(d: SchedulerDeps) {
       ...(run.spec?.denyTools?.length ? { disallowedTools: run.spec.denyTools } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
     };
-    if (chat && o.resume && !node.providerConversationId) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
+    if (chat && o.resume && !node.agentChatId) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
     const argv = chat
-      ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-host", encodeConfig({
+      ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-runner", encodeConfig({
         inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex" | "delta", binary: node.agent === "delta" ? config["delta.binary"]?.trim() || agent.binary || "delta" : agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
-        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.providerConversationId ? { resume: node.providerConversationId } : {}), ...(fork && !o.fresh && !node.providerConversationId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, ...replyAnchor(fork.items), context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.providerConversationId ? { fork: { providerId: branch.items.at(-1)?.providerConversationId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, ...replyAnchor(branch.items), context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
+        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.agentChatId ? { resume: node.agentChatId } : {}), ...(fork && !o.fresh && !node.agentChatId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, ...replyAnchor(fork.items), context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.agentChatId ? { fork: { providerId: branch.items.at(-1)?.agentChatId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, ...replyAnchor(branch.items), context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
       })]
       : o.resume
-        ? await agent.restoreCommand({ ...cfg, ...(node.agentSessionId ? { capturedId: node.agentSessionId } : {}) })
+        ? await agent.restoreCommand({ ...cfg, ...(node.agentOwnId ? { capturedId: node.agentOwnId } : {}) })
         : await agent.launchCommand(cfg);
     if (!argv) throw new SchedulerError(409, `${run.id} has no conversation to resume`);
     if (chat) chats.add(sessionId);
@@ -250,8 +250,8 @@ export function createScheduler(d: SchedulerDeps) {
       await agent.installHooks(node.worktree);
       await agent.prepare?.({ workspace: node.worktree, headless });
     }
-    if ((node.sessionMode ?? "terminal") !== (chat ? "chat" : "terminal")) {
-      await d.write(() => d.store.updateNode(run.id, node.id, { sessionMode: chat ? "chat" : "terminal" }));
+    if ((node.runMode ?? "terminal") !== (chat ? "chat" : "terminal")) {
+      await d.write(() => d.store.updateNode(run.id, node.id, { runMode: chat ? "chat" : "terminal" }));
     }
     // Recorded before the process exists, so even an instant exit is attributed to it.
     const previous = d.launches.get(sessionId);
@@ -345,7 +345,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (!d.runtime.isAlive(session) || d.runtime.takesInput(session)) return false;
     const queued = await d.write(() => d.store.undeliveredMessages(runId, NODE_ID));
     if (!queued.some((m) => m.mode === "interrupt")) return false;
-    const cfg = { sessionId: session, workspace: run.node.worktree, ...(run.node.agentSessionId ? { capturedId: run.node.agentSessionId } : {}) };
+    const cfg = { sessionId: session, workspace: run.node.worktree, ...(run.node.agentOwnId ? { capturedId: run.node.agentOwnId } : {}) };
     if (!(await d.agents(run.node.agent).restoreCommand(cfg))) return false;
     await stopSession(session);
     return messagesAtTurnEnd(await load(runId));
@@ -1213,18 +1213,18 @@ export function createScheduler(d: SchedulerDeps) {
     awaitingPartner.delete(runId);
     setPending(runId, null);
     const from = run.node.agent;
-    const conversation = run.node.agentSessionId ? conversationFile(from, run.node.agentSessionId) : null;
+    const conversation = run.node.agentOwnId ? conversationFile(from, run.node.agentOwnId) : null;
     // A chat's whole conversation is Rivet's own record, readable with rivet read.
-    const history = run.node.sessionMode === "chat" ? `rivet read ${runId} --activity` : null;
+    const history = run.node.runMode === "chat" ? `rivet read ${runId} --activity` : null;
     await stopSession(sessionOf(run));
     const log = await git(["log", "--oneline", `${run.base}..HEAD`], run.node.worktree).catch(() => "");
     const status = await git(["status", "--short"], run.node.worktree).catch(() => "");
     const otherWriters = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id)).some((r) => r.id !== runId && r.node.worktree === run.node.worktree && d.runtime.isAlive(sessionOf(r))));
     notes.push(...await settleGit(run.node.worktree, !otherWriters));
-    const said = await d.write(() => (run.node.sessionMode === "chat" ? d.store.readChat : d.store.readTimeline)(runId, { limit: 10_000, kinds: ["prompt", "message", "assistant"], session: NODE_ID }));
+    const said = await d.write(() => (run.node.runMode === "chat" ? d.store.readChat : d.store.readTimeline)(runId, { limit: 10_000, kinds: ["prompt", "message", "assistant"], session: NODE_ID }));
     const turns = handoffTurns(said.items, from);
     await d.write(() => {
-      d.store.updateNode(runId, NODE_ID, { agent: to, agentSessionId: null });
+      d.store.updateNode(runId, NODE_ID, { agent: to, agentOwnId: null });
       const fresh = d.store.loadRun(runId);
       const { model: _old, ...rest } = fresh;
       d.store.saveRun(model ? { ...rest, model } : rest);
@@ -1273,7 +1273,7 @@ export function createScheduler(d: SchedulerDeps) {
       const fresh = await load(runId);
       // It continues its own conversation, told to look first: the workers it started may
       // have finished or reported while it was away.
-      if (await d.agents(fresh.node.agent).restoreCommand({ sessionId: sessionOf(fresh), workspace: fresh.node.worktree, ...(fresh.node.agentSessionId ? { capturedId: fresh.node.agentSessionId } : {}) })) {
+      if (await d.agents(fresh.node.agent).restoreCommand({ sessionId: sessionOf(fresh), workspace: fresh.node.worktree, ...(fresh.node.agentOwnId ? { capturedId: fresh.node.agentOwnId } : {}) })) {
         await launch(fresh, RESTART_NOTE, { resume: true });
         return;
       }
@@ -1283,7 +1283,7 @@ export function createScheduler(d: SchedulerDeps) {
       await launch(fresh, prompt);
       return;
     }
-    if (run.node.agent !== "fake" && !d.runtime.isAlive(sessionOf(run)) && (run.node.providerConversationId || run.node.agentSessionId)) {
+    if (run.node.agent !== "fake" && !d.runtime.isAlive(sessionOf(run)) && (run.node.agentChatId || run.node.agentOwnId)) {
       if (run.node.status !== "running") await transition(runId, "running");
       await d.write(() => d.store.updateNode(runId, NODE_ID, {finishedAt:null}));
       await launch(await load(runId), "The user explicitly resumed this interrupted work. Inspect current files and provider history before repeating any possibly completed action.", {resume:true});

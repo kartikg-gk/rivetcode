@@ -28,7 +28,7 @@ function exchange(s: Store, id: string, turn: string, text: string) {
 }
 async function seed() {
   data = await makeDataDir(); store = openStore(data);
-  const run = sessionRun(data, { agent: "codex" }); run.node.sessionMode = "chat";
+  const run = sessionRun(data, { agent: "codex" }); run.node.runMode = "chat";
   store.saveRun(run); store.recordChat("r1", "agent", [{ type: "conversation", id: "native-parent" }]);
   exchange(store, "r1", "t1", "original marker");
   return store;
@@ -57,7 +57,7 @@ describe("durable conversation lineage", () => {
     const run = s.loadRun(child.runId);
     expect(run.node.worktree).toBe(s.loadRun("r1").node.worktree);
     expect(workerPrompt(run)).toContain("share the checkout");
-    expect(run.sharedWorkspace).toBe("r1"); expect(run.node.providerConversationId).toBeUndefined();
+    expect(run.sharedWorkspace).toBe("r1"); expect(run.node.agentChatId).toBeUndefined();
     expect(run.node.status).toBe("pending");
     exchange(s, "r1", "later-turn", "future marker");
     expect(s.readChat(child.runId, { limit: 100 }).items.map((i) => i.text)).toEqual(["question original marker", "original marker"]);
@@ -82,7 +82,7 @@ describe("durable conversation lineage", () => {
     s.updateNode(recent.runId, "agent", { status: "done", finishedAt: "2002-01-01T00:00:00.000Z" });
     s.updateNode(boundary.runId, "agent", { status: "done", finishedAt: "2001-01-01T00:00:00.000Z" });
     s.updateNode(staleRunning.runId, "agent", { status: "running", finishedAt: "2000-01-01T00:00:00.000Z" });
-    const other = sessionRun(data!, { id: "r2", project: "other", agent: "codex" }); other.node.sessionMode = "chat";
+    const other = sessionRun(data!, { id: "r2", project: "other", agent: "codex" }); other.node.runMode = "chat";
     s.saveRun(other); exchange(s, "r2", "other-turn", "other project");
     const otherFork = forkConversation(s, "r2", {});
     s.updateNode(otherFork.runId, "agent", { status: "done", finishedAt: "2000-01-01T00:00:00.000Z" });

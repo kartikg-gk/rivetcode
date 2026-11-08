@@ -32,7 +32,7 @@ export type Node = {
   attempts: number;
   summary?: string;
   activity?: ActivityState;
-  agentSessionId?: string;
+  agentOwnId?: string;
   prStatus?: PrStatus;
   // When the agent last reported activity (ISO); the status view shows idle time from it.
   activityAt?: string;
@@ -43,13 +43,13 @@ export type Node = {
   // The first hook of the current launch; unset means the agent has not been heard from.
   firstSignalAt?: string;
   // How the session runs: in a terminal (the agent's own CLI) or as a chat (its protocol).
-  sessionMode?: SessionMode;
+  runMode?: RunMode;
   // A chat's conversation id at the agent, to resume it.
-  providerConversationId?: string;
+  agentChatId?: string;
 };
 
 export const SESSION_MODES = ["terminal", "chat"] as const;
-export type SessionMode = (typeof SESSION_MODES)[number];
+export type RunMode = (typeof SESSION_MODES)[number];
 
 // Every run has exactly one node, under this id; its session is "<run>-agent".
 export const NODE_ID = "agent";

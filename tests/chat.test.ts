@@ -127,7 +127,7 @@ describe("forking a Claude chat", () => {
       await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
       const fork = (await api("POST", `/api/v1/runs/${runId}/fork`, {})).json.runId as string;
       await api("POST", `/api/v1/sessions/${fork}-agent/send`, { message: "from the fork", mode: "queue" });
-      await until("the fork's reply", async () => (await timeline(fork) as (Item & { providerConversationId?: string })[]).some((i) => i.kind === "assistant" && i.text.startsWith("echo: from the fork") && i.providerConversationId === "forked" && !i.text.includes("Inherited context")));
+      await until("the fork's reply", async () => (await timeline(fork) as (Item & { agentChatId?: string })[]).some((i) => i.kind === "assistant" && i.text.startsWith("echo: from the fork") && i.agentChatId === "forked" && !i.text.includes("Inherited context")));
     } finally { delete process.env.FAKE_NATIVE_FORK; }
   }, 30_000);
 });
@@ -174,7 +174,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     expect(items[0]!.text).toContain("say hello");
     expect(items.find((i) => i.kind === "tool")).toMatchObject({ text: "ls\na.txt" });
     const run = (await api("GET", `/api/v1/runs/${runId}`)).json;
-    expect(run.run.node.sessionMode).toBe("chat");
+    expect(run.run.node.runMode).toBe("chat");
     await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
     watching = false;
     await watcher;
@@ -266,7 +266,7 @@ describe("a delta chat session", () => {
     daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "RUN it", agent: "delta", model: "openai/gpt-5-mini" })).json.runId as string;
     await until("the question", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest?.tool === "Bash");
-    expect((await api("GET", `/api/v1/runs/${runId}`)).json.run.node.sessionMode).toBe("chat");
+    expect((await api("GET", `/api/v1/runs/${runId}`)).json.run.node.runMode).toBe("chat");
     await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" });
     await until("the reply", async () => said(await timeline(runId), "echo: Your task: RUN it"));
     const items = await timeline(runId);

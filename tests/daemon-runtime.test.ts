@@ -209,7 +209,7 @@ describe("hook activity from agents", () => {
   it("saves an agent session id without a state, and ignores events from an older launch", async () => {
     await start();
     const first = await (await startAgent({ stayFor: 60_000 })).json() as { launchId: string };
-    expect((await post("/api/v1/sessions/r1-agent/activity", { agentSessionId: "conv-1", launchId: first.launchId })).status).toBe(204);
+    expect((await post("/api/v1/sessions/r1-agent/activity", { agentOwnId: "conv-1", launchId: first.launchId })).status).toBe(204);
     expect((await post("/api/v1/sessions/r1-agent/activity", { state: "busy", launchId: "0000000000000000" })).status).toBe(204);
     expect(activity()).toBe("idle");
     expect((await post("/api/v1/sessions/r1-agent/activity", { state: "busy", launchId: first.launchId })).status).toBe(204);
@@ -219,7 +219,7 @@ describe("hook activity from agents", () => {
     daemon = undefined;
     const store = openStore(data);
     try {
-      expect(store.loadRun("r1").node.agentSessionId).toBe("conv-1");
+      expect(store.loadRun("r1").node.agentOwnId).toBe("conv-1");
       expect(store.loadRun("r1").node.firstSignalAt).toBeDefined();
       expect(store.conversations("r1")).toEqual([{ nodeId: "agent", agent: "claude", id: "conv-1" }]);
     }

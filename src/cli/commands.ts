@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { readRunFile } from "../runfile.js";
 import type { Probes } from "./doctor.js";
-import { agentSessionIdOf, deriveActivity } from "./activity.js";
+import { agentOwnIdOf, deriveActivity } from "./activity.js";
 import { fromHook } from "../timeline.js";
 import { callDaemon, dataDirFrom, DaemonDownError, DaemonError, runFileFrom } from "./client.js";
 
@@ -163,14 +163,14 @@ async function hooks(args: string[], io: CliIo): Promise<number> {
     // An unreadable payload still tells us which event fired.
   }
   const state = deriveActivity(agent, event, payload);
-  const agentSessionId = agentSessionIdOf(payload);
+  const agentOwnId = agentOwnIdOf(payload);
   let timeline = fromHook(agent, event, payload);
-  if (agent === "claude-code" && event === "stop" && agentSessionId && io.env.RIVET_CLAUDE_TERMINAL_HISTORY === "1") {
+  if (agent === "claude-code" && event === "stop" && agentOwnId && io.env.RIVET_CLAUDE_TERMINAL_HISTORY === "1") {
     const { claudeTerminalReplies } = await import("../claude-terminal-history.js");
-    const replies = claudeTerminalReplies(agentSessionId, timeline[0]?.text);
+    const replies = claudeTerminalReplies(agentOwnId, timeline[0]?.text);
     if (replies.length) timeline = replies;
   }
-  if (state === null && agentSessionId === undefined && timeline.length === 0) return 0;
+  if (state === null && agentOwnId === undefined && timeline.length === 0) return 0;
   const launchId = io.env.RIVET_LAUNCH_ID?.trim();
   const request = state === "approval" || event === "permission-request" ? permissionRequestOf(payload) : undefined;
   try {
@@ -179,7 +179,7 @@ async function hooks(args: string[], io: CliIo): Promise<number> {
       ...(event === "stop" ? { turnEnded: true } : {}),
       ...(request ? { request } : {}),
       ...(timeline.length ? { timeline } : {}),
-      ...(agentSessionId ? { agentSessionId } : {}),
+      ...(agentOwnId ? { agentOwnId } : {}),
       ...(launchId ? { launchId } : {}),
     }, HOOK_TIMEOUT_MS);
   } catch (e) {
@@ -1056,7 +1056,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       case "hooks": return await hooks(args, io);
       // The process behind a chat session (started by the daemon, not by people).
-      case "chat-host": {
+      case "chat-runner": {
         const { runHost } = await import("../chat/host.js");
         return await runHost(JSON.parse(Buffer.from(args[0] ?? "", "base64url").toString("utf8")), io.env);
       }

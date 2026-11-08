@@ -9,7 +9,7 @@ export type Action = { id: string; label: string; about: string; args?: string; 
 // What can be done to a session: the same list drives its menu, the / menu and the palette.
 export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
   const post = (tail: string, body?: unknown, done?: string) => { void act(() => api("POST", runPath(id, tail), body), done); };
-  const chat = d?.run.node.sessionMode === "chat";
+  const chat = d?.run.node.runMode === "chat";
   const all: Action[] = [
     { id: "stop", label: "Stop", about: "stop this session; an orchestrator also stops its workers", run: () => ask({
       title: "Stop this session?", danger: true, confirm: "Stop",
