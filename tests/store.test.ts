@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { assertId } from "../src/paths.js";
-import { newRunId, openStore, RunStoreError, type Run, type Store } from "../src/store.js";
+import { forkedRunId, openStore, RunStoreError, type Run, type Store } from "../src/store.js";
 import { setStatus } from "../src/model.js";
 import { makeDataDir, removeRepo, sessionRun } from "./helpers.js";
 
@@ -21,9 +21,9 @@ afterEach(async () => {
 
 const sampleRun = (id = "r1", project = "proj"): Run => sessionRun(data, { id, project });
 
-describe("newRunId", () => {
+describe("forkedRunId", () => {
   it("is a valid, unique run id", () => {
-    const ids = new Set(Array.from({ length: 50 }, () => newRunId(1_790_000_000_000)));
+    const ids = new Set(Array.from({ length: 50 }, () => forkedRunId(1_790_000_000_000)));
     expect(ids.size).toBe(50);
     for (const id of ids) expect(() => assertId("run", id)).not.toThrow();
   });
@@ -298,7 +298,7 @@ describe("timeline", () => {
     const id = store.queueMessage("r1", "agent", "hi", "orchestrator", "queue")!;
     store.markDelivered(id);
     store.markDelivered(id);
-    store.recordOutcome("r1", "agent", "done", "ok");
+    store.saveOutcome("r1", "agent", "done", "ok");
     store.updateNode("r1", "agent", { status: "done" });
     store.updateNode("r1", "agent", { status: "done" });
     store.setPr("r1", { number: 7, url: "u" });

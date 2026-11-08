@@ -46,10 +46,10 @@ function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; t
   const set = useApp((s) => s.set);
   const text = full ?? item.text;
   const showAll = () => void act(async () => {
-    let out = item.text; let offset = item.nextChar ?? null;
+    let out = item.text; let offset = item.continueFrom ?? null;
     while (offset !== null) {
       const page = await api<Page>("GET", runPath(id, `/timeline?item=${item.position}&startChar=${offset}&charLimit=50000`));
-      out += page.items[0]!.text; offset = page.items[0]!.nextChar ?? null;
+      out += page.items[0]!.text; offset = page.items[0]!.continueFrom ?? null;
     }
     setFull(out);
   });
@@ -84,7 +84,7 @@ function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; t
       {/* Agent text is data: markdown renders without raw HTML. */}
       {mine ? <div className="whitespace-pre-wrap break-words">{item.kind === "prompt" && task && text.includes(task) ? task : text}</div>
         : <div className="prose-agent"><Markdown components={{ a: (p) => <a href={p.href} target="_blank" rel="noreferrer noopener">{p.children}</a> }}>{text}</Markdown></div>}
-      {item.nextChar != null && full === undefined && <button className="btn justify-self-start text-xs" onClick={showAll}>Show all ({item.cut?.length} characters)</button>}
+      {item.continueFrom != null && full === undefined && <button className="btn justify-self-start text-xs" onClick={showAll}>Show all ({item.cut?.length} characters)</button>}
     </article>
   );
 }

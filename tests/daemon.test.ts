@@ -218,7 +218,7 @@ describe("daemon routes", () => {
 
 it("pages an entire long item without skipping its tail and validates offsets",async()=>{
  const s=openStore(data);const r=run();r.node.runMode="chat";s.saveRun(r);const text="prefix "+"long history ".repeat(6000)+" UNIQUE_TAIL";s.recordChat("r1","agent",[{type:"message",itemId:"long",role:"assistant",text}]);const position=s.readChat("r1",{limit:1}).items[0]!.position;s.close();await start();
- let offset=0,recovered="";for(;;){const response=await fetch(url(`/api/v1/runs/r1/timeline?item=${position}&startChar=${offset}&charLimit=4000`));expect(response.status).toBe(200);const page=await response.json();const item=page.items[0];recovered+=item.text;if(item.nextChar===null)break;expect(item.nextChar).toBeGreaterThan(offset);offset=item.nextChar;}expect(recovered).toBe(text);
+ let offset=0,recovered="";for(;;){const response=await fetch(url(`/api/v1/runs/r1/timeline?item=${position}&startChar=${offset}&charLimit=4000`));expect(response.status).toBe(200);const page=await response.json();const item=page.items[0];recovered+=item.text;if(item.continueFrom===null)break;expect(item.continueFrom).toBeGreaterThan(offset);offset=item.continueFrom;}expect(recovered).toBe(text);
  expect((await fetch(url("/api/v1/runs/r1/timeline?startChar=3"))).status).toBe(400);expect((await fetch(url("/api/v1/runs/r1/timeline?item=999"))).status).toBe(404);
 });
 

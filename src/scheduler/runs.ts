@@ -4,8 +4,8 @@ import { cp, mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { git } from "../git.js";
 import { runCommand } from "../merge.js";
-import { assertProjectId, branchName, defaultProjectId, worktreePath } from "../paths.js";
-import { newRunId, type Run } from "../store.js";
+import { assertProjectId, branchName, projectIdFor, worktreePath } from "../paths.js";
+import { forkedRunId, type Run } from "../store.js";
 import { AGENTS, NODE_ID, ROLES, type Agent, type Role } from "../model.js";
 import { createWorktree, DirtyWorktreeError, removeWorktree } from "../worktree.js";
 import { LinkError, linkListed } from "../links.js";
@@ -67,7 +67,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   } catch {
     throw new RunInputError(`base "${base}" is not a commit in ${repo}`);
   }
-  const project = defaultProjectId(repo);
+  const project = projectIdFor(repo);
   try { assertProjectId(project); } catch (e) { throw new RunInputError((e as Error).message); }
   const agent = (o.agent ?? o.defaultAgentFor?.(project) ?? "claude") as Agent;
   if (!AGENTS.includes(agent)) throw new RunInputError(`unknown agent "${o.agent}"`);
@@ -80,7 +80,7 @@ export async function prepareRun(o: NewRun): Promise<Run> {
   const name = (o.name ?? "").trim();
   if (name.length > 100) throw new RunInputError(`name is ${name.length} characters; at most 100`);
 
-  const id = newRunId();
+  const id = forkedRunId();
   const node = {
     id: NODE_ID, title: name || o.task.trim().split(/\r?\n/)[0]!.slice(0, 100), prompt: o.task.trim(), agent,
     branch: branchName(id, NODE_ID), worktree: worktreePath(o.data, project, id, NODE_ID),

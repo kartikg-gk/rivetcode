@@ -82,7 +82,7 @@ export type Store = {
   markLaunched(runId: string, nodeId: string, active?: boolean): void;
   // Every agent conversation a run's nodes have had.
   conversations(runId: string): { nodeId: string; agent: string; id: string }[];
-  recordOutcome(runId: string, nodeId: string, kind: "done" | "blocked" | "question", message?: string): number | null;
+  saveOutcome(runId: string, nodeId: string, kind: "done" | "blocked" | "question", message?: string): number | null;
   // mode: steer (typed in as soon as the agent can take it), queue (only once it is idle),
   // interrupt (its current turn is stopped first).
   queueMessage(runId: string, nodeId: string, message: string, from?: string, mode?: SendMode): number | null;
@@ -254,7 +254,7 @@ export class RunStoreError extends Error {
   }
 }
 
-export function newRunId(now: number = Date.now()): string {
+export function forkedRunId(now: number = Date.now()): string {
   const rand = randomBytes(4).readUInt32BE(0).toString(36).padStart(4, "0").slice(-4);
   return `r${now.toString(36)}${rand}`;
 }
@@ -946,7 +946,7 @@ export function openStore(data: string): Store {
         .map((r) => ({ nodeId: r.node_id, agent: r.agent, id: r.conversation_id }));
     },
 
-    recordOutcome(runId, nodeId, kind, message) {
+    saveOutcome(runId, nodeId, kind, message) {
       if (!sessionExists.get(runId, nodeId)) return null;
       const id = Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
       logEvent(runId, nodeId, "report", { kind });
@@ -1155,7 +1155,7 @@ export function openStore(data: string): Store {
       if (forkRecord(sourceId)?.detached) throw new RunStoreError("source workspace is detached");
       const rootRun = source.sharedWorkspace ?? source.id;
       return tasks.map(input => {
-        const id = newRunId();
+        const id = forkedRunId();
         const task = input.task.trim();
         const name = input.name?.trim() ?? "";
         const run: Run = {

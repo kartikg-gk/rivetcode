@@ -6,7 +6,7 @@ import {
   assertProjectId,
   branchName,
   dataDir,
-  defaultProjectId,
+  projectIdFor,
   worktreePath,
 } from "../src/paths.js";
 
@@ -54,8 +54,8 @@ describe("dataDir", () => {
 
 describe("project ids", () => {
   it("derives the id from the repo folder name", () => {
-    expect(defaultProjectId(join("C:", "work", "My Repo "))).toBe("my-repo");
-    expect(defaultProjectId(join("C:", "work", "graphRAG"))).toBe("graphrag");
+    expect(projectIdFor(join("C:", "work", "My Repo "))).toBe("my-repo");
+    expect(projectIdFor(join("C:", "work", "graphRAG"))).toBe("graphrag");
   });
 
   it.each(["", ".", "a..b", "a/b", "a\\b", "-x", "a b"])("rejects project id %j", (id) => {

@@ -8,14 +8,14 @@ import { parseTaskFile, TaskFileError } from "../scheduler/tasks.js";
 import { searchPage, SearchInputError } from "../search.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
 import { existsSync } from "node:fs";
-import { awaitRun } from "../scheduler/wait.js";
+import { waitOnRun } from "../scheduler/wait.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { findClaude, findCodex } from "../agents/locate.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
-import { dataDir, assertId, defaultProjectId, branchName, worktreePath } from "../paths.js";
+import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
 import { liveOwner, releaseRunFile, runFileAt, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
@@ -349,7 +349,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   // Creates a run with the project's settings and starts its agent.
   async function newRun(o: Omit<NewRun, "data" | "defaultAgentFor" | "copyFor" | "setupFor">): Promise<Run> {
     const root = await repoRoot(o.repo);
-    if (await write(() => store.projectDeleted(defaultProjectId(root)))) throw new HttpError(409, "register the deleted project before starting new runs");
+    if (await write(() => store.projectDeleted(projectIdFor(root)))) throw new HttpError(409, "register the deleted project before starting new runs");
     const run = await prepareRun({
       ...o, data,
       defaultAgentFor: (project) => store.getConfig(project)["worker.agent"],
@@ -764,7 +764,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 201, { id: 0 });
         return;
       }
-      const id = await write(() => store.recordOutcome(runId, nodeId, payload.kind as ReportKind, message));
+      const id = await write(() => store.saveOutcome(runId, nodeId, payload.kind as ReportKind, message));
       if (id === null) throw new HttpError(404, "unknown session");
       await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
       void scheduler.onReport(runId, payload.kind as string, message).catch((e) => opts.onError?.(e));
@@ -1012,7 +1012,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const payload = await body(req);
         const repo = !id && typeof payload.repo === "string" ? await repoRoot(payload.repo).catch(() => null) : null;
         if (!id && !repo) throw new HttpError(400, "an existing Git repository is required");
-        const key = id ?? defaultProjectId(repo!);
+        const key = id ?? projectIdFor(repo!);
         const title = payload.title;
         const instructions = payload.instructions;
         const scripts = payload.scripts;
@@ -1319,7 +1319,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const closed = () => abort.abort();
       res.on("close", closed);
       try {
-        const result = await awaitRun(async (turn) => write(() => {
+        const result = await waitOnRun(async (turn) => write(() => {
           const run = store.loadRun(runId);
           return { retrying: run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2), status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstHeardAt };
         }), { scope: scope as "turn" | "task", timeoutMs, ...(q.get("turn") ? { turn: q.get("turn")! } : {}) }, AbortSignal.any([abort.signal, waitAbort.signal]));
@@ -1357,7 +1357,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const items = page.items.map((i) => {
         const offset = item !== undefined ? startChar : 0;
         const end = Math.min(i.text.length, offset + charLimit);
-        return {...i, text: i.text.slice(offset, end), startChar: offset, nextChar: end < i.text.length ? end : null,
+        return {...i, text: i.text.slice(offset, end), startChar: offset, continueFrom: end < i.text.length ? end : null,
           ...(end < i.text.length ? {cut:{shown:end-offset,length:i.text.length}} : {})};
       });
       const last = items.at(-1)?.position;
@@ -1451,7 +1451,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (issueRef !== undefined) {
         try {
           const root = await repoRoot(repo);
-          const gh = await github({ repo: root, project: defaultProjectId(root) } as Run);
+          const gh = await github({ repo: root, project: projectIdFor(root) } as Run);
           const found = await gh.issue(issueNumber(issueRef, gh.repo));
           issue = found.number;
           task = issueTask(found, task);
@@ -1502,7 +1502,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       } catch (e) { throw new HttpError(400, (e as Error).message); }
       let root: string;
       try { root = await repoRoot(repoArg); } catch (e) { throw new HttpError(400, (e as Error).message); }
-      const project = defaultProjectId(root);
+      const project = projectIdFor(root);
       if (await write(() => store.listRoutines(project).some((a) => a.name === name))) throw new HttpError(409, `an routine "${name}" exists`);
       const routine = {
         id: `a${randomBytes(6).toString("hex")}`, project, repo: root, name, prompt: prompt.trim(), role, cron, zone,

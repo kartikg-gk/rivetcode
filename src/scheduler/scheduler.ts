@@ -753,7 +753,7 @@ export function createScheduler(d: SchedulerDeps) {
         await abortMerge(node.worktree).catch(report);
         if ((await headOf(node.worktree)) !== before) await resetTo(node.worktree, before).catch(report);
         const why = `merging the latest ${run.base} conflicts in ${synced.conflicts.join(", ")}: ${resolved.reason}`;
-        await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "needs-you" }));
+        await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "decision-pending" }));
         throw new SchedulerError(409, why);
       }
     }
@@ -764,7 +764,7 @@ export function createScheduler(d: SchedulerDeps) {
         if (!result.ok) {
           await resetTo(node.worktree, before);
           const why = `tests "${test}" fail after merging the latest ${run.base}:\n${result.output}`;
-          await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "needs-you" }));
+          await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "decision-pending" }));
           throw new SchedulerError(409, why);
         }
       }

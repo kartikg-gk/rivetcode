@@ -11,7 +11,7 @@ export const ACTIVITY_STATES = ["busy", "idle", "asking", "approval", "ended"] a
 export const PR_STATUSES = [
   "open", "draft", "checks-failing", "changes-wanted", "awaiting-review", "approved", "ready", "merged", "closed",
   // Rivet stopped watching it for the person to decide (feedback could not be handed over).
-  "needs-you",
+  "decision-pending",
 ] as const;
 
 export type Agent = (typeof AGENTS)[number];

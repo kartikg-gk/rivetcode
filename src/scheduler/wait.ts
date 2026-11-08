@@ -6,7 +6,7 @@ export type WaitSnapshot = {
   pendingRequest?: { tool: string; detail: string } | null;
 };
 // Waiting happens in the daemon without generating repeated agent tool calls.
-export async function awaitRun(read: (turn?: string) => Promise<WaitSnapshot>, options: { scope: "turn" | "task"; timeoutMs: number; turn?: string }, signal: AbortSignal) {
+export async function waitOnRun(read: (turn?: string) => Promise<WaitSnapshot>, options: { scope: "turn" | "task"; timeoutMs: number; turn?: string }, signal: AbortSignal) {
   const deadline = Date.now() + options.timeoutMs;
   let snapshot = await read(options.turn);
   let turn = options.turn ?? (snapshot.pending ? undefined : snapshot.turn?.id);

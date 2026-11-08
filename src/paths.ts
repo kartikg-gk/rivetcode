@@ -19,7 +19,7 @@ export function assertProjectId(id: string): void {
   }
 }
 
-export function defaultProjectId(repo: string): string {
+export function projectIdFor(repo: string): string {
   return basename(resolve(repo)).toLowerCase().trim().replace(/ /g, "-");
 }
 
