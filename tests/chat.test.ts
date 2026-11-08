@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getAgent } from "../src/agents/agent.js";
-import { allowed, autoApproved } from "../src/chat/host.js";
+import { allowed, autoApproved, readsAttachment } from "../src/chat/host.js";
 import { runCli } from "../src/cli/commands.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
@@ -63,6 +63,17 @@ async function until<T>(what: string, fn: () => Promise<T | undefined | false>, 
   }
 }
 const said = (items: Item[], text: string) => items.some((i) => i.kind === "assistant" && i.text.includes(text));
+
+describe("a file attached to the thread", () => {
+  it("is read without asking, and nothing outside its folder is", () => {
+    const dir = join("data", "attachments", "r1");
+    expect(readsAttachment(dir, { tool: "Read", detail: join(dir, "abc-notes.txt") })).toBe(true);
+    expect(readsAttachment(dir, { tool: "Read", detail: join(dir, "..", "r2", "x.txt") })).toBe(false);
+    expect(readsAttachment(dir, { tool: "Read", detail: join("data", "rivet.db") })).toBe(false);
+    expect(readsAttachment(dir, { tool: "Write", detail: join(dir, "abc-notes.txt") })).toBe(false);
+    expect(readsAttachment(dir, { tool: "Read", detail: dir })).toBe(false);
+  });
+});
 
 describe("a chat session's own tools", () => {
   it("are covered by the rivet rule, and other tools are not", () => {
@@ -291,5 +302,18 @@ describe("Rivet's own tools in a delta session", () => {
     daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "TOOL please", agent: "delta" })).json.runId as string;
     await until("the reply", async () => said(await timeline(runId), "tool said: {"));
+  }, 30_000);
+});
+
+describe("a new thread in the same checkout", () => {
+  it("starts with its own task", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "run.mode", value: "chat" });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "first", agent: "claude" })).json.runId as string;
+    await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
+    const thread = (await api("POST", `/api/v1/runs/${runId}/threads`, { tasks: [{ task: "count the tests" }] })).json.threads[0].runId as string;
+    await api("POST", `/api/v1/sessions/${thread}-agent/send`, { message: "go", mode: "queue" });
+    await until("the thread's task", async () => (await timeline(thread)).some((i) => (i.kind === "prompt" || i.kind === "message") && i.text.includes("count the tests")));
   }, 30_000);
 });
