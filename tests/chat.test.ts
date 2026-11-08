@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getAgent } from "../src/agents/agent.js";
-import { allowed, autoApproved } from "../src/chat/host.js";
+import { allowed, autoApproved, readsAttachment } from "../src/chat/host.js";
 import { runCli } from "../src/cli/commands.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
 import { makeDataDir, makeRepo, removeRepo } from "./helpers.js";
@@ -63,6 +63,17 @@ async function until<T>(what: string, fn: () => Promise<T | undefined | false>, 
   }
 }
 const said = (items: Item[], text: string) => items.some((i) => i.kind === "assistant" && i.text.includes(text));
+
+describe("a file attached to the thread", () => {
+  it("is read without asking, and nothing outside its folder is", () => {
+    const dir = join("data", "attachments", "r1");
+    expect(readsAttachment(dir, { tool: "Read", detail: join(dir, "abc-notes.txt") })).toBe(true);
+    expect(readsAttachment(dir, { tool: "Read", detail: join(dir, "..", "r2", "x.txt") })).toBe(false);
+    expect(readsAttachment(dir, { tool: "Read", detail: join("data", "rivet.db") })).toBe(false);
+    expect(readsAttachment(dir, { tool: "Write", detail: join(dir, "abc-notes.txt") })).toBe(false);
+    expect(readsAttachment(dir, { tool: "Read", detail: dir })).toBe(false);
+  });
+});
 
 describe("a chat session's own tools", () => {
   it("are covered by the rivet rule, and other tools are not", () => {

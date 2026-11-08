@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createInterface } from "node:readline";
 import { callDaemon, dataDirFrom } from "../cli/client.js";
@@ -60,6 +60,14 @@ export function allowed(rules: string[], command: string | undefined): boolean {
 export function autoApproved(rules: string[], a: { tool: string; command?: string }): boolean {
   if (a.tool.startsWith("mcp__rivet__")) return allowed(rules, "rivet");
   return allowed(rules, a.command);
+}
+
+// Files attached to this thread live in Rivet's data folder, outside the worktree; reading
+// one of them is what the person asked for when they attached it.
+export function readsAttachment(dir: string, a: { tool: string; detail: string }): boolean {
+  if (a.tool !== "Read" || !a.detail.trim()) return false;
+  const within = relative(resolve(dir), resolve(a.detail.trim()));
+  return !!within && !within.startsWith("..") && !isAbsolute(within);
 }
 
 export async function runHost(config: HostConfig, env: Record<string, string | undefined> = process.env): Promise<number> {
@@ -134,6 +142,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
     ownToolsFree: autoApproved(config.allow, { tool: "mcp__rivet__rivet_status" }),
     decide: (a: Approval): Choice | undefined => {
       if (autoApproved(config.allow, a)) return "yes";
+      if (sessionId && readsAttachment(join(dataDirFrom(env), "attachments", sessionId.slice(0, sessionId.lastIndexOf("-"))), a)) return "yes";
       questionOpen = a;
       return undefined;
     },
