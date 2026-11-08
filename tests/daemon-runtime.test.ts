@@ -94,7 +94,7 @@ describe("starting agents", () => {
       RIVET_ATTEMPT: "0",
       RIVET_CLAUDE_TERMINAL_HISTORY: "0",
     });
-    await until(() => activity() === "exited");
+    await until(() => activity() === "ended");
   });
 
   it("refuses running sessions, missing worktrees and unknown sessions", async () => {
@@ -127,7 +127,7 @@ describe("stop and output", () => {
     expect((await post("/api/v1/sessions/r1-agent/stop")).status).toBe(204);
     const out = await (await fetch(url("/api/v1/sessions/r1-agent/output?lines=5"))).json();
     expect(out).toMatchObject({ alive: false, lines: ["wrote a.txt"] });
-    await until(() => activity() === "exited");
+    await until(() => activity() === "ended");
     expect((await post("/api/v1/sessions/r1-agent/stop")).status).toBe(404);
   });
 
@@ -169,15 +169,15 @@ describe("daemon lifecycle with agents", () => {
     expect(out.alive).toBe(true);
     await daemon!.stop();
     daemon = undefined;
-    expect(activity()).toBe("exited");
+    expect(activity()).toBe("ended");
   });
 
   it("marks sessions left active by a dead daemon as exited on startup", async () => {
     const store = openStore(data);
-    store.setActivity("r1", "agent", "active");
+    store.setActivity("r1", "agent", "busy");
     store.close();
     await start();
-    expect(activity()).toBe("exited");
+    expect(activity()).toBe("ended");
   });
 });
 
@@ -186,7 +186,7 @@ describe("concurrent requests", () => {
     await start();
     const results = await Promise.all([startAgent({ stayFor: 300 }), startAgent({ stayFor: 300 })]);
     expect(results.map((r) => r.status).sort()).toEqual([202, 409]);
-    await until(() => activity() === "exited");
+    await until(() => activity() === "ended");
   });
 
   it("two sends at once deliver each message exactly once", async () => {
@@ -210,10 +210,10 @@ describe("hook activity from agents", () => {
     await start();
     const first = await (await startAgent({ stayFor: 60_000 })).json() as { launchId: string };
     expect((await post("/api/v1/sessions/r1-agent/activity", { agentSessionId: "conv-1", launchId: first.launchId })).status).toBe(204);
-    expect((await post("/api/v1/sessions/r1-agent/activity", { state: "active", launchId: "0000000000000000" })).status).toBe(204);
+    expect((await post("/api/v1/sessions/r1-agent/activity", { state: "busy", launchId: "0000000000000000" })).status).toBe(204);
     expect(activity()).toBe("idle");
-    expect((await post("/api/v1/sessions/r1-agent/activity", { state: "active", launchId: first.launchId })).status).toBe(204);
-    expect(activity()).toBe("active");
+    expect((await post("/api/v1/sessions/r1-agent/activity", { state: "busy", launchId: first.launchId })).status).toBe(204);
+    expect(activity()).toBe("busy");
     expect((await post("/api/v1/sessions/r1-agent/activity", {})).status).toBe(400);
     await daemon!.stop();
     daemon = undefined;
@@ -264,7 +264,7 @@ describe("interactive mode (terminal sessions)", () => {
     expect((await post("/api/v1/sessions/r1-agent/input", { data: "/exit\r" })).status).toBe(204);
     await readUntil("");
     await reader.cancel();
-    await until(() => activity() === "exited");
+    await until(() => activity() === "ended");
     expect((await post("/api/v1/sessions/r1-agent/input", { data: "x" })).status).toBe(404);
   });
 

@@ -72,7 +72,7 @@ describe("saveRun / loadRun", () => {
   it("round-trips a run and every field", () => {
     const run: Run = {
       ...sampleRun(), role: "orchestrator", name: "login work", orchestrator: "r0-agent", model: "haiku",
-      node: { ...sampleRun().node, prStatus: "open", activity: "waiting_input", summary: "s" },
+      node: { ...sampleRun().node, prStatus: "open", activity: "asking", summary: "s" },
     };
     store.saveRun(run);
     expect(store.loadRun("r1")).toEqual(run);
@@ -195,10 +195,10 @@ describe("outbox and stale sessions", () => {
   it("marks every session that still looks alive as exited", () => {
     store.saveRun(sampleRun());
     store.saveRun(sampleRun("r2"));
-    store.setActivity("r1", "agent", "active");
+    store.setActivity("r1", "agent", "busy");
     store.setActivity("r2", "agent", "idle");
     expect(store.exitStaleSessions()).toBe(2);
-    expect([store.loadRun("r1").node.activity, store.loadRun("r2").node.activity]).toEqual(["exited", "exited"]);
+    expect([store.loadRun("r1").node.activity, store.loadRun("r2").node.activity]).toEqual(["ended", "ended"]);
     expect(store.exitStaleSessions()).toBe(0);
   });
 });
@@ -240,11 +240,11 @@ describe("migration 3 and project config", () => {
 describe("updateNode", () => {
   it("changes only the given fields and leaves activity alone", () => {
     store.saveRun(sampleRun());
-    store.setActivity("r1", "agent", "blocked", "conv");
+    store.setActivity("r1", "agent", "approval", "conv");
     store.updateNode("r1", "agent", { status: "running", attempts: 1, finishedAt: "2026-10-04T00:00:00.000Z" });
     store.updateNode("r1", "agent", { summary: "half way" });
     expect(store.loadRun("r1").node).toMatchObject({
-      status: "running", attempts: 1, summary: "half way", activity: "blocked", agentSessionId: "conv",
+      status: "running", attempts: 1, summary: "half way", activity: "approval", agentSessionId: "conv",
       finishedAt: "2026-10-04T00:00:00.000Z",
     });
     store.updateNode("r1", "agent", { finishedAt: null, summary: null });
@@ -292,8 +292,8 @@ describe("timeline", () => {
 
   it("logs each change to a run's state, but not a repeated activity", () => {
     store.saveRun(sampleRun());
-    store.setActivity("r1", "agent", "active");
-    store.setActivity("r1", "agent", "active");
+    store.setActivity("r1", "agent", "busy");
+    store.setActivity("r1", "agent", "busy");
     store.setActivity("r1", "agent", "idle");
     const id = store.queueMessage("r1", "agent", "hi", "orchestrator", "queue")!;
     store.markDelivered(id);
@@ -304,8 +304,8 @@ describe("timeline", () => {
     store.setPr("r1", { number: 7, url: "u" });
     expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
       ["run.added", { status: sampleRun().node.status, agent: sampleRun().node.agent }],
-      ["activity", { from: null, to: "active" }],
-      ["activity", { from: "active", to: "idle" }],
+      ["activity", { from: null, to: "busy" }],
+      ["activity", { from: "busy", to: "idle" }],
       ["message.queued", { id, mode: "queue", from: "orchestrator" }],
       ["message.delivered", { id }],
       ["report", { kind: "done" }],
@@ -313,7 +313,7 @@ describe("timeline", () => {
       ["pr", { number: 7, handled: null }],
     ]);
     const first = store.readEvents("r1", { limit: 2 });
-    expect(store.readEvents("r1", { limit: 1, after: first[1]!.position })[0]!.data).toEqual({ from: "active", to: "idle" });
+    expect(store.readEvents("r1", { limit: 1, after: first[1]!.position })[0]!.data).toEqual({ from: "busy", to: "idle" });
   });
 
   it("logs a run's creation once, a re-save only when its status changed, and sessions closed at startup", () => {
@@ -321,13 +321,13 @@ describe("timeline", () => {
     store.saveRun(run);
     store.saveRun(run);
     store.saveRun({ ...run, node: { ...run.node, status: "done" } });
-    store.setActivity("r1", "agent", "active");
+    store.setActivity("r1", "agent", "busy");
     store.exitStaleSessions();
     expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
       ["run.added", { status: run.node.status, agent: run.node.agent }],
       ["run.changed", { status: "done" }],
-      ["activity", { from: null, to: "active" }],
-      ["session.ended", { from: "active", reason: "daemon restarted" }],
+      ["activity", { from: null, to: "busy" }],
+      ["session.ended", { from: "busy", reason: "daemon restarted" }],
     ]);
   });
 
@@ -353,5 +353,5 @@ describe("timeline", () => {
 
 
 it("keeps a signaled terminal active until its first idle hook instead of reusing startup idle",()=>{
- const s=openStore(data);try{s.saveRun(sessionRun(data));s.markLaunched("r1","agent",true);expect(s.loadRun("r1").node.activity).toBe("active");s.recordSignal("r1","agent","idle");expect(s.loadRun("r1").node.activity).toBe("idle");}finally{s.close();}
+ const s=openStore(data);try{s.saveRun(sessionRun(data));s.markLaunched("r1","agent",true);expect(s.loadRun("r1").node.activity).toBe("busy");s.recordSignal("r1","agent","idle");expect(s.loadRun("r1").node.activity).toBe("idle");}finally{s.close();}
 });

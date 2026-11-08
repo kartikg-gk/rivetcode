@@ -6,7 +6,7 @@ export const STATUSES = ["pending", "running", "done", "failed", "escalated"] as
 export const ROLES = ["worker", "orchestrator"] as const;
 
 // What an agent session is doing right now.
-export const ACTIVITY_STATES = ["active", "idle", "waiting_input", "blocked", "exited"] as const;
+export const ACTIVITY_STATES = ["busy", "idle", "asking", "approval", "ended"] as const;
 // Where a worker's pull request stands.
 export const PR_STATUSES = [
   "open", "draft", "checks-failing", "changes-wanted", "awaiting-review", "approved", "ready", "merged", "closed",

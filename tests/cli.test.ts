@@ -12,19 +12,19 @@ import { makeDataDir, removeRepo, sessionRun } from "./helpers.js";
 
 describe("deriveActivity (Claude Code)", () => {
   it.each([
-    ["user-prompt-submit", {}, "active"],
-    ["pre-tool-use", {}, "active"],
-    ["post-tool-use", {}, "active"],
-    ["post-tool-use-failure", {}, "active"],
-    ["permission-request", {}, "blocked"],
+    ["user-prompt-submit", {}, "busy"],
+    ["pre-tool-use", {}, "busy"],
+    ["post-tool-use", {}, "busy"],
+    ["post-tool-use-failure", {}, "busy"],
+    ["permission-request", {}, "approval"],
     ["stop", {}, "idle"],
     ["notification", { notification_type: "idle_prompt" }, "idle"],
     ["notification", { notification_type: "agent_completed" }, "idle"],
-    ["notification", { notification_type: "agent_needs_input" }, "waiting_input"],
-    ["notification", { notification_type: "permission_prompt" }, "blocked"],
+    ["notification", { notification_type: "agent_needs_input" }, "asking"],
+    ["notification", { notification_type: "permission_prompt" }, "approval"],
     ["notification", { notification_type: "other" }, null],
-    ["session-end", { reason: "logout" }, "exited"],
-    ["session-end", {}, "exited"],
+    ["session-end", { reason: "logout" }, "ended"],
+    ["session-end", {}, "ended"],
     ["session-end", { reason: "clear" }, null],
     ["session-end", { reason: "resume" }, null],
     ["session-start", {}, null],
@@ -88,7 +88,7 @@ describe("rivet hooks", () => {
       io({ RIVET_SESSION_ID: "r1-agent" }, JSON.stringify({ session_id: "conv-9" })));
     expect(code).toBe(0);
     expect(query("SELECT activity, agent_session_id FROM nodes WHERE run_id = 'r1' AND id = 'agent'")).toEqual([
-      { activity: "blocked", agent_session_id: "conv-9" },
+      { activity: "approval", agent_session_id: "conv-9" },
     ]);
   });
 
@@ -414,7 +414,7 @@ describe("status view", () => {
     const lines = renderRun(run, true, t0 + 250_000, true);
     expect(lines[0]).toBe("worker r1 (login): running  add login");
     expect(lines[1]).toMatch(/session r1-agent +claude +no signal for 4m10s +\[working 4m10s\] +\[agent running\] +\[started by r0-agent\]/);
-    const done = renderRun({ ...run, node: { ...run.node, status: "done", finishedAt: iso(100), activity: "exited" } }, false, t0 + 250_000);
+    const done = renderRun({ ...run, node: { ...run.node, status: "done", finishedAt: iso(100), activity: "ended" } }, false, t0 + 250_000);
     expect(done[1]).toMatch(/exited +\[took 1m40s\]/);
   });
 });

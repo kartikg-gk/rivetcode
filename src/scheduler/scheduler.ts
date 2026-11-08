@@ -311,7 +311,7 @@ export function createScheduler(d: SchedulerDeps) {
     const activity = (await load(runId)).node.activity;
     // Typed into a permission question, a message would answer it: nothing goes in until
     // the question is answered (rivet answer).
-    if (activity === "blocked") return;
+    if (activity === "approval") return;
     // A chat's host takes every message at once and keeps its mode: it steers the turn in
     // progress, waits for the next one, or stops the turn first.
     if (chats.has(sessionId)) {
@@ -324,9 +324,9 @@ export function createScheduler(d: SchedulerDeps) {
     }
     for (const m of queued) {
       // In order: a queued message waits for the agent to be idle, and so does what follows it.
-      if (m.mode === "queue" && activity !== "idle" && activity !== "waiting_input") return;
+      if (m.mode === "queue" && activity !== "idle" && activity !== "asking") return;
       try {
-        if (m.mode === "interrupt" && activity !== "idle" && activity !== "waiting_input") {
+        if (m.mode === "interrupt" && activity !== "idle" && activity !== "asking") {
           d.runtime.input(sessionId, "\x1b");
           await new Promise((r) => setTimeout(r, INTERRUPT_SETTLE_MS));
         }
@@ -372,12 +372,12 @@ export function createScheduler(d: SchedulerDeps) {
     const run = await load(runId);
     const session = sessionOf(run);
     if (!d.runtime.isAlive(session)) throw new SchedulerError(409, `run ${runId} is not running`);
-    if (run.node.activity !== "blocked") throw new SchedulerError(409, `run ${runId} is not waiting for a permission answer`);
+    if (run.node.activity !== "approval") throw new SchedulerError(409, `run ${runId} is not waiting for a permission answer`);
     if (chats.has(session)) {
       const control: Control = { type: "answer", choice, ...(note?.trim() ? { note: note.trim() } : {}) };
       await d.runtime.write(session, JSON.stringify(control));
       setPending(runId, null);
-      await d.write(() => d.store.setActivity(runId, NODE_ID, "active"));
+      await d.write(() => d.store.setActivity(runId, NODE_ID, "busy"));
       void deliverQueued(runId).catch(report);
       return;
     }
@@ -389,7 +389,7 @@ export function createScheduler(d: SchedulerDeps) {
       throw new SchedulerError(409, "only an agent in a terminal is asked for permission");
     }
     setPending(runId, null);
-    await d.write(() => d.store.setActivity(runId, NODE_ID, "active"));
+    await d.write(() => d.store.setActivity(runId, NODE_ID, "busy"));
     if (choice === "no" && note?.trim()) {
       await new Promise((r) => setTimeout(r, INTERRUPT_SETTLE_MS));
       await d.runtime.write(session, note.trim());
@@ -545,7 +545,7 @@ export function createScheduler(d: SchedulerDeps) {
       await partnerExited(runId, code);
       return;
     }
-    await d.write(() => d.store.setActivity(runId, NODE_ID, "exited"));
+    await d.write(() => d.store.setActivity(runId, NODE_ID, "ended"));
     if (waiter) {
       exitWaiters.delete(launchId);
       waiter(code);
@@ -1197,7 +1197,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
     // Switch agents between turns: stopping mid-turn can leave a git lock,
     // a half-done merge or a half-installed package behind.
-    const busy = () => d.runtime.isAlive(sessionOf(run)) && (run.node.activity === "active" || run.node.activity === "blocked");
+    const busy = () => d.runtime.isAlive(sessionOf(run)) && (run.node.activity === "busy" || run.node.activity === "approval");
     for (const end = Date.now() + waitMs; !now && busy(); run = await load(runId)) {
       if (Date.now() > end) throw new SchedulerError(409, `run ${runId} is still working; switch again when it is idle, or with --now to stop it mid-turn`);
       await new Promise((r) => setTimeout(r, 500));

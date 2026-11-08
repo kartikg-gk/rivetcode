@@ -6,7 +6,7 @@ import { Home } from "./Home";
 import { AskDialog, Palette, Screens } from "./Screens";
 import { ago, repoName, runLabel, useApp, useLive } from "./state";
 
-const DOT: Record<string, string> = { active: "bg-accent", blocked: "bg-warn", waiting_input: "bg-warn", idle: "bg-muted", exited: "bg-line" };
+const DOT: Record<string, string> = { busy: "bg-accent", approval: "bg-warn", asking: "bg-warn", idle: "bg-muted", ended: "bg-line" };
 
 const snoozed = (r: RunRow) => !!r.organization.snoozedUntil && Date.parse(r.organization.snoozedUntil) > Date.now();
 
@@ -103,7 +103,7 @@ export function App() {
   useEffect(() => { if (list.data) set({ runs: list.data.runs }); }, [list.data]);
   useEffect(() => onConnection(setOnline), []);
   useEffect(() => {
-    const count = list.data?.runs.filter(r=>!r.organization.archivedAt && (r.needsAnswer || r.activity === "blocked" || r.activity === "waiting_input" || r.organization.unread)).length ?? 0;
+    const count = list.data?.runs.filter(r=>!r.organization.archivedAt && (r.needsAnswer || r.activity === "approval" || r.activity === "asking" || r.organization.unread)).length ?? 0;
     document.title = count ? "("+count+") Rivet · needs attention" : "Rivet";
     const badge = navigator as Navigator & {setAppBadge?(count:number):Promise<void>;clearAppBadge?():Promise<void>};
     void (count ? badge.setAppBadge?.(count) : badge.clearAppBadge?.())?.catch(()=>{});

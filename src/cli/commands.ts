@@ -172,7 +172,7 @@ async function hooks(args: string[], io: CliIo): Promise<number> {
   }
   if (state === null && agentSessionId === undefined && timeline.length === 0) return 0;
   const launchId = io.env.RIVET_LAUNCH_ID?.trim();
-  const request = state === "blocked" || event === "permission-request" ? permissionRequestOf(payload) : undefined;
+  const request = state === "approval" || event === "permission-request" ? permissionRequestOf(payload) : undefined;
   try {
     await callDaemon(io.env, "POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/activity`, {
       ...(state ? { state } : {}),
@@ -294,7 +294,7 @@ async function follow(runId: string, activity: boolean, io: CliIo): Promise<numb
       open = null;
       after = i.position;
     }
-    const ended = page.run.status !== "running" || page.run.activity === "exited";
+    const ended = page.run.status !== "running" || page.run.activity === "ended";
     if (ended) {
       if (open) write("\n");
       break;
@@ -513,7 +513,7 @@ export function renderRun(run: Run, live: boolean, now: number, silent = false):
   const lines = [`${run.role} ${run.id}${label}: ${n.status}  ${run.task.split(/\r?\n/)[0]}`];
   const parts = [`  session ${run.id}-${n.id}`, n.agent];
   if (n.activity) {
-    const quiet = n.activity !== "active" && n.activity !== "exited" ? ` for ${ago(n.activityAt, now)}` : "";
+    const quiet = n.activity !== "busy" && n.activity !== "ended" ? ` for ${ago(n.activityAt, now)}` : "";
     parts.push(silent ? `no signal for ${ago(n.activityAt, now)}` : `${n.activity}${quiet}`);
   }
   const worked = elapsedMs(n, now);

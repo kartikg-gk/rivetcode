@@ -196,7 +196,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
 
     // A steer joins the turn in progress.
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "SLOW work", mode: "queue" });
-    await until("the slow turn", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "active");
+    await until("the slow turn", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "busy");
     const queued = await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also this", mode: "queue" });
     expect(queued.status).toBe(202);
     const promoted = await api("PATCH", `/api/v1/sessions/${runId}-agent/queue/${queued.json.id}`, { mode: "steer" });
@@ -205,7 +205,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
 
     // What it may not run waits for rivet answer; a no with a note becomes its next message.
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "ASK first", mode: "queue" });
-    const blocked = await until("the question", async () => { const r = (await api("GET", `/api/v1/runs/${runId}`)).json; return r.run.node.activity === "blocked" && r; });
+    const blocked = await until("the question", async () => { const r = (await api("GET", `/api/v1/runs/${runId}`)).json; return r.run.node.activity === "approval" && r; });
     expect(blocked.pendingRequest).toMatchObject({ detail: "npm publish" });
     expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "no", note: "do not publish" })).status).toBeLessThan(300);
     items = await until("the answered turn", async () => { const t = await timeline(runId); return said(t, "do not publish") && t; });
@@ -216,7 +216,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     // An interrupt stops the turn in progress and comes next.
     await until("idle again", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "SLOW long job", mode: "queue" });
-    await until("the long turn", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "active");
+    await until("the long turn", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "busy");
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "stop and do this", mode: "interrupt" });
     items = await until("the interrupting turn", async () => { const t = await timeline(runId); return said(t, "echo: stop and do this") && t; });
     const order = items.filter((i) => i.kind === "assistant").map((i) => i.text);
@@ -245,7 +245,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s 
     const runId=(await api("POST","/api/v1/runs",{repo,task:"initial",agent})).json.runId;
     await until("initial idle",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="idle" && (await timeline(runId)).some(i=>i.kind==="assistant" && !(i as Item & {streaming?:boolean}).streaming));
     await api("POST",`/api/v1/sessions/${runId}-agent/send`,{message:"SLOW final receipt marker",mode:"queue"});
-    await until("active final turn",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="active");
+    await until("active final turn",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="busy");
     expect((await api("POST","/api/v1/reports",{sessionId:`${runId}-agent`,kind:"done",message:"finished"})).status).toBeLessThan(300);
     await until("done",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.status==="done");
     const final=await timeline(runId);
@@ -257,7 +257,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s 
 
 
 it("escalates a timed-out completion without publishing or replaying consumed guidance",async()=>{
- process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"session.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("active",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="active");await api("POST","/api/v1/reports",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
+ process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"session.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("busy",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="busy");await api("POST","/api/v1/reports",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
 },30000);
 
 describe("a delta chat session", () => {

@@ -213,7 +213,7 @@ describe("an orchestrator", () => {
     const orchestrator = (await api("POST", "/api/v1/runs", { repo, task: JSON.stringify({ listen: true }), agent: "fake", role: "orchestrator" })).json.runId as string;
     const worker = await spawn({ stayFor: 60_000 }, { from: `${orchestrator}-agent` });
     await new Promise((r) => setTimeout(r, 300));
-    for (const state of ["blocked", "blocked"]) await api("POST", `/api/v1/sessions/${worker}-agent/activity`, { state });
+    for (const state of ["approval", "approval"]) await api("POST", `/api/v1/sessions/${worker}-agent/activity`, { state });
     await new Promise((r) => setTimeout(r, 400));
     const inbox = await readFile(join((await getRun(orchestrator)).node.worktree, "inbox.txt"), "utf8");
     expect(inbox.split(/\r?\n/).filter((l) => l.includes("is waiting for a permission answer"))).toHaveLength(1);
@@ -695,7 +695,7 @@ describe("switching a worker's agent", () => {
     const runId = await spawn({ stayFor: 60_000 });
     await new Promise((r) => setTimeout(r, 500));
     // Working, and asking a question: not switched without --now.
-    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "blocked", request: { tool: "Bash", detail: "npm publish" } });
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "approval", request: { tool: "Bash", detail: "npm publish" } });
     expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).json.error).toMatch(/still working.*--now/);
     // Its git was mid-command when stopped.
     const gitDir = (await git(["rev-parse", "--absolute-git-dir"], (await getRun(runId)).node.worktree)).trim();
@@ -713,7 +713,7 @@ describe("switching a worker's agent", () => {
     await start(undefined, { switchWaitMs: 5_000 });
     const runId = await spawn({ stayFor: 60_000 });
     await new Promise((r) => setTimeout(r, 500));
-    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active" });
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "busy" });
     const switching = api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" });
     await new Promise((r) => setTimeout(r, 300));
     await api("POST", "/api/v1/reports", { sessionId: `${runId}-agent`, kind: "done", message: "finished" });
@@ -749,7 +749,7 @@ describe("answering a permission question and send modes", () => {
 
   it("holds messages while the agent is blocked, shows the question, and answers it", async () => {
     const { runId, inbox } = await terminalWorker();
-    await activity(runId, "blocked", { tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
+    await activity(runId, "approval", { tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
     expect((await api("GET", `/api/v1/runs/${runId}`)).json.pendingRequest).toMatchObject({ tool: "PowerShell", detail: "Get-ChildItem | ForEach-Object { $_ }" });
     // Typed into the question, a message would answer it: it waits.
     expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also add docs" })).json.delivery).toBe("after-answer");
@@ -764,7 +764,7 @@ describe("answering a permission question and send modes", () => {
 
   it("queue waits for the agent to be idle; steer goes in at once", async () => {
     const { runId, inbox } = await terminalWorker();
-    await activity(runId, "active");
+    await activity(runId, "busy");
     expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "later please", mode: "queue" })).json.delivery).toBe("when-idle");
     expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "after that", mode: "steer" })).json.delivery).toBe("when-idle");
     expect(await inbox()).toBe("");
@@ -778,7 +778,7 @@ describe("answering a permission question and send modes", () => {
     await start();
     const runId = await spawn({ listen: true });
     await new Promise((r) => setTimeout(r, 300));
-    await activity(runId, "blocked");
+    await activity(runId, "approval");
     expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "yes" })).json.error).toMatch(/only an agent in a terminal/);
     await api("POST", `/api/v1/runs/${runId}/stop`, {});
   });
@@ -791,7 +791,7 @@ describe("reading a session's timeline", () => {
     await new Promise((r) => setTimeout(r, 300));
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "also add docs" });
     // What a hook reports: the same prompt again (skipped), a tool call, its result, the reply.
-    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active", timeline: [
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "busy", timeline: [
       { kind: "prompt", text: JSON.stringify({ listen: true }) },
       { kind: "tool", tool: "Bash", text: "npm test" }, { kind: "result", tool: "Bash", text: "ok" },
       { kind: "assistant", text: "x".repeat(30) }, { kind: "nonsense", text: "dropped" },
@@ -823,7 +823,7 @@ describe("reading a session's timeline", () => {
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "look at a.ts", agent: "claude" })).json.runId as string;
     await new Promise((r) => setTimeout(r, 200));
     // Its hooks report the same call: dropped, as the stream has it.
-    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "active", timeline: [{ kind: "tool", tool: "Read", text: "a.ts" }] });
+    await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "busy", timeline: [{ kind: "tool", tool: "Read", text: "a.ts" }] });
     await settled(runId);
     const items = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity`)).json.items as { kind: string; tool?: string; text: string }[];
     expect(items.filter((i) => i.kind !== "event").map((i) => [i.kind, i.tool ?? "", i.text])).toEqual([

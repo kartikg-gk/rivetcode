@@ -153,21 +153,21 @@ describe("daemon routes", () => {
 
   it("saves activity and an agent session id", async () => {
     const response = await post("/api/v1/sessions/r1-agent/activity", {
-      state: "blocked", agentSessionId: "agent-42",
+      state: "approval", agentSessionId: "agent-42",
     });
     expect(response.status).toBe(204);
     await daemon!.stop();
     daemon = undefined;
     const store = openStore(data);
     try {
-      expect(store.loadRun("r1").node).toMatchObject({ activity: "blocked", agentSessionId: "agent-42" });
+      expect(store.loadRun("r1").node).toMatchObject({ activity: "approval", agentSessionId: "agent-42" });
     } finally { store.close(); }
   });
 
   it("rejects invalid activity, session ids, and unknown sessions", async () => {
     expect((await post("/api/v1/sessions/r1-agent/activity", { state: "asleep" })).status).toBe(400);
-    expect((await post("/api/v1/sessions/bad/activity", { state: "active" })).status).toBe(400);
-    expect((await post("/api/v1/sessions/r1-missing/activity", { state: "active" })).status).toBe(404);
+    expect((await post("/api/v1/sessions/bad/activity", { state: "busy" })).status).toBe(400);
+    expect((await post("/api/v1/sessions/r1-missing/activity", { state: "busy" })).status).toBe(404);
   });
 
   it("stores reports without changing the session status", async () => {
@@ -299,9 +299,9 @@ it("notifies permission and question activity without including private request 
   seed();const notices:{title:string;body:string}[]=[];
   daemon=await startDaemon({data,runFile,port:0,notify:async n=>{notices.push(n);}});
   const wait=async(text:string)=>{const end=Date.now()+4000;while(!notices.some(n=>n.body.includes(text))&&Date.now()<end)await new Promise(r=>setTimeout(r,25));expect(notices.some(n=>n.body.includes(text))).toBe(true);};
-  expect((await post("/api/v1/sessions/r1-agent/activity",{state:"blocked",request:{tool:"Bash",detail:"private command"}})).status).toBe(204);
+  expect((await post("/api/v1/sessions/r1-agent/activity",{state:"approval",request:{tool:"Bash",detail:"private command"}})).status).toBe(204);
   await wait("Approval is requested");
-  expect((await post("/api/v1/sessions/r1-agent/activity",{state:"waiting_input"})).status).toBe(204);
+  expect((await post("/api/v1/sessions/r1-agent/activity",{state:"asking"})).status).toBe(204);
   await wait("An answer is requested");
   expect(JSON.stringify(notices)).not.toContain("private command");
 });

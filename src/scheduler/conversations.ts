@@ -6,7 +6,7 @@ export function stableHistory(store: Store, run: Run, at?: number): TimelineItem
   const candidates = page.items.filter((i) => i.kind === "assistant" && !i.streaming && (at === undefined || i.position === at));
   const anchor = candidates.reverse().find((i) => {
     if (i.position <= (store.inherited(run.id).at(-1)?.position ?? -1)) return true;
-    if (!i.turnId) return run.node.activity !== "active" && run.node.activity !== "blocked";
+    if (!i.turnId) return run.node.activity !== "busy" && run.node.activity !== "approval";
     try { return store.waitTurn(run.id, i.turnId)?.state === "completed"; } catch { return i.position <= (store.getFork(run.id)?.position ?? -1); }
   });
   if (!anchor) throw new Error("choose a completed assistant reply as the source position");

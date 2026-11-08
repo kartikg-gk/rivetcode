@@ -86,8 +86,8 @@ describe("codex adapter", () => {
   });
 
   it("maps codex hook events to activity", () => {
-    expect(deriveActivity("codex", "user-prompt-submit", {})).toBe("active");
-    expect(deriveActivity("codex", "permission-request", {})).toBe("waiting_input");
+    expect(deriveActivity("codex", "user-prompt-submit", {})).toBe("busy");
+    expect(deriveActivity("codex", "permission-request", {})).toBe("asking");
     expect(deriveActivity("codex", "stop", {})).toBe("idle");
     expect(deriveActivity("codex", "session-start", {})).toBeNull();
   });

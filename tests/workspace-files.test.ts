@@ -33,9 +33,9 @@ describe("workspace files", () => {
     await expect(readTextFile(root, "../secret.txt")).rejects.toThrow();
     await expect(readTextFile(root, ".git/config")).rejects.toThrow();
     await expect(readTextFile(root, "escape/secret.txt")).rejects.toThrow();
-    await expect(saveTextFile(root, "escape/new.txt", "blocked", null)).rejects.toThrow();
+    await expect(saveTextFile(root, "escape/new.txt", "approval", null)).rejects.toThrow();
     await mkdir(join(root,".git"));
     await symlink(join(root,".git"),join(root,"metadata"),process.platform === "win32" ? "junction" : "dir");
-    await expect(saveTextFile(root,"metadata/config","blocked",null)).rejects.toThrow("Git metadata");
+    await expect(saveTextFile(root,"metadata/config","approval",null)).rejects.toThrow("Git metadata");
   });
 });

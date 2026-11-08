@@ -10,21 +10,21 @@ function claudeCode(event: string, payload: Payload): ActivityState | null {
     case "pre-tool-use":
     case "post-tool-use":
     case "post-tool-use-failure":
-      return "active";
+      return "busy";
     case "permission-request":
-      return "blocked";
+      return "approval";
     case "stop":
       return "idle";
     case "notification":
       return ({
         idle_prompt: "idle",
         agent_completed: "idle",
-        agent_needs_input: "waiting_input",
-        permission_prompt: "blocked",
+        agent_needs_input: "asking",
+        permission_prompt: "approval",
       } as Record<string, ActivityState>)[String(payload.notification_type)] ?? null;
     case "session-end":
       // Clearing or resuming ends one conversation but not the agent.
-      return payload.reason === "clear" || payload.reason === "resume" ? null : "exited";
+      return payload.reason === "clear" || payload.reason === "resume" ? null : "ended";
     default:
       return null;
   }
@@ -32,7 +32,7 @@ function claudeCode(event: string, payload: Payload): ActivityState | null {
 
 // Codex hooks: a prompt starts work, a permission prompt waits on the user, stop is idle.
 function codex(event: string): ActivityState | null {
-  return ({ "user-prompt-submit": "active", "permission-request": "waiting_input", stop: "idle" } as Record<string, ActivityState>)[event] ?? null;
+  return ({ "user-prompt-submit": "busy", "permission-request": "asking", stop: "idle" } as Record<string, ActivityState>)[event] ?? null;
 }
 
 const BY_AGENT: Record<string, (event: string, payload: Payload) => ActivityState | null> = {

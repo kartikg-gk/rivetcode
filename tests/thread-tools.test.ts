@@ -167,9 +167,9 @@ describe("completion waits", () => {
       return { status: "running", live: true, turn: { id: "t1", state: calls > 1 ? "completed" : "running" }, pendingRequest: { tool: "shell", detail: "approval" } };
     }, { scope: "turn", timeoutMs: 1000 }, signal());
     expect(result.timedOut).toBe(false);
-    expect(await waitForRun(async () => ({ status: "running", live: false, activity: "exited" }), { scope: "turn", timeoutMs: 100 }, signal())).toMatchObject({ timedOut: false });
+    expect(await waitForRun(async () => ({ status: "running", live: false, activity: "ended" }), { scope: "turn", timeoutMs: 100 }, signal())).toMatchObject({ timedOut: false });
     const abort = new AbortController();
-    const waiting = waitForRun(async () => ({ status: "running", live: true, activity: "active" }), { scope: "task", timeoutMs: 60000 }, abort.signal);
+    const waiting = waitForRun(async () => ({ status: "running", live: true, activity: "busy" }), { scope: "task", timeoutMs: 60000 }, abort.signal);
     abort.abort(); await expect(waiting).rejects.toThrow();
   });
 });
@@ -257,7 +257,7 @@ describe("conversation recovery and branch lifecycle", () => {
     const child=forkConversation(s,"r1",{});
     expect(s.loadRun(child.runId).spec).toEqual(source.spec);
     s.detachFork(child.runId);
-    expect(s.loadRun(child.runId).node).toMatchObject({status:"escalated",activity:"exited"});
+    expect(s.loadRun(child.runId).node).toMatchObject({status:"escalated",activity:"ended"});
     expect(s.loadRun(child.runId).node.finishedAt).toBeTruthy();
     s.pruneTimeline("proj","2099-01-01T00:00:00.000Z");
     expect(s.inherited(child.runId)).toEqual([]);

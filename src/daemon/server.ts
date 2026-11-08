@@ -296,7 +296,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const run = store.loadRun(id), node = run.node;
         const request = scheduler.pendingRequest(id);
         const secret = secrets.pending(sessionIdOf(id,NODE_ID));
-        const state = secret ? "secret:"+secret.id : request ? "approval:"+request.at : node.activity === "blocked" ? "approval:"+node.activityAt : node.activity === "waiting_input" ? "question:"+node.activityAt : ["done","escalated"].includes(node.status) ? node.status+":"+node.attempts : "";
+        const state = secret ? "secret:"+secret.id : request ? "approval:"+request.at : node.activity === "approval" ? "approval:"+node.activityAt : node.activity === "asking" ? "question:"+node.activityAt : ["done","escalated"].includes(node.status) ? node.status+":"+node.attempts : "";
         const previous = store.lifecycleState(id,"desktop-notice");
         const seen = {...previous.reactions};
         const numbers = new Set([store.getPr(id)?.number,...store.linkedPrs(id).map(pr=>pr.number)]);
@@ -314,7 +314,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         store.saveLifecycleState(id,"desktop-notice",{state,reactions:seen});
         if (!state) continue;
         store.organizeRun(id,{unread:true});
-        const reason = secret ? "A secret is requested" : request || node.activity === "blocked" ? "Approval is requested" : node.activity === "waiting_input" ? "An answer is requested" : node.status === "done" ? "Task finished" : "Task needs attention";
+        const reason = secret ? "A secret is requested" : request || node.activity === "approval" ? "Approval is requested" : node.activity === "asking" ? "An answer is requested" : node.status === "done" ? "Task finished" : "Task needs attention";
         result.push({title:"Rivet",body:id+": "+reason+". Open Rivet to review."});
       }
       return result;
@@ -572,17 +572,17 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         }
         throw new HttpError(400, "state or agentSessionId is required");
       }
-      const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
+      const before = state === "approval" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       const found = await write(() => store.recordSignal(runId, nodeId, state, agentSessionId));
       if (!found) throw new HttpError(404, "unknown session");
       // What a permission question asks, when the hook says; forgotten once the agent moves on.
-      if (state === "blocked") {
+      if (state === "approval") {
         const request = payload.request as { tool?: unknown; detail?: unknown } | undefined;
         if (request && typeof request.tool === "string") {
           scheduler.setPending(runId, { tool: request.tool.slice(0, 100), detail: typeof request.detail === "string" ? request.detail.slice(0, 500) : "" });
         }
       } else if (state !== null) scheduler.setPending(runId, null);
-      if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
+      if (state === "approval" && before !== "approval") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
       if (payload.turnEnded === true && state === "idle" && launchId !== undefined) {
         reply(res, 204);
         void scheduler.terminalTurnEnded(runId, launchId).then(() => {
@@ -591,7 +591,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       // An agent that went idle can take what was queued for it.
-      if (state === "idle" || state === "waiting_input") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
+      if (state === "idle" || state === "asking") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
     }
@@ -743,11 +743,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 204);
         return;
       }
-      const before = state === "blocked" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
+      const before = state === "approval" ? await write(() => store.loadRun(runId).node.activity).catch(() => undefined) : undefined;
       await write(() => store.recordSignal(runId, nodeId, state));
       if (outcome.question) scheduler.setPending(runId, { tool: outcome.question.tool.slice(0, 100), detail: outcome.question.detail.slice(0, 500) });
-      else if (state !== "blocked") scheduler.setPending(runId, null);
-      if (state === "blocked" && before !== "blocked") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
+      else if (state !== "approval") scheduler.setPending(runId, null);
+      if (state === "approval" && before !== "approval") void scheduler.onBlocked(runId).catch((e) => opts.onError?.(e));
       if (state === "idle") void scheduler.deliver(runId).catch((e) => opts.onError?.(e));
       reply(res, 204);
       return;
@@ -929,7 +929,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         await scheduler.deliver(runId);
         const left = await write(() => store.undeliveredMessages(runId, nodeId).some((m) => m.id === id));
         const activity = await write(() => store.loadRun(runId).node.activity);
-        delivery = !left ? (mode === "interrupt" ? "interrupted" : "now") : activity === "blocked" ? "after-answer" : "when-idle";
+        delivery = !left ? (mode === "interrupt" ? "interrupted" : "now") : activity === "approval" ? "after-answer" : "when-idle";
       } else if (runtime.isAlive(target)) {
         delivery = mode === "interrupt" && (await scheduler.interruptHeadless(runId)) ? "interrupted" : "turn-end";
       } else delivery = "next-launch";
@@ -1229,7 +1229,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const source = await write(()=>store.loadRun(id));
       if ((await write(()=>store.getFork(id)))?.detached) throw new HttpError(409,"fork is detached");
       if (source.node.sessionMode !== "chat") throw new HttpError(409,"conversation editing requires chat mode");
-      if (["active","blocked"].includes(source.node.activity ?? "")) throw new HttpError(409,"wait for the active turn or answer its permission request first");
+      if (["busy","approval"].includes(source.node.activity ?? "")) throw new HttpError(409,"wait for the active turn or answer its permission request first");
       if ((await write(()=>store.undeliveredMessages(id,NODE_ID))).length) throw new HttpError(409,"settle pending messages before changing conversation branches");
       const history = await write(()=>store.readChat(id,{limit:5001}).items);
       if (history.length > 5000) throw new HttpError(409,"conversation exceeds the branch snapshot limit");
@@ -1599,7 +1599,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         try {
         if ((await write(() => store.readChat(run.id, { limit: 1 }))).total > 5000) throw new HttpError(409, "history exceeds the handoff context limit");
         const payload = await body(req);
-        if (!run.sharedWorkspace || ["active", "blocked"].includes(run.node.activity ?? "")) {
+        if (!run.sharedWorkspace || ["busy", "approval"].includes(run.node.activity ?? "")) {
           throw new HttpError(409, "handoff requires a shared fork with a settled turn");
         }
         await scheduler.stopRun(run.id);

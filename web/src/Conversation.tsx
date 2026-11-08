@@ -406,7 +406,7 @@ export function Conversation({ id }: { id: string }) {
             {side === "management" && d && <ThreadManagement detail={d} />}
             {side === "details" && d && <>
               <Details d={d} />
-              {d.run.sharedWorkspace && !["active", "blocked"].includes(d.run.node.activity ?? "") && !d.fork?.detached && (
+              {d.run.sharedWorkspace && !["busy", "approval"].includes(d.run.node.activity ?? "") && !d.fork?.detached && (
                 <button className="btn" onClick={() => void act(() => api("POST", runPath(id, "/move-to-worktree"), {}), "Moved to a new worktree")}>
                   Move to a new worktree
                 </button>

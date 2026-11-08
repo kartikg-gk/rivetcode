@@ -777,7 +777,7 @@ export function openStore(data: string): Store {
     started_at = COALESCE(started_at, ?) WHERE run_id = ? AND id = ?`);
   const selectConversations = db.prepare(`SELECT node_id, agent, conversation_id FROM conversations
     WHERE run_id = ? ORDER BY seen_at, node_id`);
-  const updateStale = db.prepare("UPDATE nodes SET activity = 'exited' WHERE activity IS NOT NULL AND activity <> 'exited'");
+  const updateStale = db.prepare("UPDATE nodes SET activity = 'ended' WHERE activity IS NOT NULL AND activity <> 'ended'");
 
   function forkRecord(runId: string): ForkRecord | undefined {
     const row = db.prepare("SELECT data_json FROM thread_forks WHERE run_id = ?").get(runId) as { data_json: string } | undefined;
@@ -807,7 +807,7 @@ export function openStore(data: string): Store {
   const insertEvent = db.prepare("INSERT INTO events (run_id, node_id, type, data, at) VALUES (?, ?, ?, ?, ?)");
   const selectActivity = db.prepare("SELECT activity FROM nodes WHERE run_id = ? AND id = ?");
   const selectStatus = db.prepare("SELECT status FROM nodes WHERE run_id = ? AND id = ?");
-  const selectStale = db.prepare("SELECT run_id, id, activity FROM nodes WHERE activity IS NOT NULL AND activity <> 'exited'");
+  const selectStale = db.prepare("SELECT run_id, id, activity FROM nodes WHERE activity IS NOT NULL AND activity <> 'ended'");
   // Written in the same call as the change it records; a failure to log never fails the change.
   function logEvent(runId: string, nodeId: string | null, type: string, data: Record<string, unknown> = {}): void {
     try { insertEvent.run(runId, nodeId, type, JSON.stringify(data), new Date().toISOString()); } catch { /* run gone */ }
@@ -939,7 +939,7 @@ export function openStore(data: string): Store {
 
     markLaunched(runId, nodeId, active = false) {
       const now = new Date().toISOString();
-      updateLaunched.run(active ? "active" : "idle", now, now, runId, nodeId);
+      updateLaunched.run(active ? "busy" : "idle", now, now, runId, nodeId);
       logEvent(runId, nodeId, "launched");
     },
 
@@ -1202,7 +1202,7 @@ export function openStore(data: string): Store {
       if (!fork) return;
       if (fork.detached) return;
       fork.detached = true;
-      db.prepare("UPDATE nodes SET status = CASE WHEN status IN ('pending', 'running') THEN 'escalated' ELSE status END, finished_at = coalesce(finished_at, ?), activity = 'exited' WHERE run_id = ?")
+      db.prepare("UPDATE nodes SET status = CASE WHEN status IN ('pending', 'running') THEN 'escalated' ELSE status END, finished_at = coalesce(finished_at, ?), activity = 'ended' WHERE run_id = ?")
         .run(new Date().toISOString(), runId);
       db.prepare("UPDATE thread_forks SET data_json = ? WHERE run_id = ?").run(JSON.stringify(fork), runId);
       logEvent(runId, NODE_ID, "conversation.detached");
@@ -1378,7 +1378,7 @@ export function openStore(data: string): Store {
               const agent = (db.prepare("SELECT agent FROM nodes WHERE run_id = ? AND id = ?").get(runId, NODE_ID) as { agent: string } | undefined)?.agent ?? "";
               if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent, provider_conversation_id) VALUES (?, ?, ?, 'running', ?, ?, ?, (SELECT provider_conversation_id FROM nodes WHERE run_id = ? AND id = 'agent'))")
                 .run(randomBytes(8).toString("hex"), c, e.turnId, now, now, agent, runId);
-              out.activity = "active";
+              out.activity = "busy";
             } else {
               if (id) db.prepare("UPDATE chat_turns SET state = ?, error_message = ?, completed_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
               out.activity = "idle";
@@ -1436,11 +1436,11 @@ export function openStore(data: string): Store {
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.kind, e.status, summary, detail,
                 e.requestId ?? "", e.requestId ? "" : e.itemId ?? "", now, now);
             if (e.kind === "approval" && e.status === "pending") {
-              out.activity = "blocked";
+              out.activity = "approval";
               out.question = { tool: e.tool ?? "tool", detail: summary.replace(/^[^:]*: /, ""), requestId: e.requestId ?? "" };
             } else if (e.kind === "approval" && e.status === "resolved") {
               out.question = null;
-              out.activity = "active";
+              out.activity = "busy";
             }
           }
         }
