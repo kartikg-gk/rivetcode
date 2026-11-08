@@ -267,7 +267,7 @@ describe("ending the run after the merge", () => {
     await writeFile(join(run.node.worktree, "notes.txt"), "not committed");
     merge();
     const after = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("closed"));
-    expect(after.pr!.handled).toBe("terminated; kept agent");
+    expect(after.pr!.handled).toBe("closed; kept agent");
     expect(existsSync(join(run.node.worktree, "notes.txt"))).toBe(true);
   });
 

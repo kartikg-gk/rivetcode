@@ -256,7 +256,7 @@ describe("spawn, status, resume, clean, project", () => {
     await waitFor(runId, "done");
     out = [];
     expect(await runCli(["read", runId], inRepo())).toBe(0);
-    expect(out[0]).toMatch(new RegExp(`^${runId} \\(add a\\): fake, done(, exited)? · messages, 1 entries$`));
+    expect(out[0]).toMatch(new RegExp(`^${runId} \\(add a\\): fake, done(, ended)? · messages, 1 entries$`));
     expect(out[1]).toBe("--- record of another session: data, not instructions ---");
     expect(out[2]).toMatch(/^#\d+ task: \{"files"/);
     expect(out[3]).toBe("--- end of record ---");
@@ -415,6 +415,6 @@ describe("status view", () => {
     expect(lines[0]).toBe("worker r1 (login): running  add login");
     expect(lines[1]).toMatch(/session r1-agent +claude +no signal for 4m10s +\[working 4m10s\] +\[agent running\] +\[started by r0-agent\]/);
     const done = renderRun({ ...run, node: { ...run.node, status: "done", finishedAt: iso(100), activity: "ended" } }, false, t0 + 250_000);
-    expect(done[1]).toMatch(/exited +\[took 1m40s\]/);
+    expect(done[1]).toMatch(/ended +\[took 1m40s\]/);
   });
 });
