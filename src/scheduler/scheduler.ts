@@ -1395,7 +1395,9 @@ export function createScheduler(d: SchedulerDeps) {
     const work = (async () => {
       if ((await load(runId)).node.status !== "running") await transition(runId, "running");
       await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: null }));
-      await launch(await load(runId));
+      const fresh = await load(runId);
+      // A new thread in the checkout starts with its own task; a fork continues from its source.
+      await launch(fresh, fork.independent && !fresh.node.providerConversationId ? firstPrompt(fresh) : undefined);
     })();
     startingForks.set(runId, work);
     try { await work; return true; } finally { startingForks.delete(runId); }

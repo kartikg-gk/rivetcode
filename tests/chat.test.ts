@@ -293,3 +293,16 @@ describe("Rivet's own tools in a delta session", () => {
     await until("the reply", async () => said(await timeline(runId), "tool said: {"));
   }, 30_000);
 });
+
+describe("a new thread in the same checkout", () => {
+  it("starts with its own task", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "first", agent: "claude" })).json.runId as string;
+    await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
+    const thread = (await api("POST", `/api/v1/runs/${runId}/threads`, { tasks: [{ task: "count the tests" }] })).json.threads[0].runId as string;
+    await api("POST", `/api/v1/sessions/${thread}-agent/send`, { message: "go", mode: "queue" });
+    await until("the thread's task", async () => (await timeline(thread)).some((i) => (i.kind === "prompt" || i.kind === "message") && i.text.includes("count the tests")));
+  }, 30_000);
+});
