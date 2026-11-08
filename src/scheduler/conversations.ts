@@ -7,7 +7,7 @@ export function stableHistory(store: Store, run: Run, at?: number): TimelineItem
   const anchor = candidates.reverse().find((i) => {
     if (i.position <= (store.inherited(run.id).at(-1)?.position ?? -1)) return true;
     if (!i.turnId) return run.node.activity !== "busy" && run.node.activity !== "approval";
-    try { return store.waitTurn(run.id, i.turnId)?.state === "completed"; } catch { return i.position <= (store.getFork(run.id)?.position ?? -1); }
+    try { return store.waitTurn(run.id, i.turnId)?.state === "done"; } catch { return i.position <= (store.getFork(run.id)?.position ?? -1); }
   });
   if (!anchor) throw new Error("choose a completed assistant reply as the source position");
   return page.items.filter((i) => i.position <= anchor.position);

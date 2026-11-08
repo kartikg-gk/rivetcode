@@ -35,9 +35,9 @@ function checkEntries(raw: unknown): TimelineEntry[] {
     .slice(0, 50);
 }
 // What a chat host reports, checked field by field; anything else is dropped.
-const CHAT_KINDS = ["command", "file_change", "plan", "reasoning", "approval", "usage", "error", "system"];
-const CHAT_STATUSES = ["running", "completed", "failed", "pending", "resolved"];
-const TURN_STATES = ["running", "completed", "interrupted", "failed"];
+const CHAT_KINDS = ["shell", "edit", "plan", "thinking", "question", "tokens", "problem", "note"];
+const CHAT_STATUSES = ["working", "done", "failed", "waiting", "answered"];
+const TURN_STATES = ["working", "done", "stopped", "failed"];
 const CHAT_TEXT_LIMIT = 100_000;
 function checkChatEvents(raw: unknown): ChatEvent[] {
   if (!Array.isArray(raw)) return [];
@@ -48,7 +48,7 @@ function checkChatEvents(raw: unknown): ChatEvent[] {
     if (!e || typeof e !== "object") continue;
     if (e.type === "conversation" && str(e.id)) out.push({ type: "conversation", id: (e.id as string).slice(0, 200), ...(["native", "reconstructed"].includes(e.forkStrategy as string) ? { forkStrategy: e.forkStrategy as "native" | "reconstructed" } : {}) });
     else if (e.type === "turn" && str(e.turnId) && TURN_STATES.includes(e.state as string)) {
-      out.push({ type: "turn", turnId: e.turnId as string, state: e.state as "running", ...(str(e.error) ? { error: cut(e.error as string) } : {}) });
+      out.push({ type: "turn", turnId: e.turnId as string, state: e.state as "working", ...(str(e.error) ? { error: cut(e.error as string) } : {}) });
     } else if (e.type === "message" && str(e.itemId) && str(e.text) && (e.role === "user" || e.role === "assistant")) {
       out.push({ type: "message", itemId: e.itemId as string, role: e.role, text: cut(e.text as string), ...(str(e.turnId) ? { turnId: e.turnId as string } : {}), ...(e.streaming === true ? { streaming: true } : {}) });
     } else if(e.type==="history"){
@@ -62,7 +62,7 @@ function checkChatEvents(raw: unknown): ChatEvent[] {
       out.push({ type: "usage", mode: e.mode, ...Object.fromEntries(fields.filter((f) => n(e[f])).map((f) => [f, e[f] as number])) });
     } else if (e.type === "activity" && CHAT_KINDS.includes(e.kind as string) && CHAT_STATUSES.includes(e.status as string) && str(e.summary)) {
       out.push({
-        type: "activity", kind: e.kind as "command", status: e.status as "running", summary: cut(e.summary as string),
+        type: "activity", kind: e.kind as "shell", status: e.status as "working", summary: cut(e.summary as string),
         ...(str(e.itemId) ? { itemId: e.itemId as string } : {}), ...(str(e.requestId) ? { requestId: e.requestId as string } : {}),
         ...(str(e.tool) ? { tool: (e.tool as string).slice(0, 100) } : {}), ...(str(e.output) ? { output: cut(e.output as string) } : {}),
         ...(str(e.turnId) ? { turnId: e.turnId as string } : {}),
@@ -723,12 +723,12 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           if (event.type !== "activity" || !event.itemId?.startsWith("child-")) continue;
           const id = event.itemId.slice(6);
           if (!id || id.length > 256) continue;
-          observed.children.set(id, { id, label: event.summary, status: event.status, canCancel: event.status === "running" && event.summary.includes("stop available") });
+          observed.children.set(id, { id, label: event.summary, status: event.status, canCancel: event.status === "working" && event.summary.includes("stop available") });
         }
       }
       const outcome = await write(() => store.recordChat(runId, nodeId, events, batchId ? { id: batchId, accepted: accepted as number[] } : undefined));
       // A finished turn is something new to read.
-      if (nodeId === NODE_ID && payload.replay !== true && events.some((e) => e.type === "turn" && e.state !== "running")) await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
+      if (nodeId === NODE_ID && payload.replay !== true && events.some((e) => e.type === "turn" && e.state !== "working")) await write(() => store.organizeRun(runId, { unread: true })).catch(() => {});
       const raw = Array.isArray(payload.raw) ? (payload.raw as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 2000).map((l) => l.slice(0, 64 * 1024)) : [];
       if (raw.length) await write(() => store.recordProviderLines(runId, nodeId, raw));
       if (payload.replay === true) {
@@ -876,7 +876,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         if (payload.mode === "steer") {
           if (nodeId !== NODE_ID || !runtime.takesInput(sessionIdOf(runId, nodeId))) throw new HttpError(409, "this session cannot accept steering");
           if (branchChanges.has(runId)) throw new HttpError(409, "conversation branch is changing");
-          if (!(await write(() => store.promoteQueued(runId, nodeId, id)))) throw new HttpError(409, "that message is no longer queued");
+          if (!(await write(() => store.promoteQueued(runId, nodeId, id)))) throw new HttpError(409, "that message has already gone out");
           await scheduler.deliver(runId, id);
           reply(res, 200, { id, mode: "steer" });
           return;
@@ -1737,7 +1737,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
               store.completeWait(subscription.id,`Wait ended for run ${run.id}: the selected turn moved to an archived conversation branch. Read branch history for details.`);
               ready.add(subscription.caller);continue;
             }
-            const turnDone = turn && !["running","queued"].includes(turn.state) && (!runtime.isAlive(sessionIdOf(run.id,NODE_ID)) || !!run.node.firstSignalAt);
+            const turnDone = turn && turn.state !== "working" && (!runtime.isAlive(sessionIdOf(run.id,NODE_ID)) || !!run.node.firstSignalAt);
             if (taskDone || (subscription.scope === "turn" && turnDone)) {
               store.completeWait(subscription.id,`Wait completed for run ${run.id}: ${subscription.scope === "task" ? run.node.status : turn?.state ?? run.node.status}. Read its history for details.`);
               ready.add(subscription.caller);

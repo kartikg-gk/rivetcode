@@ -20,10 +20,10 @@ afterEach(async () => { await daemon?.stop(); daemon = undefined; store?.close()
 beforeAll(() => { execFileSync(process.execPath, [fileURLToPath(new URL("../node_modules/typescript/bin/tsc", import.meta.url)), "-p", "tsconfig.build.json"], { cwd: fileURLToPath(new URL("..", import.meta.url)) }); }, 120000);
 function exchange(s: Store, id: string, turn: string, text: string) {
   s.recordChat(id, "agent", [
-    { type: "turn", turnId: turn, state: "running" },
+    { type: "turn", turnId: turn, state: "working" },
     { type: "message", itemId: `${turn}-u`, role: "user", text: `question ${text}`, turnId: turn },
     { type: "message", itemId: `${turn}-a`, role: "assistant", text, turnId: turn },
-    { type: "turn", turnId: turn, state: "completed" },
+    { type: "turn", turnId: turn, state: "done" },
   ]);
 }
 async function seed() {
@@ -151,20 +151,20 @@ describe("durable conversation lineage", () => {
 describe("completion waits", () => {
   const signal = () => new AbortController().signal;
   it("returns already completed work immediately, and distinguishes turn from task", async () => {
-    const read = async (): Promise<WaitSnapshot> => ({ status: "running", activity: "idle", live: true, turn: { id: "t1", state: "completed" } });
+    const read = async (): Promise<WaitSnapshot> => ({ status: "running", activity: "idle", live: true, turn: { id: "t1", state: "done" } });
     expect(await waitForRun(read, { scope: "turn", timeoutMs: 0 }, signal())).toMatchObject({ timedOut: false, turnId: "t1" });
     expect(await waitForRun(read, { scope: "task", timeoutMs: 0 }, signal())).toMatchObject({ timedOut: true });
   });
   it("waits for startup instead of returning the preceding completed turn", async () => {
     let calls = 0;
-    const result = await waitForRun(async () => ({ status: "running", live: true, pending: ++calls === 1, turn: { id: calls === 1 ? "old" : "new", state: "completed" } }), { scope: "turn", timeoutMs: 1000 }, signal());
+    const result = await waitForRun(async () => ({ status: "running", live: true, pending: ++calls === 1, turn: { id: calls === 1 ? "old" : "new", state: "done" } }), { scope: "turn", timeoutMs: 1000 }, signal());
     expect(result).toMatchObject({ turnId: "new", timedOut: false });
   });
   it("pins the selected turn, handles input requests, completion, restart and cancellation", async () => {
     let calls = 0;
     const result = await waitForRun(async (turn) => {
       calls++; if (calls > 1) expect(turn).toBe("t1");
-      return { status: "running", live: true, turn: { id: "t1", state: calls > 1 ? "completed" : "running" }, pendingRequest: { tool: "shell", detail: "approval" } };
+      return { status: "running", live: true, turn: { id: "t1", state: calls > 1 ? "done" : "working" }, pendingRequest: { tool: "shell", detail: "approval" } };
     }, { scope: "turn", timeoutMs: 1000 }, signal());
     expect(result.timedOut).toBe(false);
     expect(await waitForRun(async () => ({ status: "running", live: false, activity: "ended" }), { scope: "turn", timeoutMs: 100 }, signal())).toMatchObject({ timedOut: false });
@@ -223,7 +223,7 @@ it("exposes lazy forks, search, wait and carry-back through daemon and CLI, prot
   const end = Date.now() + 15000;
   while (true) {
     const r = await api("GET", `/runs/${child}/wait?scope=turn&timeoutMs=1000`);
-    if (r.value.turn?.state === "completed") break;
+    if (r.value.turn?.state === "done") break;
     if (Date.now() > end) throw new Error("fork did not finish its first turn");
   }
   expect((await api("GET", `/runs/${child}`)).value.fork.strategy).toBe("native");
@@ -343,7 +343,7 @@ it("reconciles native history on resume without duplicating user prompts or fina
   const items=s.readChat("r1",{limit:100}).items;
   expect(items.filter(i=>i.text==="recover me")).toHaveLength(1);
   expect(items.filter(i=>i.text==="recovered answer")).toHaveLength(1);
-  expect(s.waitTurn("r1","recovered-turn")?.state).toBe("completed");
+  expect(s.waitTurn("r1","recovered-turn")?.state).toBe("done");
 });
 
 it("keeps repeated live user prompts as separate messages",async()=>{

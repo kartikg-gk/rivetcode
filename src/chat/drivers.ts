@@ -11,12 +11,13 @@ import { connect, RpcError, type Rpc } from "./rpc.js";
 
 // What a conversation reports, the same for every agent. Rivet keeps it in its
 // conversation tables and derives the session's activity from it.
-export type ActivityKind = "command" | "file_change" | "plan" | "reasoning" | "approval" | "usage" | "error" | "system";
-export type ActivityStatus = "running" | "completed" | "failed" | "pending" | "resolved";
+export type ActivityKind = "shell" | "edit" | "plan" | "thinking" | "question" | "tokens" | "problem" | "note";
+export type ActivityStatus = "working" | "done" | "failed" | "waiting" | "answered";
+export type TurnState = "working" | "done" | "stopped" | "failed";
 export type ChatEvent =
   | { type: "conversation"; id: string; forkStrategy?: "native" | "reconstructed" }
   | { type: "history"; providerId:string; items:{role:"user"|"assistant";text:string}[] }
-  | { type: "turn"; turnId: string; state: "running" | "completed" | "interrupted" | "failed"; error?: string }
+  | { type: "turn"; turnId: string; state: TurnState; error?: string }
   // streaming: the text so far of a reply still being written; the same item comes again,
   // longer, until a last time without it.
   | { type: "message"; itemId: string; role: "user" | "assistant"; text: string; turnId?: string; streaming?: boolean }
@@ -162,8 +163,8 @@ export function claudeChat(o: ChatOptions): ChatDriver {
         const childState = state === undefined ? previous?.state ?? "unknown" : state?.state ?? "unknown";
         const canCancel = capabilities === undefined ? previous?.canCancel ?? false : !!capabilities?.cancel;
         children.set(id, { canCancel, state: childState });
-        o.emit({ type: "activity", kind: "system", itemId: "child-" + id,
-          status: childState === "idle" ? "completed" : "running",
+        o.emit({ type: "activity", kind: "note", itemId: "child-" + id,
+          status: childState === "idle" ? "done" : "working",
           summary: `Claude sub-agent ${id}: ${childState}${canCancel ? " (stop available while active)" : ""}` });
         return;
       }
@@ -198,7 +199,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       flush();
       if (kind === "plan") {
         const entries = Array.isArray(u.entries) ? (u.entries as { content?: string; status?: string }[]) : [];
-        o.emit({ type: "activity", itemId: `plan-${activeTurn}`, kind: "plan", status: "completed", summary: entries.map((e) => `[${e.status ?? ""}] ${e.content ?? ""}`).join("\n"), turnId: activeTurn });
+        o.emit({ type: "activity", itemId: `plan-${activeTurn}`, kind: "plan", status: "done", summary: entries.map((e) => `[${e.status ?? ""}] ${e.content ?? ""}`).join("\n"), turnId: activeTurn });
         return;
       }
       const id = `${identity}:${text(u.toolCallId)}`;
@@ -209,8 +210,8 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       if (input && Object.keys(input).length) known.summary = describeTool(input);
       else if (!known.summary && typeof u.title === "string") known.summary = u.title;
       tools.set(id, known);
-      const status = u.status === "completed" ? "completed" : u.status === "failed" ? "failed" : "running";
-      const toolKind = u.kind === "edit" || u.kind === "delete" || u.kind === "move" ? "file_change" : u.kind === "think" ? "reasoning" : "command";
+      const status = u.status === "completed" ? "done" : u.status === "failed" ? "failed" : "working";
+      const toolKind = u.kind === "edit" || u.kind === "delete" || u.kind === "move" ? "edit" : u.kind === "think" ? "thinking" : "shell";
       const output = text(u.rawOutput).trim();
       o.emit({
         type: "activity", itemId: id, kind: toolKind, status, summary: known.summary, tool: known.tool, turnId: activeTurn,
@@ -232,7 +233,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
       const approval: Approval = { requestId, tool, detail: describeTool(input), ...(typeof input.command === "string" ? { command: input.command } : {}) };
       const auto = o.decide(approval);
       if (auto) { answer(requestId, auto); return; }
-      o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
+      o.emit({ type: "activity", requestId, kind: "question", status: "waiting", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
     },
   }, { jsonrpc: true });
   if (o.raw) rpc.onLine(o.raw);
@@ -284,7 +285,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
     async prompt(said) {
       if (o.fork && !o.resume && !nativeFork && turn === 0) said = o.fork.context + "\n\n" + said;
       activeTurn = `${identity}:t${++turn}`;
-      o.emit({ type: "turn", turnId: activeTurn, state: "running" });
+      o.emit({ type: "turn", turnId: activeTurn, state: "working" });
       try {
         const r = await rpc.call("session/prompt", { sessionId, prompt: [{ type: "text", text: said }, ...nativeImages(said, o.env).map(image => ({ type: "image", mimeType: image.mimeType, data: image.data }))] });
         flush();
@@ -293,7 +294,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
         if (num(u.totalTokens) !== undefined) {
           o.emit({ type: "usage", mode: "add", input: num(u.inputTokens) ?? 0, output: num(u.outputTokens) ?? 0, cached: (num(u.cachedReadTokens) ?? 0) + (num(u.cachedWriteTokens) ?? 0), total: num(u.totalTokens)! });
         }
-        o.emit({ type: "turn", turnId: activeTurn, state: r.stopReason === "cancelled" ? "interrupted" : "completed" });
+        o.emit({ type: "turn", turnId: activeTurn, state: r.stopReason === "cancelled" ? "stopped" : "done" });
       } catch (e) {
         flush();
         o.emit({ type: "turn", turnId: activeTurn, state: "failed", error: (e as Error).message });
@@ -360,7 +361,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
         return;
       case "mcpToolCall": {
         const tool = `mcp:${text(it.server)}/${text(it.tool)}`;
-        o.emit({ type: "activity", itemId: id, kind: "command", status: !done ? "running" : it.error || it.status === "failed" ? "failed" : "completed", summary: tool, tool, turnId,
+        o.emit({ type: "activity", itemId: id, kind: "shell", status: !done ? "working" : it.error || it.status === "failed" ? "failed" : "done", summary: tool, tool, turnId,
           ...(done ? { output: text(it.error ?? it.result).slice(0, RESULT_LIMIT) } : {}) });
         return;
       }
@@ -368,19 +369,19 @@ export function codexChat(o: ChatOptions): ChatDriver {
         const actions = Array.isArray(it.commandActions) ? (it.commandActions as { command?: string }[]) : [];
         const summary = actions.map((a) => a.command).filter(Boolean).join(" && ") || text(it.command);
         const output = text(it.aggregatedOutput).trim();
-        const status = !done ? "running" : it.status === "completed" ? "completed" : "failed";
-        o.emit({ type: "activity", itemId: id, kind: "command", status, summary, tool: "shell", turnId, ...(output ? { output: output.slice(0, RESULT_LIMIT) } : {}) });
+        const status = !done ? "working" : it.status === "completed" ? "done" : "failed";
+        o.emit({ type: "activity", itemId: id, kind: "shell", status, summary, tool: "shell", turnId, ...(output ? { output: output.slice(0, RESULT_LIMIT) } : {}) });
         return;
       }
       case "fileChange": {
         const changes = Array.isArray(it.changes) ? (it.changes as { path?: string; kind?: unknown }[]) : [];
         const summary = changes.map((c) => `${typeof c.kind === "string" ? c.kind : text((c.kind as { type?: string } | undefined)?.type) || "change"} ${c.path ?? ""}`.trim()).join(", ") || "files changed";
-        o.emit({ type: "activity", itemId: id, kind: "file_change", status: !done ? "running" : it.status === "failed" ? "failed" : "completed", summary, tool: "edit", turnId });
+        o.emit({ type: "activity", itemId: id, kind: "edit", status: !done ? "working" : it.status === "failed" ? "failed" : "done", summary, tool: "edit", turnId });
         return;
       }
       case "reasoning": {
         const summary = (Array.isArray(it.summary) ? (it.summary as unknown[]) : []).map(text).join("\n").trim();
-        if (done && summary) o.emit({ type: "activity", itemId: id, kind: "reasoning", status: "completed", summary, turnId });
+        if (done && summary) o.emit({ type: "activity", itemId: id, kind: "thinking", status: "done", summary, turnId });
         return;
       }
       default:
@@ -409,17 +410,17 @@ export function codexChat(o: ChatOptions): ChatDriver {
       }
       else if (method === "turn/started") {
         activeTurn = turnId;
-        o.emit({ type: "turn", turnId, state: "running" });
+        o.emit({ type: "turn", turnId, state: "working" });
       } else if (method === "turn/completed") {
         const t = (params.turn ?? {}) as { status?: string; error?: { message?: string } | null };
-        const state = t.status === "interrupted" ? "interrupted" : t.status === "failed" ? "failed" : "completed";
+        const state = t.status === "interrupted" ? "stopped" : t.status === "failed" ? "failed" : "done";
         o.emit({ type: "turn", turnId, state, ...(t.error?.message ? { error: t.error.message } : {}) });
         finished.add(turnId);
         if (turnId === activeTurn) activeTurn = "";
         turnEnded?.();
       } else if (method === "serverRequest/resolved") {
         const requestId = text(params.requestId);
-        if (questions.delete(requestId)) o.emit({ type: "activity", requestId, kind: "approval", status: "resolved", summary: "answered", turnId });
+        if (questions.delete(requestId)) o.emit({ type: "activity", requestId, kind: "question", status: "answered", summary: "answered", turnId });
       }
     },
     request(method, params, id) {
@@ -436,7 +437,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
       const detail = command ?? (text(params.reason) || "file changes");
       const auto = o.decide({ requestId, tool, detail, ...(command !== undefined ? { command } : {}) });
       if (auto) { answer(requestId, auto); return; }
-      o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${detail}`, tool, turnId: text(params.turnId) || activeTurn });
+      o.emit({ type: "activity", requestId, kind: "question", status: "waiting", summary: `${tool}: ${detail}`, tool, turnId: text(params.turnId) || activeTurn });
     },
   }, { jsonrpc: false });
   if (o.raw) rpc.onLine(o.raw);
@@ -458,7 +459,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
     for (const turn of thread.turns) {
       if (excluded.has(turn.id) || !["completed","interrupted","failed"].includes(turn.status)) continue;
       if (!Array.isArray(turn.items)) continue;
-      o.emit({type:"turn",turnId:turn.id,state:"running"});
+      o.emit({type:"turn",turnId:turn.id,state:"working"});
       for (const entry of turn.items) {
         if (entry.type === "userMessage") {
           const content = Array.isArray(entry.content) ? entry.content as {text?:string}[] : [];
@@ -466,7 +467,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
           if (text) o.emit({type:"message",itemId:String(entry.id),role:"user",text,turnId:turn.id});
         } else item(entry,true,turn.id);
       }
-      o.emit({type:"turn",turnId:turn.id,state:turn.status as "completed"|"interrupted"|"failed"});
+      o.emit({type:"turn",turnId:turn.id,state:turn.status==="interrupted"?"stopped":turn.status==="failed"?"failed":"done"});
     }
   }
   return {
@@ -493,7 +494,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
       threadId = text((r.thread as { id?: string } | undefined)?.id) || o.resume || "";
       if (forkStrategy === "native" && (!threadId || threadId === o.fork?.providerId)) throw new Error("provider fork returned no independent thread id");
       o.emit({ type: "conversation", id: threadId, ...(forkStrategy ? { forkStrategy } : {}) });
-      if (o.resume) await refresh().catch((e: Error) => o.emit({type:"activity",kind:"system",status:"failed",summary:`Provider history refresh unavailable: ${e.message}`}));
+      if (o.resume) await refresh().catch((e: Error) => o.emit({type:"activity",kind:"note",status:"failed",summary:`Provider history refresh unavailable: ${e.message}`}));
     },
     async prompt(said) {
       if (firstForkPrompt && forkStrategy === "reconstructed" && o.fork) said = o.fork.context + "\n\n" + said;
@@ -503,7 +504,7 @@ export function codexChat(o: ChatOptions): ChatDriver {
       try {
         const r = await rpc.call("turn/start", { threadId, input: [{ type: "text", text: said }, ...nativeImages(said, o.env).map(image => ({ type: "image", url: `data:${image.mimeType};base64,${image.data}` }))] });
         id = text((r.turn as { id?: string } | undefined)?.id);
-        if (id && !activeTurn && !finished.has(id)) { activeTurn = id; o.emit({ type: "turn", turnId: id, state: "running" }); }
+        if (id && !activeTurn && !finished.has(id)) { activeTurn = id; o.emit({ type: "turn", turnId: id, state: "working" }); }
       } catch (e) {
         o.emit({ type: "turn", turnId: activeTurn || "start", state: "failed", error: (e as Error).message });
         return;
@@ -616,7 +617,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
         const tool = text(e.toolName);
         const done = e.type === "tool_execution_end";
         const result = done ? segments((e.result ?? {}) as Record<string, unknown>).filter((c) => c.type === "text").map((c) => text(c.text)).join("") : "";
-        o.emit({ type: "activity", itemId: text(e.toolCallId), kind: DELTA_EDITS.has(tool) ? "file_change" : "command", status: !done ? "running" : e.isError ? "failed" : "completed",
+        o.emit({ type: "activity", itemId: text(e.toolCallId), kind: DELTA_EDITS.has(tool) ? "edit" : "shell", status: !done ? "working" : e.isError ? "failed" : "done",
           summary: done ? tool : describeTool(e.args), tool, turnId: activeTurn, ...(result ? { output: result.slice(0, RESULT_LIMIT) } : {}) });
         return;
       }
@@ -628,7 +629,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
         const approval: Approval = { requestId, tool, detail: Object.keys(input).length ? describeTool(input) : text(e.preview), ...(typeof input.command === "string" ? { command: input.command } : {}) };
         const auto = always.has(tool) || (o.permission === "edits" && DELTA_EDITS.has(tool)) ? "yes" : o.decide(approval);
         if (auto) { answer(requestId, auto); return; }
-        o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
+        o.emit({ type: "activity", requestId, kind: "question", status: "waiting", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
         return;
       }
       case "host_tool_call": {
@@ -640,11 +641,11 @@ export function deltaChat(o: ChatOptions): ChatDriver {
       }
       case "approval_resolved":
         // Delta lets a question expire; one Rivet answered was removed when it did.
-        if (questions.delete(text(e.approvalId))) o.emit({ type: "activity", requestId: text(e.approvalId), kind: "approval", status: "resolved", summary: "expired", turnId: activeTurn });
+        if (questions.delete(text(e.approvalId))) o.emit({ type: "activity", requestId: text(e.approvalId), kind: "question", status: "answered", summary: "expired", turnId: activeTurn });
         return;
       case "agent_settled": {
         const outcome = text(e.outcome);
-        o.emit({ type: "turn", turnId: activeTurn, state: outcome === "completed" ? "completed" : outcome === "cancelled" ? "interrupted" : "failed", ...(e.error ? { error: text(e.error) } : {}) });
+        o.emit({ type: "turn", turnId: activeTurn, state: outcome === "completed" ? "done" : outcome === "cancelled" ? "stopped" : "failed", ...(e.error ? { error: text(e.error) } : {}) });
         activeTurn = "";
         void send("get_session_stats").then((st) => {
           const c = ((st ?? {}) as Record<string, unknown>).contextUsage as Record<string, unknown> | undefined;
@@ -676,7 +677,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
     },
     async prompt(message) {
       activeTurn = `turn-${++turns}`;
-      o.emit({ type: "turn", turnId: activeTurn, state: "running" });
+      o.emit({ type: "turn", turnId: activeTurn, state: "working" });
       const ended = new Promise<void>((resolve) => { settled = resolve; });
       try { await send("prompt", { message }); }
       catch (e) { o.emit({ type: "turn", turnId: activeTurn, state: "failed", error: (e as Error).message }); activeTurn = ""; return; }

@@ -473,7 +473,7 @@ CREATE TABLE chat_receipts (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE C
 ` });
 
 MIGRATIONS.push({ version: 22, sql: `
-ALTER TABLE chat_turns ADD COLUMN agent_chat_id TEXT NOT NULL DEFAULT '';
+SELECT 1;
 ` });
 
 MIGRATIONS.push({ version: 21, sql: `
@@ -522,48 +522,48 @@ CREATE TABLE context_transfers (
 ` });
 // Which agent ran each chat turn, so a handoff credits every answer to the agent that gave it.
 MIGRATIONS.push({ version: 18, sql: `
-ALTER TABLE chat_turns ADD COLUMN agent TEXT NOT NULL DEFAULT '';
+SELECT 1;
 ` });
 
 MIGRATIONS.push({ version: 17, sql: `
 ALTER TABLE nodes ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'terminal' CHECK (run_mode IN ('terminal', 'chat'));
 ALTER TABLE nodes ADD COLUMN agent_chat_id TEXT NOT NULL DEFAULT '';
-CREATE TABLE chat_conversations (
+-- One agent conversation of a run's session, with Rivet's counters for it.
+CREATE TABLE chat_sessions (
   id TEXT PRIMARY KEY,
-  scope TEXT NOT NULL CHECK (scope IN ('session', 'project')),
-  project TEXT NOT NULL,
-  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
-  session TEXT,
-  latest_sequence INTEGER NOT NULL DEFAULT 0,
-  -- Token use and how full the context is, as the agent last said.
-  context_used INTEGER,
-  context_window INTEGER,
-  usage_input_tokens INTEGER,
-  usage_output_tokens INTEGER,
-  usage_cached_tokens INTEGER,
-  usage_total_tokens INTEGER,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  session TEXT NOT NULL,
+  -- Where the next entry of its log goes.
+  next_position INTEGER NOT NULL DEFAULT 1,
+  -- Tokens and context, as the agent last reported them.
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  tokens_cached INTEGER,
+  tokens_total INTEGER,
+  context_filled INTEGER,
+  context_size INTEGER,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  CHECK ((scope = 'session' AND run_id IS NOT NULL AND session IS NOT NULL) OR (scope = 'project' AND run_id IS NULL))
+  UNIQUE (run_id, session)
 );
-CREATE UNIQUE INDEX chat_conversations_session ON chat_conversations (run_id, session) WHERE run_id IS NOT NULL;
+-- One prompt and the work it led to. ended_as stays empty while the agent works on it.
 CREATE TABLE chat_turns (
   id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
-  provider_turn_id TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'interrupted', 'failed')),
-  error_message TEXT NOT NULL DEFAULT '',
-  requested_at TEXT NOT NULL,
-  started_at TEXT,
-  completed_at TEXT
+  chat_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  agent TEXT NOT NULL DEFAULT '',
+  agent_turn TEXT NOT NULL DEFAULT '',
+  agent_chat_id TEXT NOT NULL DEFAULT '',
+  began_at TEXT NOT NULL,
+  ended_at TEXT,
+  ended_as TEXT CHECK (ended_as IN ('done', 'stopped', 'failed')),
+  problem TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX chat_turns_conversation ON chat_turns (conversation_id, requested_at);
-CREATE UNIQUE INDEX chat_turns_provider ON chat_turns (conversation_id, provider_turn_id) WHERE provider_turn_id <> '';
+CREATE UNIQUE INDEX chat_turns_by_agent ON chat_turns (chat_id, agent_turn) WHERE agent_turn <> '';
 -- A conversation's log, in the order things happened. A row is either something said
 -- (said_by set) or something done: a command, an edit, a question (step set).
 CREATE TABLE chat_log (
   id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
   position INTEGER NOT NULL,
   turn_id TEXT REFERENCES chat_turns(id) ON DELETE SET NULL,
   said_by TEXT CHECK (said_by IN ('user', 'assistant')),
@@ -578,24 +578,22 @@ CREATE TABLE chat_log (
   question_key TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE (conversation_id, position),
+  UNIQUE (chat_id, position),
   CHECK ((said_by IS NULL) <> (step IS NULL))
 );
-CREATE UNIQUE INDEX chat_log_said ON chat_log (conversation_id, item_key) WHERE step IS NULL AND item_key <> '';
-CREATE UNIQUE INDEX chat_log_done ON chat_log (conversation_id, item_key) WHERE step IS NOT NULL AND item_key <> '';
-CREATE UNIQUE INDEX chat_log_question ON chat_log (conversation_id, question_key) WHERE question_key <> '';
+CREATE UNIQUE INDEX chat_log_said ON chat_log (chat_id, item_key) WHERE step IS NULL AND item_key <> '';
+CREATE UNIQUE INDEX chat_log_done ON chat_log (chat_id, item_key) WHERE step IS NOT NULL AND item_key <> '';
+CREATE UNIQUE INDEX chat_log_question ON chat_log (chat_id, question_key) WHERE question_key <> '';
 -- Every line the agent wrote, as it came: the evidence when Rivet's reading of it is wrong.
 -- Never shown as the conversation and never given back to an agent.
-CREATE TABLE chat_provider_events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
-  provider_event_id TEXT NOT NULL DEFAULT '',
-  method TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  received_at TEXT NOT NULL
+CREATE TABLE chat_raw (
+  position INTEGER PRIMARY KEY,
+  chat_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  line TEXT NOT NULL,
+  seen_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX chat_provider_events_dedupe ON chat_provider_events (conversation_id, provider_event_id) WHERE provider_event_id <> '';
-CREATE INDEX chat_provider_events_replay ON chat_provider_events (conversation_id, id);
+CREATE INDEX chat_raw_by_chat ON chat_raw (chat_id, position);
 ` });
 
 // Every change to a run's state, in order, kept beside the tables that hold its current state.
@@ -1086,7 +1084,7 @@ export function openStore(data: string): Store {
             AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id
               AND (n.finished_at IS NULL OR n.finished_at >= ? OR n.status IN ('pending', 'running'))))`)
         .run(project, before);
-      db.prepare(`DELETE FROM chat_conversations WHERE run_id IN (
+      db.prepare(`DELETE FROM chat_sessions WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
           AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
@@ -1117,12 +1115,12 @@ export function openStore(data: string): Store {
           current = branches(runId).find(b=>b.active)!;
         }
         db.prepare("UPDATE conversation_branches SET snapshot=?,provider=?,agent=?,active=0 WHERE id=?").run(JSON.stringify(history),node.provider,node.agent,current.id);
-        db.prepare("UPDATE chat_conversations SET session=? WHERE run_id=? AND session='agent'").run('branch-'+current.id,runId);
+        db.prepare("UPDATE chat_sessions SET session=? WHERE run_id=? AND session='agent'").run('branch-'+current.id,runId);
         const id = target?.id ?? randomBytes(8).toString("hex");
         if (target) {
           if (target.agent !== node.agent) throw new RunStoreError("switch to the branch's provider before restoring it");
           db.prepare("UPDATE conversation_branches SET active=1 WHERE id=?").run(id);
-          db.prepare("UPDATE chat_conversations SET session='agent' WHERE run_id=? AND session=?").run(runId,'branch-'+id);
+          db.prepare("UPDATE chat_sessions SET session='agent' WHERE run_id=? AND session=?").run(runId,'branch-'+id);
         } else db.prepare("INSERT INTO conversation_branches(id,run_id,parent,items,snapshot,provider,agent,active) VALUES (?,?,?,?,?,?,?,1)").run(id,runId,current.id,JSON.stringify(prefix),JSON.stringify(prefix),'',node.agent);
         db.prepare("UPDATE nodes SET agent_chat_id=?,status='running',finished_at=NULL,activity='idle' WHERE run_id=? AND id='agent'").run(target?.provider ?? '',runId);
         if(!target)db.prepare("UPDATE conversation_branches SET strategy='pending' WHERE id=?").run(id);
@@ -1240,10 +1238,10 @@ export function openStore(data: string): Store {
       } catch (e) { db.exec("ROLLBACK TO store_write; RELEASE store_write"); throw e; }
     },
     waitTurn(runId, turn) {
-      const row = db.prepare(`SELECT t.provider_turn_id AS id, t.state FROM chat_turns t
-        JOIN chat_conversations c ON c.id = t.conversation_id
-        WHERE c.run_id = ? AND c.session = 'agent' ${turn ? 'AND t.provider_turn_id = ?' : ''}
-        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1`).get(runId, ...(turn ? [turn] : [])) as { id: string; state: string } | undefined;
+      const row = db.prepare(`SELECT t.agent_turn AS id, coalesce(t.ended_as, 'working') AS state FROM chat_turns t
+        JOIN chat_sessions c ON c.id = t.chat_id
+        WHERE c.run_id = ? AND c.session = 'agent' ${turn ? 'AND t.agent_turn = ?' : ''}
+        ORDER BY t.began_at DESC, t.rowid DESC LIMIT 1`).get(runId, ...(turn ? [turn] : [])) as { id: string; state: string } | undefined;
       if (turn && !row) throw new RunStoreError(`unknown turn ${turn}`);
       return row;
     },
@@ -1278,7 +1276,7 @@ export function openStore(data: string): Store {
           AND (@project IS NULL OR r.project=@project)
         UNION ALL
         SELECT r.id, r.project, r.name, m.said_by, m.body, m.position, m.created_at, NULL, 'live', 1
-        FROM chat_log m JOIN chat_conversations c ON c.id=m.conversation_id JOIN runs r ON r.id=c.run_id
+        FROM chat_log m JOIN chat_sessions c ON c.id=m.chat_id JOIN runs r ON r.id=c.run_id
         WHERE c.session='agent' AND m.step IS NULL AND m.progress='final' AND instr(lower(m.body),@query)>0
           ${messageFilter} AND (@project IS NULL OR r.project=@project)
         UNION ALL
@@ -1336,24 +1334,24 @@ export function openStore(data: string): Store {
       const out: ChatOutcome = {};
       db.exec("SAVEPOINT store_write");
       try {
-        let conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
+        let conv = db.prepare("SELECT id FROM chat_sessions WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
         if (!conv) {
           conv = { id: randomBytes(8).toString("hex") };
-          db.prepare("INSERT INTO chat_conversations (id, scope, project, run_id, session, created_at, updated_at) VALUES (?, 'session', ?, ?, ?, ?, ?)")
-            .run(conv.id, run.project, runId, session, now, now);
+          db.prepare("INSERT INTO chat_sessions (id, run_id, session, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+            .run(conv.id, runId, session, now, now);
         }
         const c = conv.id;
         const inheritedMax = prefixFor(runId).at(-1)?.position ?? 0;
-        db.prepare("UPDATE chat_conversations SET latest_sequence = max(latest_sequence, ?) WHERE id = ?").run(inheritedMax, c);
-        const nextSeq = () => Number((db.prepare("UPDATE chat_conversations SET latest_sequence = latest_sequence + 1, updated_at = ? WHERE id = ? RETURNING latest_sequence")
-          .get(now, c) as { latest_sequence: number }).latest_sequence);
+        db.prepare("UPDATE chat_sessions SET next_position = max(next_position, ?) WHERE id = ?").run(inheritedMax + 1, c);
+        const nextSeq = () => Number((db.prepare("UPDATE chat_sessions SET next_position = next_position + 1, updated_at = ? WHERE id = ? RETURNING next_position - 1 AS position")
+          .get(now, c) as { position: number }).position);
         const turnRow = (providerTurnId?: string) => providerTurnId
-          ? (db.prepare("SELECT id FROM chat_turns WHERE conversation_id = ? AND provider_turn_id = ?").get(c, providerTurnId) as { id: string } | undefined)?.id ?? null
+          ? (db.prepare("SELECT id FROM chat_turns WHERE chat_id = ? AND agent_turn = ?").get(c, providerTurnId) as { id: string } | undefined)?.id ?? null
           : null;
         // State the partial-index predicate explicitly: SQLite cannot infer that a
         // bound provider item id is nonempty, otherwise large imports scan each prefix.
-        const namedMessage = db.prepare("SELECT id FROM chat_log WHERE conversation_id=? AND step IS NULL AND item_key=? AND item_key<>''");
-        const emptyMessage = db.prepare("SELECT id FROM chat_log WHERE conversation_id=? AND step IS NULL AND item_key=''");
+        const namedMessage = db.prepare("SELECT id FROM chat_log WHERE chat_id=? AND step IS NULL AND item_key=? AND item_key<>''");
+        const emptyMessage = db.prepare("SELECT id FROM chat_log WHERE chat_id=? AND step IS NULL AND item_key=''");
         const messageRow = (itemId: string) => (itemId ? namedMessage.get(c, itemId) : emptyMessage.get(c)) as { id: string } | undefined;
         for (const e of events) {
           if (e.type === "conversation") {
@@ -1374,19 +1372,19 @@ export function openStore(data: string): Store {
             }
           } else if (e.type === "turn") {
             const id = turnRow(e.turnId);
-            if (e.state === "running") {
+            if (e.state === "working") {
               const agent = (db.prepare("SELECT agent FROM nodes WHERE run_id = ? AND id = ?").get(runId, NODE_ID) as { agent: string } | undefined)?.agent ?? "";
-              if (!id) db.prepare("INSERT INTO chat_turns (id, conversation_id, provider_turn_id, state, requested_at, started_at, agent, agent_chat_id) VALUES (?, ?, ?, 'running', ?, ?, ?, (SELECT agent_chat_id FROM nodes WHERE run_id = ? AND id = 'agent'))")
-                .run(randomBytes(8).toString("hex"), c, e.turnId, now, now, agent, runId);
+              if (!id) db.prepare("INSERT INTO chat_turns (id, chat_id, agent_turn, began_at, agent, agent_chat_id) VALUES (?, ?, ?, ?, ?, (SELECT agent_chat_id FROM nodes WHERE run_id = ? AND id = 'agent'))")
+                .run(randomBytes(8).toString("hex"), c, e.turnId, now, agent, runId);
               out.activity = "busy";
             } else {
-              if (id) db.prepare("UPDATE chat_turns SET state = ?, error_message = ?, completed_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
+              if (id) db.prepare("UPDATE chat_turns SET ended_as = ?, problem = ?, ended_at = ? WHERE id = ?").run(e.state, e.error ?? "", now, id);
               out.activity = "idle";
             }
           } else if (e.type === "message") {
             let text = redact(e.text);
             if (e.role === "user" && !e.itemId.startsWith("rivet-") && !messageRow(e.itemId)) {
-              const hostPrompts = db.prepare("SELECT id,body AS text FROM chat_log WHERE conversation_id=? AND said_by='user' AND item_key LIKE 'rivet-%' ORDER BY position").all(c) as {id:string;text:string}[];
+              const hostPrompts = db.prepare("SELECT id,body AS text FROM chat_log WHERE chat_id=? AND said_by='user' AND item_key LIKE 'rivet-%' ORDER BY position").all(c) as {id:string;text:string}[];
               const host = hostPrompts.find(p=>text === p.text || text.endsWith("\n\n"+p.text));
               if (host) {
                 db.prepare("UPDATE chat_log SET item_key=?,turn_id=? WHERE id=?").run(e.itemId,turnRow(e.turnId),host.id);
@@ -1396,10 +1394,10 @@ export function openStore(data: string): Store {
             const found = messageRow(e.itemId);
             const progress = e.streaming ? "writing" : "final";
             if (found) db.prepare("UPDATE chat_log SET body = ?, progress = ?, updated_at = ? WHERE id = ?").run(text, progress, now, found.id);
-            else db.prepare(`INSERT INTO chat_log (id, conversation_id, turn_id, position, said_by, body, progress, item_key, created_at, updated_at)
+            else db.prepare(`INSERT INTO chat_log (id, chat_id, turn_id, position, said_by, body, progress, item_key, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.role, text, progress, e.itemId, now, now);
           } else if(e.type==="history") {
-            const existing=db.prepare("SELECT id,said_by AS role,body AS text,progress='writing' AS streaming,item_key AS providerId FROM chat_log WHERE conversation_id=? AND step IS NULL ORDER BY position").all(c) as {id:string;role:string;text:string;streaming:number;providerId:string}[];
+            const existing=db.prepare("SELECT id,said_by AS role,body AS text,progress='writing' AS streaming,item_key AS providerId FROM chat_log WHERE chat_id=? AND step IS NULL ORDER BY position").all(c) as {id:string;role:string;text:string;streaming:number;providerId:string}[];
             const used=new Set<string>();
             for(const [index,item] of e.items.entries()){
               const whole=redact(item.text);
@@ -1411,7 +1409,7 @@ export function openStore(data: string): Store {
                 if(matched.streaming)db.prepare("UPDATE chat_log SET body=?,progress='final',updated_at=? WHERE id=?").run(whole,now,matched.id);
               }else{
                 const id=randomBytes(8).toString("hex");
-                db.prepare("INSERT INTO chat_log(id,conversation_id,position,said_by,body,progress,item_key,created_at,updated_at) VALUES (?,?,?,?,?,'final',?,?,?)").run(id,c,nextSeq(),item.role,whole,providerId,now,now);
+                db.prepare("INSERT INTO chat_log(id,chat_id,position,said_by,body,progress,item_key,created_at,updated_at) VALUES (?,?,?,?,?,'final',?,?,?)").run(id,c,nextSeq(),item.role,whole,providerId,now,now);
                 existing.push({id,role:item.role,text:whole,streaming:0,providerId});used.add(id);
               }
             }
@@ -1421,24 +1419,24 @@ export function openStore(data: string): Store {
             // add: one turn's use on top of the totals; set: the agent's own totals. Context
             // figures are always the latest.
             const op = (col: string, v: number | undefined) => v === undefined ? "" : e.mode === "add" ? `${col} = COALESCE(${col}, 0) + ${Math.round(v)}` : `${col} = ${Math.round(v)}`;
-            const sets = [op("usage_input_tokens", e.input), op("usage_output_tokens", e.output), op("usage_cached_tokens", e.cached), op("usage_total_tokens", e.total),
-              e.contextUsed !== undefined ? `context_used = ${Math.round(e.contextUsed)}` : "", e.contextWindow !== undefined ? `context_window = ${Math.round(e.contextWindow)}` : ""].filter(Boolean);
-            if (sets.length) db.prepare(`UPDATE chat_conversations SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`).run(now, c);
+            const sets = [op("tokens_in", e.input), op("tokens_out", e.output), op("tokens_cached", e.cached), op("tokens_total", e.total),
+              e.contextUsed !== undefined ? `context_filled = ${Math.round(e.contextUsed)}` : "", e.contextWindow !== undefined ? `context_size = ${Math.round(e.contextWindow)}` : ""].filter(Boolean);
+            if (sets.length) db.prepare(`UPDATE chat_sessions SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`).run(now, c);
           } else {
             const key = e.requestId ? "question_key" : "item_key";
             const keyValue = e.requestId ?? e.itemId ?? "";
             const detail = e.output !== undefined || e.tool !== undefined ? JSON.stringify({ ...(e.tool ? { tool: e.tool } : {}), ...(e.output !== undefined ? { output: redact(e.output) } : {}) }) : "";
-            const found = keyValue ? db.prepare(`SELECT id, body AS summary FROM chat_log WHERE conversation_id = ? AND step IS NOT NULL AND ${key} = ?`).get(c, keyValue) as { id: string; summary: string } | undefined : undefined;
+            const found = keyValue ? db.prepare(`SELECT id, body AS summary FROM chat_log WHERE chat_id = ? AND step IS NOT NULL AND ${key} = ?`).get(c, keyValue) as { id: string; summary: string } | undefined : undefined;
             const summary = redact(e.summary);
             if (found) db.prepare("UPDATE chat_log SET progress = ?, body = ?, details = CASE WHEN ? = '' THEN details ELSE ? END, updated_at = ? WHERE id = ?")
-              .run(e.status, e.kind === "approval" && e.status === "resolved" ? `${found.summary} (${summary})` : summary || found.summary, detail, detail, now, found.id);
-            else db.prepare(`INSERT INTO chat_log (id, conversation_id, turn_id, position, step, progress, body, details, question_key, item_key, created_at, updated_at)
+              .run(e.status, e.kind === "question" && e.status === "answered" ? `${found.summary} (${summary})` : summary || found.summary, detail, detail, now, found.id);
+            else db.prepare(`INSERT INTO chat_log (id, chat_id, turn_id, position, step, progress, body, details, question_key, item_key, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomBytes(8).toString("hex"), c, turnRow(e.turnId), nextSeq(), e.kind, e.status, summary, detail,
                 e.requestId ?? "", e.requestId ? "" : e.itemId ?? "", now, now);
-            if (e.kind === "approval" && e.status === "pending") {
+            if (e.kind === "question" && e.status === "waiting") {
               out.activity = "approval";
               out.question = { tool: e.tool ?? "tool", detail: summary.replace(/^[^:]*: /, ""), requestId: e.requestId ?? "" };
-            } else if (e.kind === "approval" && e.status === "resolved") {
+            } else if (e.kind === "question" && e.status === "answered") {
               out.question = null;
               out.activity = "busy";
             }
@@ -1457,14 +1455,14 @@ export function openStore(data: string): Store {
     },
 
     lastTurnError(runId) {
-      const r = db.prepare(`SELECT t.state, t.error_message AS error FROM chat_turns t JOIN chat_conversations c ON c.id = t.conversation_id
+      const r = db.prepare(`SELECT t.ended_as AS state, t.problem AS error FROM chat_turns t JOIN chat_sessions c ON c.id = t.chat_id
         WHERE c.run_id = ? AND c.session = ? ORDER BY t.rowid DESC LIMIT 1`).get(runId, NODE_ID) as { state: string; error: string } | undefined;
       return r?.state === "failed" && r.error ? r.error : null;
     },
 
     chatUsage(runId, session = NODE_ID) {
-      const r = db.prepare(`SELECT usage_input_tokens AS input, usage_output_tokens AS output, usage_cached_tokens AS cached, usage_total_tokens AS total,
-        context_used AS used, context_window AS window FROM chat_conversations WHERE run_id = ? AND session = ?`).get(runId, session) as
+      const r = db.prepare(`SELECT tokens_in AS input, tokens_out AS output, tokens_cached AS cached, tokens_total AS total,
+        context_filled AS used, context_size AS window FROM chat_sessions WHERE run_id = ? AND session = ?`).get(runId, session) as
         { input: number | null; output: number | null; cached: number | null; total: number | null; used: number | null; window: number | null } | undefined;
       if (!r || (r.total === null && r.used === null)) return null;
       return { input: Number(r.input ?? 0), output: Number(r.output ?? 0), cached: Number(r.cached ?? 0), total: Number(r.total ?? 0),
@@ -1472,9 +1470,9 @@ export function openStore(data: string): Store {
     },
 
     recordProviderLines(runId, session, lines) {
-      const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
+      const conv = db.prepare("SELECT id FROM chat_sessions WHERE run_id = ? AND session = ?").get(runId, session) as { id: string } | undefined;
       if (!conv) return 0;
-      const insert = db.prepare("INSERT OR IGNORE INTO chat_provider_events (conversation_id, provider_event_id, method, payload_json, received_at) VALUES (?, ?, ?, ?, ?)");
+      const insert = db.prepare("INSERT INTO chat_raw (chat_id, kind, line, seen_at) VALUES (?, ?, ?, ?)");
       const now = new Date().toISOString();
       let kept = 0;
       db.exec("SAVEPOINT store_write");
@@ -1484,7 +1482,7 @@ export function openStore(data: string): Store {
           try { m = JSON.parse(line); } catch { continue; }
           // A reply to Rivet's own call has no method: it is named after what it answers.
           const method = typeof m.method === "string" ? m.method : m.error !== undefined ? "error" : "result";
-          kept += Number(insert.run(conv.id, "", method, redact(line), now).changes);
+          kept += Number(insert.run(conv.id, method, redact(line), now).changes);
         }
         db.exec("RELEASE store_write");
       } catch (e) {
@@ -1495,15 +1493,15 @@ export function openStore(data: string): Store {
     },
 
     providerLines(runId, o) {
-      const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
+      const conv = db.prepare("SELECT id FROM chat_sessions WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
       if (!conv) return [];
       type Row = { id: number; method: string; payload_json: string; received_at: string };
-      return (db.prepare("SELECT id, method, payload_json, received_at FROM chat_provider_events WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?")
+      return (db.prepare("SELECT position AS id, kind AS method, line AS payload_json, seen_at AS received_at FROM chat_raw WHERE chat_id = ? AND position > ? ORDER BY position LIMIT ?")
         .all(conv.id, o.after ?? 0, o.limit) as Row[]).map((r) => ({ position: Number(r.id), method: r.method, payload: r.payload_json, at: r.received_at }));
     },
 
     readChat(runId, o) {
-      const conv = db.prepare("SELECT id FROM chat_conversations WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
+      const conv = db.prepare("SELECT id FROM chat_sessions WHERE run_id = ? AND session = ?").get(runId, o.session ?? NODE_ID) as { id: string } | undefined;
       const inherited = o.session && o.session !== NODE_ID ? [] : prefixFor(runId);
       if (!conv) {
         const shown = inherited.filter((i) => !o.kinds || o.kinds.includes(i.kind));
@@ -1513,9 +1511,9 @@ export function openStore(data: string): Store {
       const rows = db.prepare(`
         SELECT l.position AS sequence, CASE WHEN l.step IS NULL THEN 'message' ELSE 'activity' END AS source, l.said_by AS role, l.step AS kind,
           l.progress AS status, l.body AS text, l.details AS detail, l.created_at AS at, l.step IS NULL AND l.progress = 'writing' AS streaming,
-          CASE WHEN l.step IS NULL THEN t.agent END AS agent, CASE WHEN l.step IS NULL THEN t.provider_turn_id END AS turn_id,
+          CASE WHEN l.step IS NULL THEN t.agent END AS agent, CASE WHEN l.step IS NULL THEN t.agent_turn END AS turn_id,
           CASE WHEN l.step IS NULL THEN t.agent_chat_id END AS provider, CASE WHEN l.step IS NULL THEN l.item_key END AS item_id
-        FROM chat_log l LEFT JOIN chat_turns t ON t.id = l.turn_id WHERE l.conversation_id = ? ORDER BY l.position`).all(conv.id) as Row[];
+        FROM chat_log l LEFT JOIN chat_turns t ON t.id = l.turn_id WHERE l.chat_id = ? ORDER BY l.position`).all(conv.id) as Row[];
       let firstUser = !inherited.some((i) => i.kind === "prompt" || i.kind === "message");
       const all: TimelineItem[] = [...inherited];
       for (const r of rows) {
@@ -1527,11 +1525,11 @@ export function openStore(data: string): Store {
           continue;
         }
         const detail = r.detail ? JSON.parse(r.detail) as { tool?: string; output?: string } : {};
-        if (r.kind === "command" || r.kind === "file_change") {
+        if (r.kind === "shell" || r.kind === "edit") {
           const failed = r.status === "failed" ? " (failed)" : "";
-          all.push({ ...base, kind: "tool", tool: detail.tool ?? (r.kind === "command" ? "shell" : "edit"), text: `${r.text}${failed}${detail.output ? `\n${detail.output}` : ""}` });
-        } else if (r.kind === "approval") all.push({ ...base, kind: "event", text: `asked to use ${r.text}${r.status === "pending" ? " (waiting for an answer)" : ""}` });
-        else if (r.kind !== "usage") all.push({ ...base, kind: "event", text: `${r.kind}: ${r.text}` });
+          all.push({ ...base, kind: "tool", tool: detail.tool ?? r.kind, text: `${r.text}${failed}${detail.output ? `\n${detail.output}` : ""}` });
+        } else if (r.kind === "question") all.push({ ...base, kind: "event", text: `asked to use ${r.text}${r.status === "waiting" ? " (waiting for an answer)" : ""}` });
+        else if (r.kind !== "tokens") all.push({ ...base, kind: "event", text: `${r.kind}: ${r.text}` });
       }
       const kinds = new Set(o.kinds ?? TIMELINE_KINDS);
       const shown = all.filter((i) => kinds.has(i.kind));

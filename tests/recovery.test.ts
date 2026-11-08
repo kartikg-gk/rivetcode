@@ -10,7 +10,7 @@ it("rebuilds exact stored state and search from the checkpoint and ordered chang
  data=await makeDataDir();target=await makeDataDir();store=openStore(data);
  store.saveRun(sessionRun(data,{agent:"codex"}));
  store.setConfig("proj","check","npm test");
- store.recordChat("r1","agent",[{type:"turn",turnId:"native-turn",state:"running"},{type:"message",itemId:"answer",role:"assistant",text:"recovered searchable marker",turnId:"native-turn"},{type:"turn",turnId:"native-turn",state:"completed"}]);
+ store.recordChat("r1","agent",[{type:"turn",turnId:"native-turn",state:"working"},{type:"message",itemId:"answer",role:"assistant",text:"recovered searchable marker",turnId:"native-turn"},{type:"turn",turnId:"native-turn",state:"done"}]);
  store.queueMessage("r1","agent","pending control");
  store.updateNode("r1","agent",{status:"running"});
  const original=store.recoveryStatus();expect(original.sequence).toBeGreaterThan(0);expect(store.verifyJournal().valid).toBe(true);

@@ -15,7 +15,7 @@ export async function waitForRun(read: (turn?: string) => Promise<WaitSnapshot>,
     if (!turn && !snapshot.pending) turn = snapshot.turn?.id;
     const taskEnded = ["done", "failed", "escalated"].includes(snapshot.status) && !snapshot.retrying;
     const turnEnded = turn
-      ? snapshot.turn?.id === turn && !["queued", "running"].includes(snapshot.turn.state)
+      ? snapshot.turn?.id === turn && snapshot.turn.state !== "working"
       : !snapshot.live || !["busy", "approval", "asking"].includes(snapshot.activity ?? "idle");
     const finished = options.scope === "task" ? taskEnded
       : taskEnded || !snapshot.live || ((!snapshot.pending || !!options.turn) && turnEnded);

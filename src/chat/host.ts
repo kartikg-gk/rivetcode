@@ -116,8 +116,8 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   // A growing reply waits for the batch; everything else is reported at once.
   const emit = (e: ChatEvent) => {
     if (e.type === "turn") lastTurnState = e.state;
-    if (!maintenance && e.type === "turn" && e.state === "completed" && currentMessage !== undefined) { accepted.push(currentMessage); currentMessage = undefined; }
-    if (e.type === "turn" && e.state === "completed") accepted.push(...steered.splice(0));
+    if (!maintenance && e.type === "turn" && e.state === "done" && currentMessage !== undefined) { accepted.push(currentMessage); currentMessage = undefined; }
+    if (e.type === "turn" && e.state === "done") accepted.push(...steered.splice(0));
     pending.push(e);
     if (e.type === "message" && e.streaming) later();
     else void post();
@@ -171,7 +171,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   const onControl = async (c: Control) => {
     if (c.type === "stop-child") {
       const sent = driver.cancelChild?.(c.id) ?? false;
-      emit({ type: "activity", kind: "system", status: sent ? "completed" : "failed",
+      emit({ type: "activity", kind: "note", status: sent ? "done" : "failed",
         summary: sent ? "Requested stop for Claude sub-agent " + c.id : "No active cancellable Claude sub-agent with that ID" });
       return;
     }
@@ -180,7 +180,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
       finishing = true;
       finishTimer = setTimeout(() => {
         completionFailed = true;
-        emit({type:"activity",kind:"system",status:"failed",summary:"Completion drain timed out; final provider output may be incomplete"});
+        emit({type:"activity",kind:"note",status:"failed",summary:"Completion drain timed out; final provider output may be incomplete"});
         void finish();
       }, 15000);
       if (!busy && !driver.running) await finish();
@@ -193,15 +193,15 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
         const operation=c.type==="compact"?driver.compact:driver.refresh;
         if(!operation)throw new Error("this provider does not support the requested maintenance operation");
         await operation();
-        emit({type:"activity",kind:"system",status:"completed",summary:`Provider ${c.type} request completed`});
-      } catch(e) {emit({type:"activity",kind:"system",status:"failed",summary:`Provider ${c.type} failed: ${(e as Error).message}`});}
+        emit({type:"activity",kind:"note",status:"done",summary:`Provider ${c.type} request completed`});
+      } catch(e) {emit({type:"activity",kind:"note",status:"failed",summary:`Provider ${c.type} failed: ${(e as Error).message}`});}
       finally {await post();maintenance=false;busy=false;void pump();}
       return;
     }
     if (c.type === "answer") {
       const q = c.requestId ? { requestId: c.requestId } : questionOpen;
       if (!q || !driver.answer(q.requestId, c.choice)) return;
-      emit({ type: "activity", requestId: q.requestId, kind: "approval", status: "resolved", summary: `answered ${c.choice}` });
+      emit({ type: "activity", requestId: q.requestId, kind: "question", status: "answered", summary: `answered ${c.choice}` });
       questionOpen = null;
       if (c.note) queue.push({ text: c.note });
       void pump();
@@ -251,5 +251,5 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   if (finishTimer) clearTimeout(finishTimer);
   await post();
   lines.close();
-  return deliveryFailed || completionFailed || lastTurnState === "failed" || lastTurnState === "running" || lastTurnState === "interrupted" ? 2 : 0;
+  return deliveryFailed || completionFailed || lastTurnState === "failed" || lastTurnState === "working" || lastTurnState === "stopped" ? 2 : 0;
 }
