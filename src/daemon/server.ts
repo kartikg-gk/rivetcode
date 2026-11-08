@@ -1277,7 +1277,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       reply(res, 201, { threads: ids.map(runId => ({ runId, started: false })) });
       return;
     }
-    const conversationRoute = /^\/api\/v1\/runs\/([^/]+)\/(fork|merge-back)$/.exec(path);
+    const conversationRoute = /^\/api\/v1\/runs\/([^/]+)\/(fork|carry-back)$/.exec(path);
     if (conversationRoute) {
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
       const payload = await body(req);
@@ -1544,7 +1544,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (!job) throw new HttpError(404, "cleanup job is unavailable, possibly after restart; inspect the worktree and rerun clean for the same run (dirty worktrees remain protected)");
       reply(res, 200, job); return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|merge-policy|review|switch|worktree-handoff))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|merge-policy|review|switch|move-to-worktree))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -1593,7 +1593,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         reply(res, 202, { runId: run.id, agent: to });
         return;
       }
-      if (action === "worktree-handoff") {
+      if (action === "move-to-worktree") {
         if (branchChanges.has(run.id)) throw new HttpError(409, "workspace is changing");
         branchChanges.add(run.id);
         try {

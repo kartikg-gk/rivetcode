@@ -194,7 +194,7 @@ it("reconstructs a pinned Claude prefix explicitly", async () => {
   expect(events.filter((e) => e.type === "message").at(-1)).toMatchObject({ text: "echo: pinned prefix\n\nnew question" });
 });
 
-it("exposes lazy forks, search, wait and merge-back through daemon and CLI, protecting the shared checkout", async () => {
+it("exposes lazy forks, search, wait and carry-back through daemon and CLI, protecting the shared checkout", async () => {
   const s = await seed(); repo = await makeRepo();
   const source = s.loadRun("r1"); source.node.worktree = repo; source.repo = repo; s.saveRun(source); s.close(); store = undefined;
   process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "codex"]);
@@ -207,12 +207,12 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
   };
   writeFileSync(join(repo, "local-only.txt"), "uncommitted work");
   const isolated = (await api("POST", "/runs/r1/fork", {})).value.runId;
-  const handoff = await api("POST", `/runs/${isolated}/worktree-handoff`, {});
+  const handoff = await api("POST", `/runs/${isolated}/move-to-worktree`, {});
   expect(handoff.status).toBe(201);
   expect(existsSync(join(repo, "local-only.txt"))).toBe(true);
   expect(existsSync(join(handoff.value.worktree, "local-only.txt"))).toBe(false);
   expect((await api("GET", `/runs/${isolated}`)).value.run.sharedWorkspace).toBeUndefined();
-  expect((await api("POST", `/runs/${isolated}/worktree-handoff`, {})).status).toBe(409);
+  expect((await api("POST", `/runs/${isolated}/move-to-worktree`, {})).status).toBe(409);
   const out: string[] = [];
   const io: CliIo = { env: { RIVET_SESSION_ID: "r1-agent", RIVET_PROJECT_ID: "proj", RIVET_RUN_FILE: join(data!, "running.json") }, cwd: repo, readStdin: async () => "", out: (l) => out.push(l), err: (l) => { throw new Error(l); } };
   expect(await runCli(["fork", "r1", "--name", "exploration"], io)).toBe(0);
@@ -232,9 +232,9 @@ it("exposes lazy forks, search, wait and merge-back through daemon and CLI, prot
   const tools = toolCaller(io.env, repo!);
   expect(await tools("rivet_search", { query: "new finding" })).toMatchObject({ matches: expect.arrayContaining([expect.objectContaining({ runId: child })]) });
   expect(await tools("rivet_wait", { run: child, timeoutMs: 0 })).toMatchObject({ timedOut: false });
-  expect(await runCli(["merge-back", child], io)).toBe(0);
+  expect(await runCli(["carry-back", child], io)).toBe(0);
   expect(await tools("rivet_transfer", { action: "status", run: child })).toMatchObject({ transfers: [expect.objectContaining({ delivery: "pending" })] });
-  expect((await api("POST", `/runs/${child}/merge-back`, {})).value.duplicate).toBe(true);
+  expect((await api("POST", `/runs/${child}/carry-back`, {})).value.duplicate).toBe(true);
   const rolled = await api("POST",`/runs/${child}/rollback`,{turns:1});
   expect(rolled.status).toBe(202);
   expect(rolled.value.strategy).toBe("pending");

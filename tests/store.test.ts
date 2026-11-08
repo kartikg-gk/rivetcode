@@ -303,13 +303,13 @@ describe("timeline", () => {
     store.updateNode("r1", "agent", { status: "done" });
     store.setPr("r1", { number: 7, url: "u" });
     expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
-      ["run.created", { status: sampleRun().node.status, agent: sampleRun().node.agent }],
+      ["run.added", { status: sampleRun().node.status, agent: sampleRun().node.agent }],
       ["activity", { from: null, to: "active" }],
       ["activity", { from: "active", to: "idle" }],
       ["message.queued", { id, mode: "queue", from: "orchestrator" }],
       ["message.delivered", { id }],
       ["report", { kind: "done" }],
-      ["node.updated", { status: "done" }],
+      ["run.changed", { status: "done" }],
       ["pr", { number: 7, handled: null }],
     ]);
     const first = store.readEvents("r1", { limit: 2 });
@@ -324,10 +324,10 @@ describe("timeline", () => {
     store.setActivity("r1", "agent", "active");
     store.exitStaleSessions();
     expect(store.readEvents("r1", { limit: 50 }).map((e) => [e.type, e.data])).toEqual([
-      ["run.created", { status: run.node.status, agent: run.node.agent }],
-      ["node.updated", { status: "done" }],
+      ["run.added", { status: run.node.status, agent: run.node.agent }],
+      ["run.changed", { status: "done" }],
       ["activity", { from: null, to: "active" }],
-      ["session.exited", { from: "active", reason: "daemon restarted" }],
+      ["session.ended", { from: "active", reason: "daemon restarted" }],
     ]);
   });
 

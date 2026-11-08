@@ -55,9 +55,9 @@ export function contextText(items: TimelineItem[], heading: string): string {
 export function mergeConversation(store: Store, sourceId: string, targetId?: string, at?: number) {
   const source = store.loadRun(sourceId);
   const fork = store.getFork(sourceId);
-  if (!fork || fork.independent) throw new Error("merge-back needs a conversation fork as its source");
+  if (!fork || fork.independent) throw new Error("carry-back needs a conversation fork as its source");
   const target = store.loadRun(targetId ?? fork.sourceRun);
-  if (source.id === target.id || source.project !== target.project) throw new Error("merge-back needs a related target in the same project");
+  if (source.id === target.id || source.project !== target.project) throw new Error("carry-back needs a related target in the same project");
   let ancestor = fork.sourceRun;
   const visited = new Set<string>();
   while (ancestor !== target.id) {
@@ -76,6 +76,6 @@ export function mergeConversation(store: Store, sourceId: string, targetId?: str
   const delta = items.filter((i) => i.position > after);
   if (!delta.some((i) => i.kind === "assistant")) throw new Error("fork has no completed exploration to transfer");
   const text = contextText(delta, `Merge-back from fork ${source.id}, after position ${after}, through ${through}.`);
-  if (store.pendingContextSize(target.id) + text.length > 60000) throw new Error("pending merge-back context exceeds 60000 characters; continue the target before transferring more");
+  if (store.pendingContextSize(target.id) + text.length > 60000) throw new Error("pending carry-back context exceeds 60000 characters; continue the target before transferring more");
   return { ...store.transferContext(source.id, target.id, through, text), targetRun: target.id, through, delivery: "pending" };
 }

@@ -469,7 +469,7 @@ export function createScheduler(d: SchedulerDeps) {
         if (!result.ok) {await workFailed(runId,result.why);return;}
       }
       await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: new Date().toISOString() }));
-      await transition(runId, "done", "fork exploration completed in shared checkout; use merge-back to transfer context");
+      await transition(runId, "done", "fork exploration completed in shared checkout; use carry-back to transfer context");
       return;
     }
     await commitLeftovers(run.node.worktree, `rivet: save work left uncommitted by "${run.node.title}"`);

@@ -866,8 +866,8 @@ export function openStore(data: string): Store {
           logEvent(run.id, n.id, "conversation.forked", { source: fork.sourceRun, position: fork.position });
         }
         // Creation is recorded once, followed only by real state changes.
-        if (before === undefined) logEvent(run.id, n.id, "run.created", { status: n.status, agent: n.agent });
-        else if (before !== n.status) logEvent(run.id, n.id, "node.updated", { status: n.status });
+        if (before === undefined) logEvent(run.id, n.id, "run.added", { status: n.status, agent: n.agent });
+        else if (before !== n.status) logEvent(run.id, n.id, "run.changed", { status: n.status });
         db.exec("RELEASE store_write");
       } catch (e) {
         db.exec("ROLLBACK TO store_write; RELEASE store_write");
@@ -1008,7 +1008,7 @@ export function openStore(data: string): Store {
     exitStaleSessions() {
       // Record each session left behind by a stopped daemon as exited.
       const stale = selectStale.all() as { run_id: string; id: string; activity: string }[];
-      for (const s of stale) logEvent(s.run_id, s.id, "session.exited", { from: s.activity, reason: "daemon restarted" });
+      for (const s of stale) logEvent(s.run_id, s.id, "session.ended", { from: s.activity, reason: "daemon restarted" });
       return Number(updateStale.run().changes);
     },
 
@@ -1022,7 +1022,7 @@ export function openStore(data: string): Store {
       if (changed === 0) throw new RunStoreError(`no node ${nodeId} in run ${runId}`);
       // Only what actually changed, as with a re-saved run.
       const diff = keys.filter((k) => old?.[UPDATE_COLUMNS[k]] !== fields[k]);
-      if (diff.length) logEvent(runId, nodeId, "node.updated", Object.fromEntries(diff.map((k) => [k, fields[k]])));
+      if (diff.length) logEvent(runId, nodeId, "run.changed", Object.fromEntries(diff.map((k) => [k, fields[k]])));
     },
 
     saveAutomation(a) {
@@ -1233,7 +1233,7 @@ export function openStore(data: string): Store {
         const message = db.prepare("INSERT INTO outbox (run_id, node_id, message, from_session, created_at, mode) VALUES (?, 'agent', ?, ?, ?, 'queue')").run(target, redact(text), `${source}-agent`, now);
         db.prepare("INSERT INTO context_transfers (id, source_run, target_run, through_position, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
           .run(id, source, target, through, Number(message.lastInsertRowid), now);
-        logEvent(source, NODE_ID, "context.merge_back", { id, target, through });
+        logEvent(source, NODE_ID, "context.carry_back", { id, target, through });
         logEvent(target, NODE_ID, "context.received", { id, source, through });
         db.exec("RELEASE store_write");
         return { id, duplicate: false };

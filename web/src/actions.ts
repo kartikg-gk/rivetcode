@@ -39,10 +39,10 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
       fields: [{ name: "turns", label: "Turns to drop", type: "number", value: rest.trim() || "1" }],
       run: (v) => api("POST", runPath(id, "/rollback"), { turns: Number(v.turns) }),
     }) },
-    { id: "merge-back", label: "Merge back…", about: "copy what this fork learned into its parent's next message; no git merge", run: () => ask({
-      title: "Merge back into parent", note: "Moves conversation context only. Files are already shared.", confirm: "Merge back",
+    { id: "carry-back", label: "Carry back…", about: "copy what this fork learned into its parent's next message; no git merge", run: () => ask({
+      title: "Carry back into parent", note: "Moves conversation context only. Files are already shared.", confirm: "Carry back",
       fields: [{ name: "target", label: "Target run (empty: its source)" }, { name: "at", label: "Through position (empty: latest)", type: "number" }],
-      run: (v) => api("POST", runPath(id, "/merge-back"), { ...(v.target ? { target: v.target } : {}), ...(v.at ? { at: Number(v.at) } : {}) }),
+      run: (v) => api("POST", runPath(id, "/carry-back"), { ...(v.target ? { target: v.target } : {}), ...(v.at ? { at: Number(v.at) } : {}) }),
     }) },
     { id: "compact", label: "Compact", about: "ask the agent to compact its context when idle", run: () => post("/compact", {}, "compaction requested") },
     { id: "reconcile", label: "Refresh history", about: "ask the agent for its history when idle", run: () => post("/reconcile", {}, "history refresh requested") },
