@@ -56,8 +56,8 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
       run: (v) => api("POST", runPath(id, "/link-pr"), { number: v.number ? Number(v.number) : null }),
     }) },
     { id: "review", label: "Review pull request", about: "have a reviewer agent review this worker's pull request", run: () => post("/review", undefined, "review started") },
-    { id: "policy", label: d?.terminateOnPrMerge ? "Keep after merge" : "End on merge", about: "whether this run ends once its pull request merges", run: () => void act(
-      () => api("PATCH", runPath(id, "/merge-policy"), { terminateOnPrMerge: !d?.terminateOnPrMerge }), "merge policy changed") },
+    { id: "policy", label: d?.endOnMerge ? "Keep after merge" : "End on merge", about: "whether this run ends once its pull request merges", run: () => void act(
+      () => api("PATCH", runPath(id, "/after-merge"), { endOnMerge: !d?.endOnMerge }), "merge policy changed") },
     { id: "rename", label: "Rename…", about: "give this session a name", args: "[name]", run: (rest) => ask({
       title: "Rename session", confirm: "Rename", fields: [{ name: "name", label: "Name", value: rest.trim() || d?.run.name || "" }],
       run: (v) => api("PATCH", runPath(id, "/organization"), { name: v.name }),

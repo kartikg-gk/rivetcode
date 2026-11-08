@@ -41,7 +41,7 @@ export type Node = {
   // When its agent first started (retries keep it).
   startedAt?: string;
   // The first hook of the current launch; unset means the agent has not been heard from.
-  firstSignalAt?: string;
+  firstHeardAt?: string;
   // How the session runs: in a terminal (the agent's own CLI) or as a chat (its protocol).
   runMode?: RunMode;
   // A chat's conversation id at the agent, to resume it.
@@ -82,7 +82,7 @@ export const NO_SIGNAL_GRACE_MS = 90_000;
 
 // A live agent that should report through hooks, has not since this launch, and has
 // been quiet past the grace period: working or stuck can not be told apart.
-export function noSignal(node: Node, now: number, alive: boolean, signals: boolean): boolean {
-  return alive && signals && !node.firstSignalAt && node.activity === "idle"
+export function unheard(node: Node, now: number, alive: boolean, signals: boolean): boolean {
+  return alive && signals && !node.firstHeardAt && node.activity === "idle"
     && !!node.activityAt && now - Date.parse(node.activityAt) > NO_SIGNAL_GRACE_MS;
 }

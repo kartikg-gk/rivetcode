@@ -261,7 +261,7 @@ function Details({ d }: { d: RunDetail }) {
       <Fact k="Worktree" v={<code className="mono text-xs">{n.worktree}</code>} />
       <Fact k="Issue" v={d.run.issue ? `#${d.run.issue}` : undefined} />
       <Fact k="Pull request" v={d.pr ? <a className="text-accent underline" target="_blank" rel="noreferrer noopener" href={d.pr.url}>#{d.pr.number}{n.prStatus ? ` · ${n.prStatus}` : ""}</a> : undefined} />
-      <Fact k="On merge" v={d.terminateOnPrMerge ? "end the run" : "keep it"} />
+      <Fact k="On merge" v={d.endOnMerge ? "end the run" : "keep it"} />
       <Fact k="Tokens" v={c ? `${c.input.toLocaleString()} in, ${c.output.toLocaleString()} out, ${c.cached.toLocaleString()} cached` : d.usage.conversations ? `${d.usage.inputEquivalent.toLocaleString()} input-equivalent` : undefined} />
       <Fact k="Context" v={c?.contextUsed && c.contextWindow ? `${Math.round(100 * c.contextUsed / c.contextWindow)}% of ${c.contextWindow.toLocaleString()}` : undefined} />
       <Fact k={d.fork?.independent ? "Workspace from" : "Fork of"} v={d.fork ? `${d.fork.sourceRun} at #${d.fork.position} (${d.fork.strategy}${d.fork.detached ? ", detached" : ""})` : undefined} />
@@ -352,7 +352,7 @@ export function Conversation({ id }: { id: string }) {
   const unread = useApp((s) => s.runs.find((r) => r.id === id)?.organization.unread);
   useEffect(() => { if (unread) void api("PATCH", runPath(id, "/organization"), { unread: false }).catch(() => {}); }, [id, unread]);
   const org = useApp((s) => s.runs.find((r) => r.id === id)?.organization);
-  const actions = useMemo(() => sessionActions(id, d), [id, d?.run.node.runMode, d?.run.role, d?.terminateOnPrMerge, d?.run.node.agent, d?.run.name, org?.pinnedAt, org?.snoozedUntil]);
+  const actions = useMemo(() => sessionActions(id, d), [id, d?.run.node.runMode, d?.run.role, d?.endOnMerge, d?.run.node.agent, d?.run.name, org?.pinnedAt, org?.snoozedUntil]);
   if (error) return (
     <div className="flex-1 grid place-items-center p-6 text-center"><div className="grid gap-2 justify-items-center"><p>{error}</p><button className="btn" onClick={() => set({ selected: null })}>Back</button></div></div>
   );

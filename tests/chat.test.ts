@@ -77,7 +77,7 @@ it("cancels an advertised Claude child session without cancelling the parent", a
   process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
   daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
     agents: name => ({ ...getAgent("fake"), name, binary: "unused" }) });
-  await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+  await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "run.mode", value: "chat" });
   const id = (await api("POST", "/api/v1/runs", { repo, task: "CHILD_STOP_PROBE", agent: "claude" })).json.runId;
   await until("the active child", async () => (await timeline(id)).some(item => item.text.includes("test-child: running")));
   const request = await api("POST", `/api/v1/runs/${id}/stop-subagent`, { id: "test-child" });
@@ -103,7 +103,7 @@ describe("what a chat host could not report", () => {
   it("is replayed by the next host", async () => {
     process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "acp"]);
     daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
-    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "run.mode", value: "chat" });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "first", agent: "claude" })).json.runId as string;
     await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
     await api("POST", `/api/v1/sessions/${runId}-agent/stop`);
@@ -122,7 +122,7 @@ describe("forking a Claude chat", () => {
     process.env.FAKE_NATIVE_FORK = "1";
     try {
       daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
-      await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+      await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "run.mode", value: "chat" });
       const runId = (await api("POST", "/api/v1/runs", { repo, task: "first", agent: "claude" })).json.runId as string;
       await until("idle", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle" && said(await timeline(runId), "echo: "));
       const fork = (await api("POST", `/api/v1/runs/${runId}/fork`, {})).json.runId as string;
@@ -136,7 +136,7 @@ describe("a chat worker whose agent refuses its turn", () => {
   it("escalates with the agent's own reason", async () => {
     process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, "codex"]);
     daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
-    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "run.mode", value: "chat" });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "LIMITFAIL", agent: "codex" })).json.runId as string;
     const run = await until("escalation", async () => { const r = (await api("GET", `/api/v1/runs/${runId}`)).json.run; return r.node.status === "escalated" && r; });
     expect(run.node.summary).toBe("codex failed: You've hit your usage limit.");
@@ -152,7 +152,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
       data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500,
       agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }),
     });
-    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.mode", value: "chat" });
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "run.mode", value: "chat" });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "say hello", agent })).json.runId as string;
     // Watched from the start: a reply shows while it is still being written.
     let sawStreaming = false;
@@ -241,7 +241,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s 
   it("flushes the final reply and receipt before stopping after a done report", async () => {
     process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, FAKE, protocol]);
     daemon = await startDaemon({data, runFile:join(data,"running.json"), port:0, agents:name=>({...getAgent("fake"),name,binary:"unused"})});
-    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, {key:"session.mode",value:"chat"});
+    await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, {key:"run.mode",value:"chat"});
     const runId=(await api("POST","/api/v1/runs",{repo,task:"initial",agent})).json.runId;
     await until("initial idle",async()=>(await api("GET",`/api/v1/runs/${runId}`)).json.run.node.activity==="idle" && (await timeline(runId)).some(i=>i.kind==="assistant" && !(i as Item & {streaming?:boolean}).streaming));
     await api("POST",`/api/v1/sessions/${runId}-agent/send`,{message:"SLOW final receipt marker",mode:"queue"});
@@ -257,7 +257,7 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("finishing a %s 
 
 
 it("escalates a timed-out completion without publishing or replaying consumed guidance",async()=>{
- process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"session.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("busy",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="busy");await api("POST","/api/v1/outcomes",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
+ process.env.RIVET_CHAT_COMMAND=JSON.stringify([process.execPath,FAKE,"acp"]);daemon=await startDaemon({data,runFile:join(data,"running.json"),port:0,agents:name=>({...getAgent("fake"),name,binary:"unused"})});await api("PUT",`/api/v1/projects/${encodeURIComponent(project())}/config`,{key:"run.mode",value:"chat"});const id=(await api("POST","/api/v1/runs",{repo,agent:"claude",task:"SLOW DRAIN_TIMEOUT incomplete task"})).json.runId;await until("busy",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.activity==="busy");await api("POST","/api/v1/outcomes",{sessionId:id+"-agent",kind:"done",message:"reported early"});await until("uncertain completion",async()=>(await api("GET",`/api/v1/runs/${id}`)).json.run.node.status==="escalated",22000);expect((await api("GET",`/api/v1/runs/${id}`)).json.pr).toBeNull();expect((await timeline(id)).some(i=>i.text.includes("Messages arrived while you worked"))).toBe(false);
 },30000);
 
 describe("a delta chat session", () => {

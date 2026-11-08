@@ -77,7 +77,7 @@ import { checkZone, nextRun, parseCron } from "../scheduler/cron.js";
 import { createScheduler, SchedulerError } from "../scheduler/scheduler.js";
 import { openStore, RunStoreError, SEND_MODES, type Run, type SendMode } from "../store.js";
 import { runUsage } from "../usage.js";
-import { ACTIVITY_STATES, AGENTS, NODE_ID, noSignal, ROLES, type ActivityState, type Node, type Role } from "../model.js";
+import { ACTIVITY_STATES, AGENTS, NODE_ID, unheard, ROLES, type ActivityState, type Node, type Role } from "../model.js";
 import { vaultResolver } from "./vault.js";
 import { createWorktree, emptyTrash, removeWorktree } from "../worktree.js";
 
@@ -92,13 +92,13 @@ const CONFIG_KEYS = [
   "verify.reuse",
   "worker.agent",
   "worker.permission",
-  "worker.model",
+  "worker.viewl",
   "claude.model",
   "codex.model",
   "delta.model",
   "delta.binary",
   "worker.allowedTools",
-  "worker.mode",
+  "worker.view",
   "pr",
   "review",
   "review.agent",
@@ -108,7 +108,7 @@ const CONFIG_KEYS = [
   "symlink",
   "setup",
   "timeline.keep",
-  "session.mode",
+  "run.mode",
 ];
 // Days a finished run's timeline is kept unless timeline.keep says otherwise ("forever" keeps it).
 const TIMELINE_KEEP_DAYS = 30;
@@ -1321,7 +1321,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       try {
         const result = await waitForRun(async (turn) => write(() => {
           const run = store.loadRun(runId);
-          return { retrying: run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2), status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstSignalAt };
+          return { retrying: run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2), status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstHeardAt };
         }), { scope: scope as "turn" | "task", timeoutMs, ...(q.get("turn") ? { turn: q.get("turn")! } : {}) }, AbortSignal.any([abort.signal, waitAbort.signal]));
         let next: string | undefined;
         if (result.timedOut && wakeCaller) {
@@ -1544,7 +1544,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (!job) throw new HttpError(404, "cleanup job is unavailable, possibly after restart; inspect the worktree and rerun clean for the same run (dirty worktrees remain protected)");
       reply(res, 200, job); return;
     }
-    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|merge-policy|review|switch|move-to-worktree))?$/.exec(path);
+    const runRoute = /^\/api\/v1\/runs\/([^/]+)(?:\/(resume|clean|pr|link-pr|stop|after-merge|review|switch|move-to-worktree))?$/.exec(path);
     if (runRoute) {
       const [, runId, action] = runRoute;
       let run;
@@ -1556,24 +1556,24 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         if (req.method !== "GET") throw new HttpError(405, "method not allowed");
         const live = runtime.isAlive(sessionIdOf(run.id, run.node.id));
         const pr = await write(() => store.getPr(run.id));
-        const terminateOnPrMerge = await write(() => store.getTerminateOnPrMerge(run.id));
+        const endOnMerge = await write(() => store.getEndOnMerge(run.id));
         const at = Date.now();
-        const silent = noSignal(run.node, at, live, getAgent(run.node.agent).signals);
+        const silent = unheard(run.node, at, live, getAgent(run.node.agent).signals);
         // Every conversation its agents had (retries and conflict fixes too), from their own files.
         const conversations = await write(() => store.conversations(run.id));
         const usage = { conversations: conversations.length, ...runUsage(conversations) };
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
         const chatUsage = run.node.runMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
-        reply(res, 200, { run, live, pr, terminateOnPrMerge, noSignal: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, independent: f.independent ?? false, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
+        reply(res, 200, { run, live, pr, endOnMerge, unheard: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, independent: f.independent ?? false, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
         return;
       }
-      if (action === "merge-policy") {
+      if (action === "after-merge") {
         if (req.method !== "PATCH") throw new HttpError(405, "method not allowed");
         const payload = await body(req);
-        if (typeof payload.terminateOnPrMerge !== "boolean") throw new HttpError(400, "terminateOnPrMerge must be true or false");
-        await write(() => store.setTerminateOnPrMerge(run.id, payload.terminateOnPrMerge as boolean));
-        reply(res, 200, { runId: run.id, terminateOnPrMerge: payload.terminateOnPrMerge });
+        if (typeof payload.endOnMerge !== "boolean") throw new HttpError(400, "endOnMerge must be true or false");
+        await write(() => store.setEndOnMerge(run.id, payload.endOnMerge as boolean));
+        reply(res, 200, { runId: run.id, endOnMerge: payload.endOnMerge });
         return;
       }
       if (req.method !== "POST") throw new HttpError(405, "method not allowed");
@@ -1737,7 +1737,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
               store.completeWait(subscription.id,`Wait ended for run ${run.id}: the selected turn moved to an archived conversation branch. Read branch history for details.`);
               ready.add(subscription.caller);continue;
             }
-            const turnDone = turn && turn.state !== "working" && (!runtime.isAlive(sessionIdOf(run.id,NODE_ID)) || !!run.node.firstSignalAt);
+            const turnDone = turn && turn.state !== "working" && (!runtime.isAlive(sessionIdOf(run.id,NODE_ID)) || !!run.node.firstHeardAt);
             if (taskDone || (subscription.scope === "turn" && turnDone)) {
               store.completeWait(subscription.id,`Wait completed for run ${run.id}: ${subscription.scope === "task" ? run.node.status : turn?.state ?? run.node.status}. Read its history for details.`);
               ready.add(subscription.caller);

@@ -110,7 +110,7 @@ export async function doctor(dataDir: string, p: Probes): Promise<Check[]> {
 
   checks.push(p.loadPty()
     ? { level: "ok", name: "terminals", message: "node-pty loads" }
-    : { level: "warn", name: "terminals", message: "node-pty does not load; worker.mode=interactive, attach and panes are unavailable" });
+    : { level: "warn", name: "terminals", message: "node-pty does not load; worker.view=interactive, attach and panes are unavailable" });
 
   checks.push(await agentCheck("claude", p.findClaude, p));
   checks.push(await agentCheck("codex", p.findCodex, p));

@@ -145,9 +145,9 @@ describe("rivet report", () => {
     expect(await runCli(argv, io({ RIVET_SESSION_ID: "r1-agent" }))).toBe(2);
   });
 
-  it("merge-policy takes terminate or keep", async () => {
-    expect(await runCli(["merge-policy", "r1", "yes"], io({ RIVET_NO_AUTOSTART: "1" }))).toBe(2);
-    expect(err.join("\n")).toMatch(/merge-policy needs <run> terminate\|keep/);
+  it("after-merge takes terminate or keep", async () => {
+    expect(await runCli(["after-merge", "r1", "yes"], io({ RIVET_NO_AUTOSTART: "1" }))).toBe(2);
+    expect(err.join("\n")).toMatch(/after-merge needs <run> terminate\|keep/);
   });
 
   it("needs RIVET_SESSION_ID", async () => {

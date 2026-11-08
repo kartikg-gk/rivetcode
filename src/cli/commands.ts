@@ -68,7 +68,7 @@ const USAGE = `usage: rivet <command>
   clean <run>                           remove a run's worktree (the branch stays)
   switch <run> claude|codex|delta [--model <id>] [--now]
                                         hand a worker's task to another agent in the same worktree
-  merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
+  after-merge <run> terminate|keep     end the run once its pull request merges (default keep)
   snippet list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
                                         saved prompts (to a session, or a new worker) and commands (run here)
   routine list | add <name> --cron "<m h dom mon dow>" [--zone <tz>] [--orchestrator] [--agent <name>] <prompt>
@@ -559,11 +559,11 @@ async function status(args: string[], io: CliIo): Promise<number> {
     return 0;
   }
   const result = await callDaemon(io.env, "GET", `/api/v1/runs/${encodeURIComponent(runId)}`, undefined, COMMAND_TIMEOUT_MS) as {
-    run: Run; live: boolean; now: string; pr: { url: string } | null; noSignal?: boolean;
+    run: Run; live: boolean; now: string; pr: { url: string } | null; unheard?: boolean;
     usage?: { conversations: number; tokens: TokenUse; inputEquivalent?: number };
     chatUsage?: { input: number; output: number; cached: number; total: number; contextUsed?: number; contextWindow?: number };
   };
-  for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.noSignal)) io.out(line);
+  for (const line of renderRun(result.run, result.live, Date.parse(result.now), result.unheard)) io.out(line);
   if (result.usage && result.usage.conversations > 0) io.out(usageLine(result.usage));
   else if (result.chatUsage && result.chatUsage.total > 0) io.out(chatUsageLine(result.chatUsage));
   if (result.chatUsage?.contextUsed !== undefined && result.chatUsage.contextWindow) {
@@ -617,8 +617,8 @@ async function initProject(args: string[], io: CliIo): Promise<number> {
   const root = (await git(["rev-parse","--show-toplevel"],io.cwd)).trim();
   let scripts: Record<string,string> = {};
   try { scripts = JSON.parse(await readFile(join(root,"package.json"),"utf8")).scripts ?? {}; } catch {}
-  const defaults: Record<string,string> = {"worker.agent":"claude","worker.model":"","check":scripts.typecheck ? "npm run typecheck" : scripts.lint ? "npm run lint" : "","test":scripts.test ? "npm test" : ""};
-  const names: Record<string,string> = {agent:"worker.agent",model:"worker.model",check:"check",test:"test"};
+  const defaults: Record<string,string> = {"worker.agent":"claude","worker.viewl":"","check":scripts.typecheck ? "npm run typecheck" : scripts.lint ? "npm run lint" : "","test":scripts.test ? "npm test" : ""};
+  const names: Record<string,string> = {agent:"worker.agent",model:"worker.viewl",check:"check",test:"test"};
   for (const [flag,key] of Object.entries(names)) {
     if (!flags.has(flag) && existing[key] !== undefined) continue;
     const value = String(flags.get(flag) ?? defaults[key]);
@@ -969,7 +969,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["new-conversation", "move-to-worktree", "app", "console", "transfers", "search", "wait", "fork", "carry-back", "spawn", "review", "snippet", "routine", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["new-conversation", "move-to-worktree", "app", "console", "transfers", "search", "wait", "fork", "carry-back", "spawn", "review", "snippet", "routine", "switch", "orchestrator", "status", "stop", "resume", "clean", "after-merge", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -1216,10 +1216,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return 0;
       }
       case "clean": return await runAction("clean", args, io);
-      case "merge-policy": {
+      case "after-merge": {
         const [runId, policy] = args;
-        if (!runId || (policy !== "terminate" && policy !== "keep")) throw new UsageError("merge-policy needs <run> terminate|keep");
-        await callDaemon(io.env, "PATCH", `/api/v1/runs/${encodeURIComponent(runId)}/merge-policy`, { terminateOnPrMerge: policy === "terminate" }, COMMAND_TIMEOUT_MS);
+        if (!runId || (policy !== "terminate" && policy !== "keep")) throw new UsageError("after-merge needs <run> terminate|keep");
+        await callDaemon(io.env, "PATCH", `/api/v1/runs/${encodeURIComponent(runId)}/after-merge`, { endOnMerge: policy === "terminate" }, COMMAND_TIMEOUT_MS);
         io.out(policy === "terminate" ? `run ${runId} ends once its pull request merges` : `run ${runId} stays after its pull request merges`);
         return 0;
       }

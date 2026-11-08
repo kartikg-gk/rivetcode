@@ -84,7 +84,7 @@ async function until<T>(get: () => Promise<T>, ok: (v: T) => boolean, ms = 20_00
   }
 }
 
-const runOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as { run: Run; pr: { number: number; url: string; handled?: string } | null; terminateOnPrMerge: boolean };
+const runOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as { run: Run; pr: { number: number; url: string; handled?: string } | null; endOnMerge: boolean };
 const onOrigin = (branch: string, file: string) => git(["show", `${branch}:${file}`], origin);
 
 // A worker on the fake agent: its task is the script it runs.
@@ -244,13 +244,13 @@ describe("watching the pull request", () => {
 
 describe("ending the run after the merge", () => {
   const merge = () => { gh.prs[0]!.merged = true; gh.prs[0]!.state = "closed"; };
-  const policy = (runId: string, terminateOnPrMerge: unknown) => api("PATCH", `/api/v1/runs/${runId}/merge-policy`, { terminateOnPrMerge });
+  const policy = (runId: string, endOnMerge: unknown) => api("PATCH", `/api/v1/runs/${runId}/after-merge`, { endOnMerge });
 
   it("terminates a run that asked for it: the worktree goes, the branch stays", async () => {
     await start({ pr: "auto" });
     const runId = await spawn();
     const { run } = await until(() => runOf(runId), (r) => r.pr !== null);
-    expect((await runOf(runId)).terminateOnPrMerge).toBe(false);
+    expect((await runOf(runId)).endOnMerge).toBe(false);
     expect((await policy(runId, true)).status).toBe(200);
     merge();
     const after = await until(() => runOf(runId), (r) => r.pr?.handled === "closed");

@@ -22,7 +22,7 @@ export type Run = {
   name: string;
   // The orchestrator session that started this worker, if any; its reports go there.
   orchestrator?: string;
-  // The model asked for when it was started; otherwise the project's worker.model.
+  // The model asked for when it was started; otherwise the project's worker.viewl.
   model?: string;
   // The issue the task came from, in the run's own repository; its pull request closes it.
   issue?: number;
@@ -154,8 +154,8 @@ export type Store = {
   listSnippets(project: string): Snippet[];
   deleteSnippet(project: string, name: string): boolean;
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
-  getTerminateOnPrMerge(runId: string): boolean;
-  setTerminateOnPrMerge(runId: string, terminate: boolean): void;
+  getEndOnMerge(runId: string): boolean;
+  setEndOnMerge(runId: string, terminate: boolean): void;
   // Rows this connection has changed since it opened; moves whenever stored state does.
   changeCount(): number;
   close(): void;
@@ -377,14 +377,14 @@ CREATE TABLE pull_requests (
 
 // Per-run merge policy; off unless the user turns it on for that run.
 MIGRATIONS.push({ version: 5, sql: `
-ALTER TABLE runs ADD COLUMN terminate_on_pr_merge INTEGER NOT NULL DEFAULT 0 CHECK (terminate_on_pr_merge IN (0, 1));
+ALTER TABLE runs ADD COLUMN end_on_merge INTEGER NOT NULL DEFAULT 0 CHECK (end_on_merge IN (0, 1));
 ` });
 
 // When a node first started, the first hook of its current launch, and every agent
 // conversation a node has had (one per launch, plus conflict fixes on parents).
 MIGRATIONS.push({ version: 6, sql: `
 ALTER TABLE nodes ADD COLUMN started_at TEXT;
-ALTER TABLE nodes ADD COLUMN first_signal_at TEXT;
+ALTER TABLE nodes ADD COLUMN first_heard_at TEXT;
 CREATE TABLE conversations (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   node_id TEXT NOT NULL,
@@ -719,7 +719,7 @@ type NodeRow = {
   id: string; parent_id: string | null; depth: number; kind: string; title: string; prompt: string;
   files: string; agent: string; branch: string; worktree: string; status: string; attempts: number;
   summary: string | null; activity: string | null; agent_own_id: string | null; pr_status: string | null;
-  activity_at: string | null; finished_at: string | null; started_at: string | null; first_signal_at: string | null;
+  activity_at: string | null; finished_at: string | null; started_at: string | null; first_heard_at: string | null;
   shared: string; run_mode: string; agent_chat_id: string;
 };
 
@@ -742,7 +742,7 @@ export function openStore(data: string): Store {
   const insertNode = db.prepare(`
     INSERT INTO nodes (run_id, id, position, parent_id, depth, kind, title, prompt, files, agent,
       branch, worktree, status, attempts, summary, activity, pr_status, agent_own_id, activity_at, finished_at,
-      started_at, first_signal_at, shared, run_mode, agent_chat_id)
+      started_at, first_heard_at, shared, run_mode, agent_chat_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const selectRun = db.prepare("SELECT * FROM runs WHERE id = ?");
   const selectNodes = db.prepare("SELECT * FROM nodes WHERE run_id = ? ORDER BY position");
@@ -766,12 +766,12 @@ export function openStore(data: string): Store {
   const updateSignal = db.prepare(`UPDATE nodes SET activity = COALESCE(?, activity),
     activity_at = CASE WHEN ? IS NULL THEN activity_at ELSE ? END,
     agent_own_id = COALESCE(?, agent_own_id),
-    first_signal_at = COALESCE(first_signal_at, ?)
+    first_heard_at = COALESCE(first_heard_at, ?)
     WHERE run_id = ? AND id = ?`);
   const insertConversation = db.prepare(`INSERT INTO conversations (run_id, node_id, agent, conversation_id, seen_at)
     SELECT run_id, id, agent, ?, ? FROM nodes WHERE run_id = ? AND id = ?
     ON CONFLICT DO NOTHING`);
-  const updateLaunched = db.prepare(`UPDATE nodes SET activity = ?, activity_at = ?, first_signal_at = NULL,
+  const updateLaunched = db.prepare(`UPDATE nodes SET activity = ?, activity_at = ?, first_heard_at = NULL,
     started_at = COALESCE(started_at, ?) WHERE run_id = ? AND id = ?`);
   const selectConversations = db.prepare(`SELECT node_id, agent, conversation_id FROM conversations
     WHERE run_id = ? ORDER BY seen_at, node_id`);
@@ -856,7 +856,7 @@ export function openStore(data: string): Store {
           run.id, n.id, 0, null, 0, "leaf", n.title, n.prompt,
           "[]", n.agent, n.branch, n.worktree, n.status, n.attempts,
           n.summary ?? null, n.activity ?? null, n.prStatus ?? null, n.agentOwnId ?? null,
-          n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstSignalAt ?? null,
+          n.activityAt ?? null, n.finishedAt ?? null, n.startedAt ?? null, n.firstHeardAt ?? null,
           "[]", n.runMode ?? "terminal", n.agentChatId ?? "",
         );
         if (fork) {
@@ -893,7 +893,7 @@ export function openStore(data: string): Store {
         ...(n.activity_at !== null ? { activityAt: n.activity_at } : {}),
         ...(n.finished_at !== null ? { finishedAt: n.finished_at } : {}),
         ...(n.started_at !== null ? { startedAt: n.started_at } : {}),
-        ...(n.first_signal_at !== null ? { firstSignalAt: n.first_signal_at } : {}),
+        ...(n.first_heard_at !== null ? { firstHeardAt: n.first_heard_at } : {}),
         ...(n.run_mode === "chat" ? { runMode: "chat" as const } : {}),
         ...(n.agent_chat_id ? { agentChatId: n.agent_chat_id } : {}),
       }));
@@ -1685,13 +1685,13 @@ export function openStore(data: string): Store {
       if (db.prepare("DELETE FROM pull_requests WHERE run_id = ?").run(runId).changes) logEvent(runId, null, "pr", { number: null });
     },
 
-    getTerminateOnPrMerge(runId) {
-      const row = db.prepare("SELECT terminate_on_pr_merge AS t FROM runs WHERE id = ?").get(runId) as { t: number } | undefined;
+    getEndOnMerge(runId) {
+      const row = db.prepare("SELECT end_on_merge AS t FROM runs WHERE id = ?").get(runId) as { t: number } | undefined;
       return Number(row?.t ?? 0) === 1;
     },
 
-    setTerminateOnPrMerge(runId, terminate) {
-      const changed = db.prepare("UPDATE runs SET terminate_on_pr_merge = ? WHERE id = ?").run(terminate ? 1 : 0, runId).changes;
+    setEndOnMerge(runId, terminate) {
+      const changed = db.prepare("UPDATE runs SET end_on_merge = ? WHERE id = ?").run(terminate ? 1 : 0, runId).changes;
       if (Number(changed) === 0) throw new RunStoreError(`unknown run ${runId}`);
     },
 

@@ -220,7 +220,7 @@ describe("hook activity from agents", () => {
     const store = openStore(data);
     try {
       expect(store.loadRun("r1").node.agentOwnId).toBe("conv-1");
-      expect(store.loadRun("r1").node.firstSignalAt).toBeDefined();
+      expect(store.loadRun("r1").node.firstHeardAt).toBeDefined();
       expect(store.conversations("r1")).toEqual([{ nodeId: "agent", agent: "claude", id: "conv-1" }]);
     }
     finally { store.close(); }
@@ -231,7 +231,7 @@ describe("interactive mode (terminal sessions)", () => {
   async function interactive(): Promise<void> {
     await start();
     const res = await fetch(url("/api/v1/projects/proj/config"), {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "worker.mode", value: "interactive" }),
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "worker.view", value: "interactive" }),
     });
     expect(res.status).toBe(204);
   }

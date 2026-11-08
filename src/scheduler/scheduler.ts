@@ -65,11 +65,11 @@ export function commandRules(command: string): string[] {
 }
 
 // A model name only means something to its own agent: "claude.model" and "codex.model"
-// set each, and "worker.model" applies to the project's default agent only.
+// set each, and "worker.viewl" applies to the project's default agent only.
 export function modelFor(agent: Node["agent"], config: Record<string, string>): string | undefined {
   const own = config[`${agent}.model`]?.trim();
   if (own) return own;
-  return agent === (config["worker.agent"]?.trim() || "claude") ? config["worker.model"]?.trim() || undefined : undefined;
+  return agent === (config["worker.agent"]?.trim() || "claude") ? config["worker.viewl"]?.trim() || undefined : undefined;
 }
 
 // What an orchestrator brought back by resume is told before anything else.
@@ -219,13 +219,13 @@ export function createScheduler(d: SchedulerDeps) {
     }
     // An orchestrator is someone you talk to, so it always gets a terminal (the test fake
     // has none). A worker runs headless unless the project asks for terminals.
-    const chat = !run.spec?.terminal && (config["session.mode"] === "chat" || !!run.spec?.chat || !!fork || !!branch || node.agent === "delta") && (node.agent === "claude" || node.agent === "codex" || node.agent === "delta");
+    const chat = !run.spec?.terminal && (config["run.mode"] === "chat" || !!run.spec?.chat || !!fork || !!branch || node.agent === "delta") && (node.agent === "claude" || node.agent === "codex" || node.agent === "delta");
     if (chat && run.spec?.denyTools?.length) {
       const summary = "task denyTools cannot be enforced by this chat provider; use terminal mode or remove the unsupported restriction explicitly";
       await d.write(() => d.store.updateNode(run.id,NODE_ID,{status:"escalated",summary}));
       throw new SchedulerError(409,summary);
     }
-    const headless = chat || (worker ? config["worker.mode"] !== "interactive" : node.agent === "fake");
+    const headless = chat || (worker ? config["worker.view"] !== "interactive" : node.agent === "fake");
     const cfg = {
       sessionId, workspace: node.worktree, headless,
       permission: normalizePermission(config["worker.permission"] ?? DEFAULT_PERMISSION),
@@ -916,7 +916,7 @@ export function createScheduler(d: SchedulerDeps) {
   // The branch stays, and a worktree with uncommitted work is never forced: it is kept
   // and named, and the run is terminated all the same.
   async function terminateAfterMerge(run: Run, pr: PullRequest): Promise<void> {
-    if (!(await d.write(() => d.store.getTerminateOnPrMerge(run.id)))) return;
+    if (!(await d.write(() => d.store.getEndOnMerge(run.id)))) return;
     if (run.node.status === "running" || d.runtime.isAlive(sessionOf(run))) return;
     await d.write(() => d.store.updateNode(run.id, NODE_ID, { prStatus: "closed" }));
     const { kept } = await cleanWorkspace(run);
