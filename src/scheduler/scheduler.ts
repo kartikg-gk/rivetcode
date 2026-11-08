@@ -28,10 +28,11 @@ export const DEFAULT_PERMISSION = "accept-edits";
 export function capDelegatedPermission(parentAgent: Node["agent"], parent: Permission, childAgent: Node["agent"], requested: Permission): Permission {
   if (parent === "read-only" || requested === "read-only") return "read-only";
   if ((parent === "bypass-permissions" && parentAgent !== "delta") || (parentAgent === "codex" && parent === "default")) return requested;
-  if (parentAgent !== childAgent) return "read-only";
   const order: Permission[] = ["read-only", "default", "accept-edits", "auto", "bypass-permissions"];
   const effectiveRequest = childAgent === "codex" && requested === "default" ? "bypass-permissions" : requested;
-  return order.indexOf(effectiveRequest) > order.indexOf(parent) ? parent : requested;
+  const capped = order.indexOf(effectiveRequest) > order.indexOf(parent) ? parent : requested;
+  // Codex has no ask-first mode: its default is full access, so a capped default stays read-only.
+  return childAgent === "codex" && capped === "default" ? "read-only" : capped;
 }
 // The agent's own id of the last reply: where a native fork of Claude's conversation is pinned.
 function replyAnchor(items: { kind: string; itemId?: string }[]): { messageId?: string } {
