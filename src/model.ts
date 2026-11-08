@@ -9,10 +9,9 @@ export const ROLES = ["worker", "orchestrator"] as const;
 export const ACTIVITY_STATES = ["active", "idle", "waiting_input", "blocked", "exited"] as const;
 // Where a worker's pull request stands.
 export const PR_STATUSES = [
-  "working", "pr_open", "draft", "ci_failed", "review_pending", "changes_requested",
-  "approved", "mergeable", "merged", "needs_input", "exited", "idle", "terminated",
-  // An agent that has never reported back: working or stuck can't be told apart.
-  "no_signal",
+  "open", "draft", "checks-failing", "changes-wanted", "awaiting-review", "approved", "ready", "merged", "closed",
+  // Rivet stopped watching it for the person to decide (feedback could not be handed over).
+  "needs-you",
 ] as const;
 
 export type Agent = (typeof AGENTS)[number];

@@ -25,15 +25,15 @@ const facts = (over: Partial<PrFacts>): PrFacts => ({
 describe("prStatus", () => {
   it("ranks what needs attention first", () => {
     expect(prStatus(facts({ merged: true, open: false }))).toBe("merged");
-    expect(prStatus(facts({ open: false }))).toBe("terminated");
-    expect(prStatus(facts({ ci: "failing", draft: true }))).toBe("ci_failed");
+    expect(prStatus(facts({ open: false }))).toBe("closed");
+    expect(prStatus(facts({ ci: "failing", draft: true }))).toBe("checks-failing");
     expect(prStatus(facts({ draft: true, review: "changes_requested" }))).toBe("draft");
-    expect(prStatus(facts({ reviewComments: true, mergeability: "mergeable" }))).toBe("changes_requested");
-    expect(prStatus(facts({ mergeability: "mergeable", review: "review_required" }))).toBe("mergeable");
-    expect(prStatus(facts({ review: "review_required" }))).toBe("review_pending");
-    expect(prStatus(facts({ mergeability: "blocked", review: "approved" }))).toBe("pr_open");
+    expect(prStatus(facts({ reviewComments: true, mergeability: "mergeable" }))).toBe("changes-wanted");
+    expect(prStatus(facts({ mergeability: "mergeable", review: "review_required" }))).toBe("ready");
+    expect(prStatus(facts({ review: "review_required" }))).toBe("awaiting-review");
+    expect(prStatus(facts({ mergeability: "blocked", review: "approved" }))).toBe("open");
     expect(prStatus(facts({ review: "approved" }))).toBe("approved");
-    expect(prStatus(facts({}))).toBe("pr_open");
+    expect(prStatus(facts({}))).toBe("open");
   });
 });
 

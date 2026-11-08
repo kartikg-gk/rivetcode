@@ -100,7 +100,7 @@ describe("opening the pull request", () => {
     const runId = await spawn();
     const { pr, run } = await until(() => runOf(runId), (r) => r.pr !== null);
     expect(pr).toMatchObject({ number: 1, url: "https://github.com/o/r/pull/1" });
-    expect(run.node.prStatus).toBe("pr_open");
+    expect(run.node.prStatus).toBe("open");
     expect(gh.prs[0]).toMatchObject({ title: "add a", base: "main", head: { ref: `rivet/${runId}/agent` } });
     expect(gh.prs[0]!.body).toMatch(/Done by one agent \(fake\) in its own worktree/);
     expect(gh.prs[0]!.body).toMatch(/Files: `a\.txt`/);
@@ -189,7 +189,7 @@ describe("watching the pull request", () => {
     expect((await api("POST", `/api/v1/runs/${runId}/linked-prs`, { number: 2 })).status).toBe(200);
     await until(() => runOf(runId), result => result.run.node.attempts === 2 && result.run.node.status === "done");
     const links = (await api("GET", `/api/v1/runs/${runId}/linked-prs`)).json.linked;
-    expect(links[0].handled).toContain("ci_failed");
+    expect(links[0].handled).toContain("checks-failing");
     await new Promise(resolve => setTimeout(resolve, 500));
     expect((await runOf(runId)).run.node.attempts).toBe(2);
   });
@@ -197,7 +197,7 @@ describe("watching the pull request", () => {
     const runId = await opened();
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     gh.annotations[9] = [{ path: "a.txt" }];
-    const { run } = await until(() => runOf(runId), (r) => r.run.node.attempts === 2 && r.run.node.status === "done" && (r.pr?.handled ?? "").startsWith("ci_failed"));
+    const { run } = await until(() => runOf(runId), (r) => r.run.node.attempts === 2 && r.run.node.status === "done" && (r.pr?.handled ?? "").startsWith("checks-failing"));
     // Fixed and finished: the CI failure no longer stands on the worker.
     expect(run.node.summary ?? null).toBeNull();
     await new Promise((r) => setTimeout(r, 600));
@@ -208,7 +208,7 @@ describe("watching the pull request", () => {
     const runId = await opened();
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     gh.annotations[9] = [{ path: "a.txt" }];
-    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("ci_failed"));
+    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("checks-failing"));
     expect(gh.requests.some((r) => r.includes("/annotations"))).toBe(false);
   });
 
@@ -218,7 +218,7 @@ describe("watching the pull request", () => {
     await until(() => runOf(runId), (r) => r.pr !== null);
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     gh.annotations[9] = [{ path: "a.txt" }];
-    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("ci_failed"));
+    await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("checks-failing"));
     expect(gh.requests.some((r) => r.includes("/check-runs/9/annotations"))).toBe(true);
   });
 
@@ -253,8 +253,8 @@ describe("ending the run after the merge", () => {
     expect((await runOf(runId)).terminateOnPrMerge).toBe(false);
     expect((await policy(runId, true)).status).toBe(200);
     merge();
-    const after = await until(() => runOf(runId), (r) => r.pr?.handled === "terminated");
-    expect(after.run.node.prStatus).toBe("terminated");
+    const after = await until(() => runOf(runId), (r) => r.pr?.handled === "closed");
+    expect(after.run.node.prStatus).toBe("closed");
     expect(existsSync(run.node.worktree)).toBe(false);
     expect((await git(["branch", "--list", run.node.branch], repo)).trim()).not.toBe("");
   });
@@ -266,7 +266,7 @@ describe("ending the run after the merge", () => {
     await policy(runId, true);
     await writeFile(join(run.node.worktree, "notes.txt"), "not committed");
     merge();
-    const after = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("terminated"));
+    const after = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("closed"));
     expect(after.pr!.handled).toBe("terminated; kept agent");
     expect(existsSync(join(run.node.worktree, "notes.txt"))).toBe(true);
   });
@@ -409,9 +409,9 @@ it("keeps the CI cap when passing checks fail again on the same commit",async()=
   await start({pr:"auto","reactions.ciRetries":"1"});
   const id=await spawn();await until(()=>runOf(id),r=>r.pr!==null);
   gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
-  await until(()=>runOf(id),r=>r.run.node.attempts===2&&r.run.node.status==="done"&&(r.pr?.handled??"").startsWith("ci_failed"));
+  await until(()=>runOf(id),r=>r.run.node.attempts===2&&r.run.node.status==="done"&&(r.pr?.handled??"").startsWith("checks-failing"));
   gh.checks.sha1=[{id:9,status:"completed",conclusion:"success"}];
-  await until(()=>runOf(id),r=>!(r.pr?.handled??"").startsWith("ci_failed"));
+  await until(()=>runOf(id),r=>!(r.pr?.handled??"").startsWith("checks-failing"));
   gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
   await until(()=>runOf(id),r=>(r.run.node.summary??"").includes("retry limit"));
   await new Promise(r=>setTimeout(r,500));

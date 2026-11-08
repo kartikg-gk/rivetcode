@@ -753,7 +753,7 @@ export function createScheduler(d: SchedulerDeps) {
         await abortMerge(node.worktree).catch(report);
         if ((await headOf(node.worktree)) !== before) await resetTo(node.worktree, before).catch(report);
         const why = `merging the latest ${run.base} conflicts in ${synced.conflicts.join(", ")}: ${resolved.reason}`;
-        await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "needs_input" }));
+        await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "needs-you" }));
         throw new SchedulerError(409, why);
       }
     }
@@ -764,7 +764,7 @@ export function createScheduler(d: SchedulerDeps) {
         if (!result.ok) {
           await resetTo(node.worktree, before);
           const why = `tests "${test}" fail after merging the latest ${run.base}:\n${result.output}`;
-          await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "needs_input" }));
+          await d.write(() => d.store.updateNode(runId, NODE_ID, { summary: why, prStatus: "needs-you" }));
           throw new SchedulerError(409, why);
         }
       }
@@ -777,7 +777,7 @@ export function createScheduler(d: SchedulerDeps) {
     const pr = await github.createPr({ title, head: node.branch, base: run.base, body: await prBody(run) });
     await d.write(() => {
       d.store.setPr(runId, pr);
-      d.store.updateNode(runId, NODE_ID, { prStatus: "pr_open" });
+      d.store.updateNode(runId, NODE_ID, { prStatus: "open" });
     });
     return pr;
   }
@@ -818,14 +818,14 @@ export function createScheduler(d: SchedulerDeps) {
         }
       }
       let allowed = true;
-      if (run.node.status === "done" && status === "ci_failed" && handled !== eventKey) {
+      if (run.node.status === "done" && status === "checks-failing" && handled !== eventKey) {
         const cap = Number(config["reactions.ciRetries"] ?? 2);
         if ((state.ciRetries ?? 0) >= cap) {
           if (!state.ciEscalated) { alert("Pull request #"+number+" reached its CI fix retry limit ("+cap+"). Manual attention is needed."); state.ciEscalated=true; }
           allowed = false;
         } else { state.ciRetries = (state.ciRetries ?? 0)+1; state.ciKey = eventKey; }
       }
-      if (status === "changes_requested" && state.reviewEscalated) allowed = false;
+      if (status === "changes-wanted" && state.reviewEscalated) allowed = false;
       if (JSON.stringify(state) !== before) d.store.saveLifecycleState(run.id,key,state);
       return allowed;
     });
@@ -859,8 +859,8 @@ export function createScheduler(d: SchedulerDeps) {
           if (permitted && facts.open && current.node.status === "done" && link.handled !== key) {
             const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
             let feedback: string | undefined;
-            if (status === "ci_failed") feedback = ciFeedback(link, full ? await github.failedPaths(link.number) : undefined);
-            else if (status === "changes_requested") feedback = reviewFeedback(link, full ? await github.reviewComments(link.number) : undefined);
+            if (status === "checks-failing") feedback = ciFeedback(link, full ? await github.failedPaths(link.number) : undefined);
+            else if (status === "changes-wanted") feedback = reviewFeedback(link, full ? await github.reviewComments(link.number) : undefined);
             else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") feedback = "Linked pull request #" + link.number + " needs its branch updated or conflicts resolved: " + link.url;
             if (feedback) {
               await reopen(runId, feedback);
@@ -880,7 +880,7 @@ export function createScheduler(d: SchedulerDeps) {
       await terminateAfterMerge(run, pr);
       return "merged";
     }
-    if (node.prStatus === "terminated") return node.prStatus;
+    if (node.prStatus === "closed") return node.prStatus;
     const github = await d.github(run);
     const facts = await github.facts(pr.number);
     if (shuttingDown) return null;
@@ -892,7 +892,7 @@ export function createScheduler(d: SchedulerDeps) {
       return status;
     }
     const key = `${status}:${facts.mergeability}:${facts.headSha}`;
-    if (node.status === "done" && facts.open && (status === "pr_open" || status === "mergeable" || status === "approved" || status === "review_pending")) {
+    if (node.status === "done" && facts.open && (status === "open" || status === "ready" || status === "approved" || status === "awaiting-review")) {
       await autoReview(run, facts.headSha).catch(report);
     }
     // Work is already under way, or this exact state was handled before.
@@ -900,9 +900,9 @@ export function createScheduler(d: SchedulerDeps) {
     // By default the worker is told where the feedback is and reads it itself; "full" has
     // Rivet fetch it and hand it over.
     const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
-    if (status === "ci_failed") {
+    if (status === "checks-failing") {
       await reopen(runId, ciFeedback(pr, full ? await github.failedPaths(pr.number) : undefined));
-    } else if (status === "changes_requested") {
+    } else if (status === "changes-wanted") {
       await reopen(runId, reviewFeedback(pr, full ? await github.reviewComments(pr.number) : undefined));
     } else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") {
       await publish(runId).catch(report);
@@ -918,9 +918,9 @@ export function createScheduler(d: SchedulerDeps) {
   async function terminateAfterMerge(run: Run, pr: PullRequest): Promise<void> {
     if (!(await d.write(() => d.store.getTerminateOnPrMerge(run.id)))) return;
     if (run.node.status === "running" || d.runtime.isAlive(sessionOf(run))) return;
-    await d.write(() => d.store.updateNode(run.id, NODE_ID, { prStatus: "terminated" }));
+    await d.write(() => d.store.updateNode(run.id, NODE_ID, { prStatus: "closed" }));
     const { kept } = await cleanWorkspace(run);
-    await d.write(() => d.store.setPr(run.id, { ...pr, handled: kept.length ? `terminated; kept ${kept.join(", ")}` : "terminated" }));
+    await d.write(() => d.store.setPr(run.id, { ...pr, handled: kept.length ? `closed; kept ${kept.join(", ")}` : "closed" }));
     if (kept.length) report(new Error(`run ${run.id}: kept its worktree, which has uncommitted work`));
   }
 

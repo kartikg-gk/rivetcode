@@ -52,8 +52,8 @@ describe("project records", () => {
     expect(store.projectMetadata(run.project)?.scripts).toEqual([{ id: "check", command: "npm test" }]);
     expect(() => store.deleteProject(run.project)).toThrow(/active and pending/);
     store.updateNode(run.id, run.node.id, { status: "done" });
-    store.addLinkedPr(run.id, { number: 2, url: "https://github.com/a/b/pull/2", status: "pr_open" });
-    store.addLinkedPr(run.id, { number: 3, url: "https://github.com/a/b/pull/3", status: "pr_open" });
+    store.addLinkedPr(run.id, { number: 2, url: "https://github.com/a/b/pull/2", status: "open" });
+    store.addLinkedPr(run.id, { number: 3, url: "https://github.com/a/b/pull/3", status: "open" });
     store.writePrGuides(run.id, [{ number: 2, text: "First guide" }, { number: 3, text: "Second guide" }]);
     expect(store.linkedPrs(run.id).map(pr => pr.number)).toEqual([2, 3]);
     expect(store.readPrGuide(run.id, 3)).toBe("Second guide");
@@ -72,7 +72,7 @@ describe("saveRun / loadRun", () => {
   it("round-trips a run and every field", () => {
     const run: Run = {
       ...sampleRun(), role: "orchestrator", name: "login work", orchestrator: "r0-agent", model: "haiku",
-      node: { ...sampleRun().node, prStatus: "pr_open", activity: "waiting_input", summary: "s" },
+      node: { ...sampleRun().node, prStatus: "open", activity: "waiting_input", summary: "s" },
     };
     store.saveRun(run);
     expect(store.loadRun("r1")).toEqual(run);

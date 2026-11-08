@@ -570,7 +570,7 @@ async function status(args: string[], io: CliIo): Promise<number> {
     const c = result.chatUsage;
     io.out(`context: ${c.contextUsed} of ${c.contextWindow} tokens (${Math.round((100 * c.contextUsed!) / c.contextWindow!)}%)`);
   }
-  if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.node.prStatus ?? "pr_open"})`);
+  if (result.pr) io.out(`pull request: ${result.pr.url} (${result.run.node.prStatus ?? "open"})`);
   return 0;
 }
 

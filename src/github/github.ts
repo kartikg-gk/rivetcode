@@ -183,13 +183,13 @@ export function githubClient(o: { repo: string; token: string; api?: string }): 
 // Where the root's pull request stands, most urgent first.
 export function prStatus(f: PrFacts): PrStatus {
   if (f.merged) return "merged";
-  if (!f.open) return "terminated";
-  if (f.ci === "failing") return "ci_failed";
+  if (!f.open) return "closed";
+  if (f.ci === "failing") return "checks-failing";
   if (f.draft) return "draft";
-  if (f.review === "changes_requested" || f.reviewComments) return "changes_requested";
-  if (f.mergeability === "mergeable") return "mergeable";
-  if (f.review === "review_required") return "review_pending";
-  if (f.mergeability === "blocked") return "pr_open";
+  if (f.review === "changes_requested" || f.reviewComments) return "changes-wanted";
+  if (f.mergeability === "mergeable") return "ready";
+  if (f.review === "review_required") return "awaiting-review";
+  if (f.mergeability === "blocked") return "open";
   if (f.review === "approved") return "approved";
-  return "pr_open";
+  return "open";
 }
