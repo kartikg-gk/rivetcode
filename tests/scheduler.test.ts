@@ -99,7 +99,7 @@ describe("a worker", () => {
     expect(commit.status, JSON.stringify(commit.json)).toBe(200);
     expect(commit.json.committed).toBe(true);
     expect((await show(run.node.branch, "change.txt")).trim()).toBe("worker edit");
-    expect((await api("POST", "/api/v1/reports", { sessionId: `${id}-agent`, kind: "done", message: "finished work" })).status).toBe(201);
+    expect((await api("POST", "/api/v1/outcomes", { sessionId: `${id}-agent`, kind: "done", message: "finished work" })).status).toBe(201);
     const history = () => api("GET", `/api/v1/runs/${id}/timeline?view=activity`);
     while (!(await history()).json.items.some((item: { text: string }) => item.text.includes("reported done"))) {
       if (Date.now() >= deadline) throw new Error("done report was not recorded");
@@ -155,7 +155,7 @@ describe("a worker", () => {
     await start();
     const runId = await spawn({ files: { "r.txt": "r" }, commit: "r", stayFor: 60_000 });
     await new Promise((r) => setTimeout(r, 300));
-    expect((await api("POST", "/api/v1/reports", { sessionId: `${runId}-agent`, kind: "done", message: "ok" })).status).toBe(201);
+    expect((await api("POST", "/api/v1/outcomes", { sessionId: `${runId}-agent`, kind: "done", message: "ok" })).status).toBe(201);
     expect((await settled(runId)).node.status).toBe("done");
   });
 });
@@ -167,7 +167,7 @@ describe("an orchestrator", () => {
     expect(orch.status).toBe(201);
     const orchestrator = orch.json.runId as string;
     const worker = await spawn({ files: { "w.txt": "w" }, commit: "w" }, { name: "write w", from: `${orchestrator}-agent` });
-    await api("POST", "/api/v1/reports", { sessionId: `${worker}-agent`, kind: "stuck", message: "which file?" });
+    await api("POST", "/api/v1/outcomes", { sessionId: `${worker}-agent`, kind: "blocked", message: "which file?" });
     expect((await settled(worker)).orchestrator).toBe(`${orchestrator}-agent`);
     expect(await getRun(orchestrator)).toMatchObject({ role: "orchestrator", node: { status: "running" } });
     // A worker spawned from another worker's session reports to nobody.
@@ -252,7 +252,7 @@ describe("resume and recovery", () => {
     daemon = undefined;
     await start();
     expect((await getRun(runId)).node.status).toBe("running");
-    await api("POST", "/api/v1/reports", { sessionId: `${runId}-agent`, kind: "done", message: "ok" });
+    await api("POST", "/api/v1/outcomes", { sessionId: `${runId}-agent`, kind: "done", message: "ok" });
     expect((await settled(runId)).node.status).toBe("done");
   });
 
@@ -593,22 +593,22 @@ describe("delegating to a partner", () => {
   });
 });
 
-describe("automations", () => {
+describe("routines", () => {
   it("are saved with their next time, run by hand without moving it, paused and removed", async () => {
     await start();
-    const add = await api("POST", "/api/v1/automations", { repo, name: "nightly", cron: "0 2 * * *", zone: "UTC", prompt: JSON.stringify({ files: { "n.txt": "n" }, commit: "n" }), agent: "fake" });
+    const add = await api("POST", "/api/v1/routines", { repo, name: "nightly", cron: "0 2 * * *", zone: "UTC", prompt: JSON.stringify({ files: { "n.txt": "n" }, commit: "n" }), agent: "fake" });
     expect(add.status).toBe(201);
     expect(add.json).toMatchObject({ name: "nightly", enabled: true, role: "worker", nextRunAt: expect.stringMatching(/T02:00:00\.000Z$/) });
-    expect((await api("POST", "/api/v1/automations", { repo, name: "nightly", cron: "0 2 * * *", prompt: "x" })).status).toBe(409);
-    expect((await api("POST", "/api/v1/automations", { repo, name: "bad", cron: "0 25 * * *", prompt: "x" })).json.error).toMatch(/out of 0-23/);
-    const ran = await api("POST", "/api/v1/automations/nightly/run");
+    expect((await api("POST", "/api/v1/routines", { repo, name: "nightly", cron: "0 2 * * *", prompt: "x" })).status).toBe(409);
+    expect((await api("POST", "/api/v1/routines", { repo, name: "bad", cron: "0 25 * * *", prompt: "x" })).json.error).toMatch(/out of 0-23/);
+    const ran = await api("POST", "/api/v1/routines/nightly/run");
     expect((await settled(ran.json.runId)).name).toBe("nightly");
-    const listed = (await api("GET", "/api/v1/automations")).json.automations[0];
+    const listed = (await api("GET", "/api/v1/routines")).json.routines[0];
     expect(listed.nextRunAt).toBe(add.json.nextRunAt);
     expect(listed.runs).toMatchObject([{ runId: ran.json.runId }]);
-    expect((await api("POST", "/api/v1/automations/nightly/pause")).json.enabled).toBe(false);
-    expect((await api("DELETE", "/api/v1/automations/nightly")).status).toBe(204);
-    expect((await api("GET", "/api/v1/automations")).json.automations).toEqual([]);
+    expect((await api("POST", "/api/v1/routines/nightly/pause")).json.enabled).toBe(false);
+    expect((await api("DELETE", "/api/v1/routines/nightly")).status).toBe(204);
+    expect((await api("GET", "/api/v1/routines")).json.routines).toEqual([]);
   });
 
   it("starts the run of one that came due while the daemon was down, once", async () => {
@@ -616,7 +616,7 @@ describe("automations", () => {
     const { realpath } = await import("node:fs/promises");
     const root = await realpath(repo);
     const store = openStore(data);
-    store.saveAutomation({
+    store.saveRoutine({
       id: "a1", project: projectOf(root), repo: root, name: "missed", prompt: JSON.stringify({ commit: "none" }), role: "worker", agent: "fake",
       cron: "0 2 * * *", zone: "UTC", enabled: true, nextRunAt: "2026-01-01T02:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z",
     });
@@ -625,7 +625,7 @@ describe("automations", () => {
     const end = Date.now() + 10_000;
     let a: { nextRunAt: string; runs: { runId?: string }[] };
     do {
-      a = (await api("GET", "/api/v1/automations")).json.automations[0];
+      a = (await api("GET", "/api/v1/routines")).json.routines[0];
       if (a.runs.length) break;
       await new Promise((r) => setTimeout(r, 50));
     } while (Date.now() < end);
@@ -716,7 +716,7 @@ describe("switching a worker's agent", () => {
     await api("POST", `/api/v1/sessions/${runId}-agent/activity`, { state: "busy" });
     const switching = api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" });
     await new Promise((r) => setTimeout(r, 300));
-    await api("POST", "/api/v1/reports", { sessionId: `${runId}-agent`, kind: "done", message: "finished" });
+    await api("POST", "/api/v1/outcomes", { sessionId: `${runId}-agent`, kind: "done", message: "finished" });
     expect((await switching).json.error).toMatch(/finished its task/);
     expect((await getRun(runId)).node.agent).toBe("fake");
   });

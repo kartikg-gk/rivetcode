@@ -25,7 +25,7 @@ it("creates, pauses, resumes and deletes schedules through the agent bridge",asy
  const call=toolCaller({RIVET_RUN_FILE:runFile,RIVET_SESSION_ID:"r1-agent"},repo);
  const created=await call("rivet_schedule",{action:"create",name:"weekly-check",prompt:"inspect current state",cron:"0 12 * * 1",zone:"UTC"}) as {id:string};
  expect(created.id).toBeTruthy();await call("rivet_schedule",{action:"pause",id:created.id});
- expect(await call("rivet_schedule",{action:"list"})).toMatchObject({automations:[{enabled:false}]});
+ expect(await call("rivet_schedule",{action:"list"})).toMatchObject({routines:[{enabled:false}]});
  await call("rivet_schedule",{action:"resume",id:created.id});await call("rivet_schedule",{action:"delete",id:created.id});
- expect(await call("rivet_schedule",{action:"list"})).toMatchObject({automations:[]});
+ expect(await call("rivet_schedule",{action:"list"})).toMatchObject({routines:[]});
 });

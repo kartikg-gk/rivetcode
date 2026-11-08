@@ -82,7 +82,7 @@ export type Store = {
   markLaunched(runId: string, nodeId: string, active?: boolean): void;
   // Every agent conversation a run's nodes have had.
   conversations(runId: string): { nodeId: string; agent: string; id: string }[];
-  createReport(runId: string, nodeId: string, kind: "done" | "stuck" | "needs-input", message?: string): number | null;
+  recordOutcome(runId: string, nodeId: string, kind: "done" | "blocked" | "question", message?: string): number | null;
   // mode: steer (typed in as soon as the agent can take it), queue (only once it is idle),
   // interrupt (its current turn is stopped first).
   queueMessage(runId: string, nodeId: string, message: string, from?: string, mode?: SendMode): number | null;
@@ -113,13 +113,13 @@ export type Store = {
   startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
   endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
   reviewsOf(runId: string): Review[];
-  saveAutomation(a: Automation): void;
-  listAutomations(project?: string): Automation[];
-  deleteAutomation(id: string): boolean;
-  recordAutomationRun(r: Omit<AutomationRun, "id">): void;
-  automationRuns(automationId: string): AutomationRun[];
-  // A project's cues, by name.
-  saveCue(cue: Cue): void;
+  saveRoutine(a: Routine): void;
+  listRoutines(project?: string): Routine[];
+  deleteRoutine(id: string): boolean;
+  recordRoutineRun(r: Omit<RoutineRun, "id">): void;
+  routineRuns(routineId: string): RoutineRun[];
+  // A project's snippets, by name.
+  saveSnippet(snippet: Snippet): void;
   // A session's timeline (session: agent, review or partner). A prompt that repeats the
   // session's recent prompts or messages is the same one seen twice (Rivet and a hook) and is skipped.
   addTimeline(runId: string, session: string, entries: TimelineEntry[]): void;
@@ -151,8 +151,8 @@ export type Store = {
   providerLines(runId: string, o: { after?: number; limit: number; session?: string }): { position: number; method: string; payload: string; at: string }[];
   // Entries after a position, oldest first; kinds narrows them (the messages view).
   readTimeline(runId: string, o: { after?: number; limit: number; kinds?: TimelineKind[]; session?: string }): { items: TimelineItem[]; total: number };
-  listCues(project: string): Cue[];
-  deleteCue(project: string, name: string): boolean;
+  listSnippets(project: string): Snippet[];
+  deleteSnippet(project: string, name: string): boolean;
   // Whether the run ends (agents stopped, worktrees removed) once its pull request merges.
   getTerminateOnPrMerge(runId: string): boolean;
   setTerminateOnPrMerge(runId: string, terminate: boolean): void;
@@ -187,7 +187,7 @@ export type Review = {
 };
 
 // A saved prompt or command of a project, run by name.
-export type Cue = {
+export type Snippet = {
   project: string;
   name: string;
   // agent: a prompt for an agent; command: a shell command run in a terminal.
@@ -197,7 +197,7 @@ export type Cue = {
 };
 
 // A prompt run on a schedule: each time it comes round, a worker or orchestrator starts.
-export type Automation = {
+export type Routine = {
   id: string;
   project: string;
   repo: string;
@@ -213,8 +213,8 @@ export type Automation = {
   createdAt: string;
 };
 
-// One time an automation came round: the run it started, or why it could not.
-export type AutomationRun = { id: number; automationId: string; scheduledFor: string; runId?: string; error?: string; createdAt: string };
+// One time an routine came round: the run it started, or why it could not.
+export type RoutineRun = { id: number; routineId: string; scheduledFor: string; runId?: string; error?: string; createdAt: string };
 
 export const SEND_MODES = ["steer", "queue", "interrupt"] as const;
 export type SendMode = (typeof SEND_MODES)[number];
@@ -307,7 +307,7 @@ CREATE TABLE reports (
   id INTEGER PRIMARY KEY,
   run_id TEXT NOT NULL,
   node_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('done', 'stuck', 'needs-input')),
+  kind TEXT NOT NULL CHECK (kind IN ('done', 'blocked', 'question')),
   message TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
@@ -635,7 +635,7 @@ ALTER TABLE runs ADD COLUMN spec TEXT;
 
 // Prompts run on a schedule, and each time they ran.
 MIGRATIONS.push({ version: 12, sql: `
-CREATE TABLE automations (
+CREATE TABLE routines (
   id TEXT PRIMARY KEY,
   project TEXT NOT NULL,
   repo TEXT NOT NULL,
@@ -651,9 +651,9 @@ CREATE TABLE automations (
   created_at TEXT NOT NULL,
   UNIQUE (project, name)
 );
-CREATE TABLE automation_runs (
+CREATE TABLE routine_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  automation_id TEXT NOT NULL REFERENCES automations(id) ON DELETE CASCADE,
+  routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
   scheduled_for TEXT NOT NULL,
   run_id TEXT,
   error TEXT,
@@ -663,7 +663,7 @@ CREATE TABLE automation_runs (
 
 // Saved prompts and commands per project.
 MIGRATIONS.push({ version: 11, sql: `
-CREATE TABLE cues (
+CREATE TABLE snippets (
   project TEXT NOT NULL,
   name TEXT NOT NULL,
   type TEXT NOT NULL CHECK (type IN ('agent', 'command')),
@@ -946,7 +946,7 @@ export function openStore(data: string): Store {
         .map((r) => ({ nodeId: r.node_id, agent: r.agent, id: r.conversation_id }));
     },
 
-    createReport(runId, nodeId, kind, message) {
+    recordOutcome(runId, nodeId, kind, message) {
       if (!sessionExists.get(runId, nodeId)) return null;
       const id = Number(insertReport.run(runId, nodeId, kind, message ?? null, new Date().toISOString()).lastInsertRowid);
       logEvent(runId, nodeId, "report", { kind });
@@ -1006,7 +1006,7 @@ export function openStore(data: string): Store {
     exitStaleSessions() {
       // Record each session left behind by a stopped daemon as exited.
       const stale = selectStale.all() as { run_id: string; id: string; activity: string }[];
-      for (const s of stale) logEvent(s.run_id, s.id, "session.ended", { from: s.activity, reason: "daemon restarted" });
+      for (const s of stale) logEvent(s.run_id, s.id, "session.closed", { from: s.activity, reason: "daemon restarted" });
       return Number(updateStale.run().changes);
     },
 
@@ -1023,20 +1023,20 @@ export function openStore(data: string): Store {
       if (diff.length) logEvent(runId, nodeId, "run.changed", Object.fromEntries(diff.map((k) => [k, fields[k]])));
     },
 
-    saveAutomation(a) {
-      db.prepare(`INSERT INTO automations (id, project, repo, name, prompt, role, agent, cron, zone, enabled, next_run_at, last_run_at, created_at)
+    saveRoutine(a) {
+      db.prepare(`INSERT INTO routines (id, project, repo, name, prompt, role, agent, cron, zone, enabled, next_run_at, last_run_at, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET prompt = excluded.prompt, role = excluded.role, agent = excluded.agent, cron = excluded.cron,
           zone = excluded.zone, enabled = excluded.enabled, next_run_at = excluded.next_run_at, last_run_at = excluded.last_run_at`)
         .run(a.id, a.project, a.repo, a.name, a.prompt, a.role, a.agent ?? null, a.cron, a.zone, a.enabled ? 1 : 0, a.nextRunAt, a.lastRunAt ?? null, a.createdAt);
     },
 
-    listAutomations(project) {
+    listRoutines(project) {
       type Row = { id: string; project: string; repo: string; name: string; prompt: string; role: Role; agent: string | null; cron: string;
         zone: string; enabled: number; next_run_at: string; last_run_at: string | null; created_at: string };
       const rows = (project === undefined
-        ? db.prepare("SELECT * FROM automations ORDER BY project, name").all()
-        : db.prepare("SELECT * FROM automations WHERE project = ? ORDER BY name").all(project)) as Row[];
+        ? db.prepare("SELECT * FROM routines ORDER BY project, name").all()
+        : db.prepare("SELECT * FROM routines WHERE project = ? ORDER BY name").all(project)) as Row[];
       return rows.map((r) => ({
         id: r.id, project: r.project, repo: r.repo, name: r.name, prompt: r.prompt, role: r.role, cron: r.cron, zone: r.zone,
         enabled: r.enabled === 1, nextRunAt: r.next_run_at, createdAt: r.created_at,
@@ -1044,19 +1044,19 @@ export function openStore(data: string): Store {
       }));
     },
 
-    deleteAutomation(id) {
-      return db.prepare("DELETE FROM automations WHERE id = ?").run(id).changes > 0;
+    deleteRoutine(id) {
+      return db.prepare("DELETE FROM routines WHERE id = ?").run(id).changes > 0;
     },
 
-    recordAutomationRun(r) {
-      db.prepare("INSERT INTO automation_runs (automation_id, scheduled_for, run_id, error, created_at) VALUES (?, ?, ?, ?, ?)")
-        .run(r.automationId, r.scheduledFor, r.runId ?? null, r.error ?? null, r.createdAt);
+    recordRoutineRun(r) {
+      db.prepare("INSERT INTO routine_runs (routine_id, scheduled_for, run_id, error, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(r.routineId, r.scheduledFor, r.runId ?? null, r.error ?? null, r.createdAt);
     },
 
-    automationRuns(automationId) {
-      type Row = { id: number; automation_id: string; scheduled_for: string; run_id: string | null; error: string | null; created_at: string };
-      return (db.prepare("SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY id").all(automationId) as Row[]).map((r) => ({
-        id: Number(r.id), automationId: r.automation_id, scheduledFor: r.scheduled_for, createdAt: r.created_at,
+    routineRuns(routineId) {
+      type Row = { id: number; routine_id: string; scheduled_for: string; run_id: string | null; error: string | null; created_at: string };
+      return (db.prepare("SELECT * FROM routine_runs WHERE routine_id = ? ORDER BY id").all(routineId) as Row[]).map((r) => ({
+        id: Number(r.id), routineId: r.routine_id, scheduledFor: r.scheduled_for, createdAt: r.created_at,
         ...(r.run_id !== null ? { runId: r.run_id } : {}), ...(r.error !== null ? { error: r.error } : {}),
       }));
     },
@@ -1577,8 +1577,8 @@ export function openStore(data: string): Store {
       db.prepare(`DELETE FROM thread_forks WHERE run_id IN (${ids})`).run(id);
       db.prepare("DELETE FROM runs WHERE project=?").run(id);
       db.prepare("DELETE FROM project_config WHERE project=?").run(id);
-      db.prepare("DELETE FROM automations WHERE project=?").run(id);
-      db.prepare("DELETE FROM cues WHERE project=?").run(id);
+      db.prepare("DELETE FROM routines WHERE project=?").run(id);
+      db.prepare("DELETE FROM snippets WHERE project=?").run(id);
       db.prepare("INSERT INTO registered_projects VALUES (?,?,?,'','[]',?) ON CONFLICT(id) DO UPDATE SET instructions='',scripts='[]',deleted_at=excluded.deleted_at")
         .run(id, project.repo, project.title, new Date().toISOString());
     },
@@ -1602,20 +1602,20 @@ export function openStore(data: string): Store {
       };
     },
 
-    saveCue(cue) {
-      db.prepare(`INSERT INTO cues (project, name, type, text, updated_at) VALUES (?, ?, ?, ?, ?)
+    saveSnippet(snippet) {
+      db.prepare(`INSERT INTO snippets (project, name, type, text, updated_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (project, name) DO UPDATE SET type = excluded.type, text = excluded.text, updated_at = excluded.updated_at`)
-        .run(cue.project, cue.name, cue.type, cue.text, cue.updatedAt);
+        .run(snippet.project, snippet.name, snippet.type, snippet.text, snippet.updatedAt);
     },
 
-    listCues(project) {
-      type Row = { project: string; name: string; type: Cue["type"]; text: string; updated_at: string };
-      return (db.prepare("SELECT * FROM cues WHERE project = ? ORDER BY name").all(project) as Row[])
+    listSnippets(project) {
+      type Row = { project: string; name: string; type: Snippet["type"]; text: string; updated_at: string };
+      return (db.prepare("SELECT * FROM snippets WHERE project = ? ORDER BY name").all(project) as Row[])
         .map((r) => ({ project: r.project, name: r.name, type: r.type, text: r.text, updatedAt: r.updated_at }));
     },
 
-    deleteCue(project, name) {
-      return db.prepare("DELETE FROM cues WHERE project = ? AND name = ?").run(project, name).changes > 0;
+    deleteSnippet(project, name) {
+      return db.prepare("DELETE FROM snippets WHERE project = ? AND name = ?").run(project, name).changes > 0;
     },
 
     startReview(runId, sha, trigger) {

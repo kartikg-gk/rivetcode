@@ -86,8 +86,8 @@ function Sidebar({ close }: { close(): void }) {
         {icon("Settings", Settings, () => set({ screen: "settings" }))}
         {icon("Machine and recovery", Activity, () => set({ screen: "health" }))}
         {icon("Conflicts between workers", BarChart2, () => set({ screen: "radar" }))}
-        {icon("Cues", Sparkles, () => set({ screen: "cues" }))}
-        {icon("Schedules", Clock, () => set({ screen: "automations" }))}
+        {icon("Snippets", Sparkles, () => set({ screen: "snippets" }))}
+        {icon("Schedules", Clock, () => set({ screen: "routines" }))}
         {icon("Task file", FileText, () => set({ screen: "tasks" }))}
         {icon(archived ? "Show active" : "Show archived", Archive, () => setArchived(!archived), archived)}
       </div>

@@ -109,7 +109,7 @@ describe("daemon ownership and lifecycle", () => {
   it("upgrades a version 1 database on startup", async () => {
     seed();
     const db = new DatabaseSync(join(data, "rivet.db"));
-    db.exec("DROP TABLE lifecycle_state; DROP TABLE environment_preferences; DROP TABLE linked_pull_requests; DROP TABLE registered_projects; DROP TABLE pull_request_guides; DROP TABLE run_organization; DROP TABLE recovery_journal; DROP TABLE conversation_branches; DROP TABLE wait_subscriptions; DROP TABLE chat_receipts; DROP TRIGGER chat_search_insert; DROP TRIGGER chat_search_update; DROP TRIGGER chat_search_delete; DROP TRIGGER timeline_search_insert; DROP TRIGGER timeline_search_delete; DROP TABLE chat_search; DROP TABLE timeline_search; DROP TABLE context_transfers; DROP TABLE thread_forks; ALTER TABLE chat_turns DROP COLUMN agent; DROP TABLE chat_raw; DROP TABLE chat_log; DROP TABLE chat_turns; DROP TABLE chat_sessions; ALTER TABLE nodes DROP COLUMN agent_chat_id; ALTER TABLE nodes DROP COLUMN run_mode; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE automation_runs; DROP TABLE automations; DROP TABLE cues; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_own_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
+    db.exec("DROP TABLE lifecycle_state; DROP TABLE environment_preferences; DROP TABLE linked_pull_requests; DROP TABLE registered_projects; DROP TABLE pull_request_guides; DROP TABLE run_organization; DROP TABLE recovery_journal; DROP TABLE conversation_branches; DROP TABLE wait_subscriptions; DROP TABLE chat_receipts; DROP TRIGGER chat_search_insert; DROP TRIGGER chat_search_update; DROP TRIGGER chat_search_delete; DROP TRIGGER timeline_search_insert; DROP TRIGGER timeline_search_delete; DROP TABLE chat_search; DROP TABLE timeline_search; DROP TABLE context_transfers; DROP TABLE thread_forks; ALTER TABLE chat_turns DROP COLUMN agent; DROP TABLE chat_raw; DROP TABLE chat_log; DROP TABLE chat_turns; DROP TABLE chat_sessions; ALTER TABLE nodes DROP COLUMN agent_chat_id; ALTER TABLE nodes DROP COLUMN run_mode; DROP TABLE events; DROP TABLE timeline; ALTER TABLE outbox DROP COLUMN mode; ALTER TABLE runs DROP COLUMN spec; DROP TABLE routine_runs; DROP TABLE routines; DROP TABLE snippets; DROP TABLE reviews; ALTER TABLE runs DROP COLUMN issue; ALTER TABLE runs DROP COLUMN role; ALTER TABLE runs DROP COLUMN name; ALTER TABLE runs DROP COLUMN orchestrator; ALTER TABLE runs DROP COLUMN model; ALTER TABLE nodes DROP COLUMN shared; DROP TABLE conversations; ALTER TABLE nodes DROP COLUMN started_at; ALTER TABLE nodes DROP COLUMN first_signal_at; DROP TABLE pull_requests; ALTER TABLE runs DROP COLUMN terminate_on_pr_merge; DROP TABLE reports; DROP TABLE outbox; DROP TABLE project_config; ALTER TABLE nodes DROP COLUMN agent_own_id; ALTER TABLE nodes DROP COLUMN activity_at; ALTER TABLE nodes DROP COLUMN finished_at; DELETE FROM schema_migrations WHERE version >= 2");
     db.close();
     await start();
     expect(rows("SELECT version FROM schema_migrations ORDER BY version")).toEqual([
@@ -171,7 +171,7 @@ describe("daemon routes", () => {
   });
 
   it("stores reports without changing the session status", async () => {
-    const response = await post("/api/v1/reports", { sessionId: "r1-agent", kind: "done", message: "ready" });
+    const response = await post("/api/v1/outcomes", { sessionId: "r1-agent", kind: "done", message: "ready" });
     expect(response.status).toBe(201);
     expect(await response.json()).toHaveProperty("id");
     await daemon!.stop();
@@ -183,8 +183,8 @@ describe("daemon routes", () => {
   });
 
   it("rejects invalid reports and unknown sessions", async () => {
-    expect((await post("/api/v1/reports", { sessionId: "r1-agent", kind: "other" })).status).toBe(400);
-    expect((await post("/api/v1/reports", { sessionId: "r1-missing", kind: "done" })).status).toBe(404);
+    expect((await post("/api/v1/outcomes", { sessionId: "r1-agent", kind: "other" })).status).toBe(400);
+    expect((await post("/api/v1/outcomes", { sessionId: "r1-missing", kind: "done" })).status).toBe(404);
   });
 
   it("queues messages for later delivery", async () => {
@@ -205,7 +205,7 @@ describe("daemon routes", () => {
 
   it("rejects invalid JSON and bodies above 1 MiB", async () => {
     for (const path of [
-      "/api/v1/reports",
+      "/api/v1/outcomes",
       "/api/v1/sessions/r1-agent/activity",
       "/api/v1/sessions/r1-agent/send",
     ]) {

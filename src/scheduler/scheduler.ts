@@ -792,7 +792,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   async function reaction(run: Run, number: number, facts: import("../github/github.js").PrFacts, status: string, handled?: string): Promise<boolean> {
     return d.write(() => {
-      const key = "pr-reaction:"+number;
+      const key = "pr-feedback:"+number;
       const state = d.store.lifecycleState(run.id,key);
       const before = JSON.stringify(state);
       const eventKey = status+":"+facts.mergeability+":"+facts.headSha;
@@ -811,7 +811,7 @@ export function createScheduler(d: SchedulerDeps) {
       if (!facts.open || (facts.review !== "changes_requested" && !facts.reviewComments)) { delete state.reviewAt; delete state.reviewEscalated; }
       else {
         state.reviewAt ??= now;
-        const minutes = Number(config["reactions.reviewMinutes"] ?? 30);
+        const minutes = Number(config["feedback.reviewMinutes"] ?? 30);
         if (!state.reviewEscalated && now-state.reviewAt >= minutes*60_000) {
           alert("Pull request #"+number+" still needs requested review changes after "+minutes+" minutes.");
           state.reviewEscalated = true;
@@ -819,7 +819,7 @@ export function createScheduler(d: SchedulerDeps) {
       }
       let allowed = true;
       if (run.node.status === "done" && status === "checks-failing" && handled !== eventKey) {
-        const cap = Number(config["reactions.ciRetries"] ?? 2);
+        const cap = Number(config["feedback.ciRetries"] ?? 2);
         if ((state.ciRetries ?? 0) >= cap) {
           if (!state.ciEscalated) { alert("Pull request #"+number+" reached its CI fix retry limit ("+cap+"). Manual attention is needed."); state.ciEscalated=true; }
           allowed = false;

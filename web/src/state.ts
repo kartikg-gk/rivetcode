@@ -4,7 +4,7 @@ import { ApiError, onChanged, type RunRow } from "./api";
 
 export type Field = { name: string; label: string; value?: string; type?: "text" | "number" | "textarea" | "select" | "check"; options?: string[]; hint?: string };
 export type Ask = { title: string; note?: string; fields?: Field[]; danger?: boolean; confirm: string; run(values: Record<string, string>): Promise<unknown> };
-export type Screen = "new" | "tasks" | "search" | "automations" | "cues" | "settings" | "health" | "radar" | null;
+export type Screen = "new" | "tasks" | "search" | "routines" | "snippets" | "settings" | "health" | "radar" | null;
 
 type State = {
   runs: RunRow[]; selected: string | null; beside: string | null; screen: Screen; ask: Ask | null; palette: boolean;

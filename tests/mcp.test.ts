@@ -27,7 +27,7 @@ describe("MCP transport", () => {
     const result = await exchange([frame(1, "initialize"), frame(2, "tools/list")]);
     const names = result[1].result.tools.map((tool: { name: string }) => tool.name);
     expect(names).toEqual(expect.arrayContaining([
-      "rivet_flag_unread", "rivet_steer_now", "rivet_run_automation_now", "rivet_stop_subagent",
+      "rivet_flag_unread", "rivet_steer_now", "rivet_run_routine_now", "rivet_stop_subagent",
     ]));
   });
   it("negotiates, lists schemas, ignores notifications and keeps stdout as JSON", async () => {

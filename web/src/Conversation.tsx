@@ -167,7 +167,7 @@ function Composer({ id, actions, openSide }: { id: string; actions: Action[]; op
     ...SIDE_TABS.map((t) => ({ id: t, label: t, about: `show ${t}`, run: () => openSide(t) })),
     { id: "worker", label: "worker", about: "start a new worker", args: "", run: () => set({ screen: "new" }) },
     { id: "search", label: "search", about: "search every session's history", run: () => set({ screen: "search" }) },
-    { id: "cues", label: "cues", about: "saved prompts and commands", run: () => set({ screen: "cues" }) },
+    { id: "snippets", label: "snippets", about: "saved prompts and commands", run: () => set({ screen: "snippets" }) },
     { id: "radar", label: "radar", about: "conflicts between workers", run: () => set({ screen: "radar" }) },
     { id: "doctor", label: "doctor", about: "check what Rivet needs on this machine", run: () => set({ screen: "health" }) },
   ], []);

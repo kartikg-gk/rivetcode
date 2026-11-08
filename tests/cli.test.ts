@@ -138,7 +138,7 @@ describe("rivet report", () => {
   it.each([
     [["report", "--note", "x"]],
     [["report", "--done"]],
-    [["report", "--done", "--stuck", "--note", "x"]],
+    [["report", "--done", "--blocked", "--note", "x"]],
     [["report", "--done", "--note", "y".repeat(1001)]],
     [["report", "free text"]],
   ])("rejects %j as a usage error", async (argv) => {
@@ -151,12 +151,12 @@ describe("rivet report", () => {
   });
 
   it("needs RIVET_SESSION_ID", async () => {
-    expect(await runCli(["report", "--stuck", "--note", "x"], io({}))).toBe(2);
+    expect(await runCli(["report", "--blocked", "--note", "x"], io({}))).toBe(2);
     expect(err.join("\n")).toMatch(/RIVET_SESSION_ID/);
   });
 
   it("fails clearly when the daemon is down", async () => {
-    expect(await runCli(["report", "--stuck", "--note", "x"], io({ RIVET_SESSION_ID: "r1-agent" }))).toBe(1);
+    expect(await runCli(["report", "--blocked", "--note", "x"], io({ RIVET_SESSION_ID: "r1-agent" }))).toBe(1);
     expect(err.join("\n")).toMatch(/daemon is not running/);
   });
 });
@@ -266,27 +266,27 @@ describe("spawn, status, resume, clean, project", () => {
     expect(await runCli(["read"], inRepo())).toBe(2);
   });
 
-  it("saves, lists, runs and removes cues", async () => {
+  it("saves, lists, runs and removes snippets", async () => {
     daemon = await startDaemon({ data, runFile, port: 0 });
-    const task = JSON.stringify({ files: { "c.txt": "from a cue" }, commit: "c" });
-    expect(await runCli(["cue", "add", "make-c", "--prompt", task], inRepo())).toBe(0);
-    expect(await runCli(["cue", "add", "touch", "--command", "node -e \"require('fs').writeFileSync('ran.txt','x')\""], inRepo())).toBe(0);
-    expect(await runCli(["cue", "add", "bad name", "--prompt", "x"], inRepo())).toBe(1);
-    expect(await runCli(["cue", "add", "both", "--prompt", "x", "--command", "y"], inRepo())).toBe(2);
+    const task = JSON.stringify({ files: { "c.txt": "from a snippet" }, commit: "c" });
+    expect(await runCli(["snippet", "add", "make-c", "--prompt", task], inRepo())).toBe(0);
+    expect(await runCli(["snippet", "add", "touch", "--command", "node -e \"require('fs').writeFileSync('ran.txt','x')\""], inRepo())).toBe(0);
+    expect(await runCli(["snippet", "add", "bad name", "--prompt", "x"], inRepo())).toBe(1);
+    expect(await runCli(["snippet", "add", "both", "--prompt", "x", "--command", "y"], inRepo())).toBe(2);
     out = [];
-    expect(await runCli(["cue", "list"], inRepo())).toBe(0);
+    expect(await runCli(["snippet", "list"], inRepo())).toBe(0);
     expect(out.join("\n")).toMatch(/make-c +agent +\{"files"[\s\S]*touch +command +node -e/);
-    // An agent cue without a session starts a worker named after it.
+    // An agent snippet without a session starts a worker named after it.
     out = [];
-    expect(await runCli(["cue", "run", "make-c", "--agent", "fake"], inRepo())).toBe(0);
+    expect(await runCli(["snippet", "run", "make-c", "--agent", "fake"], inRepo())).toBe(0);
     const runId = /worker (r\w+) started/.exec(out.join("\n"))![1]!;
     await waitFor(runId, "done");
     expect(out[0]).toMatch(new RegExp(`^worker ${runId} \\(make-c\\): done`));
-    // A command cue runs here, at the repository's top.
-    expect(await runCli(["cue", "run", "touch"], inRepo())).toBe(0);
+    // A command snippet runs here, at the repository's top.
+    expect(await runCli(["snippet", "run", "touch"], inRepo())).toBe(0);
     expect(existsSync(join(repo, "ran.txt"))).toBe(true);
-    expect(await runCli(["cue", "rm", "touch"], inRepo())).toBe(0);
-    expect(await runCli(["cue", "run", "touch"], inRepo())).toBe(2);
+    expect(await runCli(["snippet", "rm", "touch"], inRepo())).toBe(0);
+    expect(await runCli(["snippet", "run", "touch"], inRepo())).toBe(2);
   });
 
   it("spawns a worker end to end, lists it and cleans its worktree", async () => {

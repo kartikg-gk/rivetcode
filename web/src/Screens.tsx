@@ -162,7 +162,7 @@ function SearchScreen({ close }: { close(): void }) {
   );
 }
 
-// Settings, cues and radar belong to a project; this picks which, from the sessions or a folder.
+// Settings, snippets and radar belong to a project; this picks which, from the sessions or a folder.
 function useProject() {
   const { runs, selected, repo } = useApp();
   const projects = useMemo(() => [...new Map(runs.map((r) => [r.project, r.repo])).entries()], [runs]);
@@ -176,8 +176,8 @@ function useProject() {
 const NoProject = () => <p className="text-muted">Start a session in a repository first; these belong to its project.</p>;
 
 const SETTINGS: { key: string; about: string; options?: string[] }[] = [
-  { key: "reactions.ciRetries", about: "automatic CI fixes per pull request (default 2)" },
-  { key: "reactions.reviewMinutes", about: "minutes before unresolved review changes need attention (default 30)" },
+  { key: "feedback.ciRetries", about: "automatic CI fixes per pull request (default 2)" },
+  { key: "feedback.reviewMinutes", about: "minutes before unresolved review changes need attention (default 30)" },
   { key: "check", about: "command that must pass before a pull request" }, { key: "test", about: "tests that must pass before a pull request" },
   { key: "verify.reuse", about: "reuse a worker's own passing check", options: ["", "off"] },
   { key: "session.mode", about: "run agents as terminals or chats", options: ["", "terminal", "chat"] },
@@ -211,28 +211,28 @@ function SettingsScreen({ close }: { close(): void }) {
   );
 }
 
-type Cue = { name: string; type: string; text: string };
+type Snippet = { name: string; type: string; text: string };
 
-function Cues({ close }: { close(): void }) {
+function Snippets({ close }: { close(): void }) {
   const { selected, set } = useApp();
   const { project, repo, picker } = useProject();
-  const { data } = useLive(() => api<{ cues: Cue[] }>("GET", `/projects/${encodeURIComponent(project)}/cues`), [project]);
+  const { data } = useLive(() => api<{ snippets: Snippet[] }>("GET", `/projects/${encodeURIComponent(project)}/snippets`), [project]);
   const add = () => set({ ask: {
-    title: "New cue", confirm: "Save",
-    fields: [{ name: "name", label: "Name (one word)" }, { name: "type", label: "Kind", type: "select", options: ["agent", "command"], value: "agent", hint: "agent: a prompt. command: run from the terminal with rivet cue run." }, { name: "text", label: "Text", type: "textarea" }],
-    run: (v) => api("PUT", `/projects/${encodeURIComponent(project)}/cues/${encodeURIComponent(v.name!)}`, { type: v.type, text: v.text }),
+    title: "New snippet", confirm: "Save",
+    fields: [{ name: "name", label: "Name (one word)" }, { name: "type", label: "Kind", type: "select", options: ["agent", "command"], value: "agent", hint: "agent: a prompt. command: run from the terminal with rivet snippet run." }, { name: "text", label: "Text", type: "textarea" }],
+    run: (v) => api("PUT", `/projects/${encodeURIComponent(project)}/snippets/${encodeURIComponent(v.name!)}`, { type: v.type, text: v.text }),
   } });
-  const runIt = (c: Cue, session: boolean) => void act(async () => {
+  const runIt = (c: Snippet, session: boolean) => void act(async () => {
     if (session) await api("POST", `/sessions/${encodeURIComponent(`${selected}-agent`)}/send`, { message: c.text });
     else await startSession({ repo, task: c.text, name: c.name });
     close();
   }, session ? "sent" : "worker started");
   return (
-    <Modal title="Cues" wide onClose={close}>
+    <Modal title="Snippets" wide onClose={close}>
       {!project ? <NoProject /> : <>
         {picker}
-        {data?.cues.length === 0 && <p className="text-muted">No saved prompts or commands yet.</p>}
-        {data?.cues.map((c) => (
+        {data?.snippets.length === 0 && <p className="text-muted">No saved prompts or commands yet.</p>}
+        {data?.snippets.map((c) => (
           <div key={c.name} className="border border-line rounded-lg p-3 grid gap-2">
             <div className="flex items-center gap-2"><b className="flex-1">{c.name}</b><span className="text-xs text-muted">{c.type}</span></div>
             <pre className="mono text-xs whitespace-pre-wrap break-words">{c.text}</pre>
@@ -240,22 +240,22 @@ function Cues({ close }: { close(): void }) {
               {c.type === "agent" ? <>
                 <button className="btn" disabled={!selected} onClick={() => runIt(c, true)}>Send to this session</button>
                 <button className="btn" onClick={() => runIt(c, false)}>Start a worker</button>
-              </> : <button className="btn" onClick={() => void navigator.clipboard.writeText(`rivet cue run ${c.name}`).then(() => toast("copied"), () => toast(`run: rivet cue run ${c.name}`))}>Copy command to run</button>}
-              <button className="btn btn-danger ml-auto" onClick={() => void act(() => api("DELETE", `/projects/${encodeURIComponent(project)}/cues/${encodeURIComponent(c.name)}`), "deleted")}>Delete</button>
+              </> : <button className="btn" onClick={() => void navigator.clipboard.writeText(`rivet snippet run ${c.name}`).then(() => toast("copied"), () => toast(`run: rivet snippet run ${c.name}`))}>Copy command to run</button>}
+              <button className="btn btn-danger ml-auto" onClick={() => void act(() => api("DELETE", `/projects/${encodeURIComponent(project)}/snippets/${encodeURIComponent(c.name)}`), "deleted")}>Delete</button>
             </div>
           </div>
         ))}
-        <button className="btn justify-self-start" onClick={add}>New cue</button>
+        <button className="btn justify-self-start" onClick={add}>New snippet</button>
       </>}
     </Modal>
   );
 }
 
-type Automation = { id: string; name: string; repo: string; prompt: string; role: string; cron: string; zone: string; enabled: boolean; nextRunAt: string; agent?: string };
+type Routine = { id: string; name: string; repo: string; prompt: string; role: string; cron: string; zone: string; enabled: boolean; nextRunAt: string; agent?: string };
 
-function Automations({ close }: { close(): void }) {
+function Routines({ close }: { close(): void }) {
   const { repo, runs, set } = useApp();
-  const { data } = useLive(() => api<{ automations: Automation[] }>("GET", "/automations"), []);
+  const { data } = useLive(() => api<{ routines: Routine[] }>("GET", "/routines"), []);
   const add = () => set({ ask: {
     title: "New schedule", confirm: "Save",
     fields: [
@@ -264,13 +264,13 @@ function Automations({ close }: { close(): void }) {
       { name: "role", label: "Runs as", type: "select", options: ["worker", "orchestrator"], value: "worker" }, { name: "agent", label: "Agent", type: "select", options: ["", "claude", "codex"] },
       { name: "prompt", label: "Prompt", type: "textarea" },
     ],
-    run: (v) => api("POST", "/automations", { ...v, ...(v.agent ? {} : { agent: undefined }) }),
+    run: (v) => api("POST", "/routines", { ...v, ...(v.agent ? {} : { agent: undefined }) }),
   } });
-  const path = (a: Automation, tail = "") => `/automations/${encodeURIComponent(a.id)}${tail}`;
+  const path = (a: Routine, tail = "") => `/routines/${encodeURIComponent(a.id)}${tail}`;
   return (
     <Modal title="Schedules" wide onClose={close}>
-      {data?.automations.length === 0 && <p className="text-muted">Nothing scheduled.</p>}
-      {data?.automations.map((a) => (
+      {data?.routines.length === 0 && <p className="text-muted">Nothing scheduled.</p>}
+      {data?.routines.map((a) => (
         <div key={a.id} className="border border-line rounded-lg p-3 grid gap-1">
           <div className="flex items-center gap-2"><b className="flex-1">{a.name}</b><code className="mono text-xs">{a.cron}</code><span className="text-xs text-muted">{a.zone}</span></div>
           <div className="text-[13px] whitespace-pre-wrap">{a.prompt}</div>
@@ -330,8 +330,8 @@ export function Screens() {
   const { screen, set } = useApp();
   const close = () => set({ screen: null });
   const map: Record<NonNullable<Screen>, ReactNode> = {
-    new: <NewSession close={close} />, tasks: <TaskFile close={close} />, search: <SearchScreen close={close} />, automations: <Automations close={close} />,
-    cues: <Cues close={close} />, settings: <SettingsScreen close={close} />, health: <Health close={close} />, radar: <Radar close={close} />,
+    new: <NewSession close={close} />, tasks: <TaskFile close={close} />, search: <SearchScreen close={close} />, routines: <Routines close={close} />,
+    snippets: <Snippets close={close} />, settings: <SettingsScreen close={close} />, health: <Health close={close} />, radar: <Radar close={close} />,
   };
   return screen ? <>{map[screen]}</> : null;
 }
@@ -350,7 +350,7 @@ export function Palette() {
   }, [palette]);
   if (!palette) return null;
   const close = () => set({ palette: false });
-  const screens: [string, NonNullable<Screen>][] = [["New session", "new"], ["Start from a task file", "tasks"], ["Search every session", "search"], ["Cues", "cues"], ["Schedules", "automations"], ["Project settings", "settings"], ["Machine and recovery", "health"], ["Conflicts between workers", "radar"]];
+  const screens: [string, NonNullable<Screen>][] = [["New session", "new"], ["Start from a task file", "tasks"], ["Search every session", "search"], ["Snippets", "snippets"], ["Schedules", "routines"], ["Project settings", "settings"], ["Machine and recovery", "health"], ["Conflicts between workers", "radar"]];
   const items = [
     ...screens.map(([label, screen]) => ({ key: screen, label, about: "", run: () => set({ screen }) })),
     ...(selected ? sessionActions(selected, detail).map((a) => ({ key: a.id, label: a.label, about: a.about, run: () => a.run("") })) : []),

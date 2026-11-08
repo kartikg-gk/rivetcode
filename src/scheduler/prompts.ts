@@ -14,8 +14,8 @@ export function workerPrompt(run: Run, retry?: string): string {
       "in their own worktrees. Keep your changes to this task, and commit as you go.",
     ]),
     `When the task is finished, run: rivet report --done --note "<one line summary>"`,
-    `If you are stuck, run: rivet report --stuck --note "<what blocks you>"`,
-    `If you need a decision, run: rivet report --needs-input --note "<question>"`,
+    `If you are stuck, run: rivet report --blocked --note "<what blocks you>"`,
+    `If you need a decision, run: rivet report --question --note "<question>"`,
     "Do not use your own subagent or task tools to hand work off; finish it here. To hand a",
     "self-contained part to another agent working in this same worktree, run",
     'rivet delegate [--agent claude|codex|delta] "<task>"; for a second opinion on your changes so far,',
@@ -225,6 +225,6 @@ export function partnerPrompt(run: Run, task: string, review: boolean, agent: st
     "- Change only what your task needs, and read a file again right before you edit it.",
     "- Do not commit, push or switch branches: your changes are committed with the other agent's work.",
     '- When finished, run: rivet report --done --note "<what you changed, in a few lines>"',
-    '- If you cannot do it, run: rivet report --stuck --note "<why>"',
+    '- If you cannot do it, run: rivet report --blocked --note "<why>"',
   ].join("\n");
 }

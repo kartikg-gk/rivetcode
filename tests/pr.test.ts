@@ -371,7 +371,7 @@ it("coalesces overlapping feedback polls and drains them before closing storage"
 });
 describe("bounded pull request reactions",()=>{
   it("caps CI fixes across new revisions and keeps the cap after restart",async()=>{
-    await start({pr:"auto","reactions.ciRetries":"1"});
+    await start({pr:"auto","feedback.ciRetries":"1"});
     const id=await spawn();
     await until(()=>runOf(id),r=>r.pr!==null);
     gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
@@ -384,7 +384,7 @@ describe("bounded pull request reactions",()=>{
     expect((await runOf(id)).run.node.attempts).toBe(2);
   });
   it("escalates unresolved review changes once after the configured deadline",async()=>{
-    await start({pr:"auto","reactions.reviewMinutes":"0.001"});
+    await start({pr:"auto","feedback.reviewMinutes":"0.001"});
     const id=await spawn();await until(()=>runOf(id),r=>r.pr!==null);
     gh.comments[1]=[{commit_id:"sha1",path:"a.txt",line:1,body:"change this"}];
     await until(()=>runOf(id),r=>(r.run.node.summary??"").includes("still needs requested"));
@@ -406,7 +406,7 @@ it("notifies approved and passing pull requests once without merging",async()=>{
 });
 
 it("keeps the CI cap when passing checks fail again on the same commit",async()=>{
-  await start({pr:"auto","reactions.ciRetries":"1"});
+  await start({pr:"auto","feedback.ciRetries":"1"});
   const id=await spawn();await until(()=>runOf(id),r=>r.pr!==null);
   gh.checks.sha1=[{id:9,status:"completed",conclusion:"failure"}];
   await until(()=>runOf(id),r=>r.run.node.attempts===2&&r.run.node.status==="done"&&(r.pr?.handled??"").startsWith("checks-failing"));

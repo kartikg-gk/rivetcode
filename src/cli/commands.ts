@@ -69,9 +69,9 @@ const USAGE = `usage: rivet <command>
   switch <run> claude|codex|delta [--model <id>] [--now]
                                         hand a worker's task to another agent in the same worktree
   merge-policy <run> terminate|keep     end the run once its pull request merges (default keep)
-  cue list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
+  snippet list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
                                         saved prompts (to a session, or a new worker) and commands (run here)
-  automation list | add <name> --cron "<m h dom mon dow>" [--zone <tz>] [--orchestrator] [--agent <name>] <prompt>
+  routine list | add <name> --cron "<m h dom mon dow>" [--zone <tz>] [--orchestrator] [--agent <name>] <prompt>
              | rm|pause|resume|run <name>   prompts run on a schedule by a new worker or orchestrator
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
@@ -86,7 +86,7 @@ const USAGE = `usage: rivet <command>
   login claude|codex                    log an agent's CLI in to its account (its own login)
   hooks <agent> <event>                 receive an agent hook (called by the agent)
   commit --message <text>               commit changes in this worker checkout
-  report --done|--stuck|--needs-input --note <text>
+  report --done|--blocked|--question --note <text>
   secret <name> --why <text>            ask the person for a secret; prints a file path holding it
                                         report this session's state (inside an agent)
   check                                 run the project's check and tests on this worktree (inside a worker)
@@ -320,13 +320,13 @@ async function answer(args: string[], io: CliIo): Promise<number> {
 async function report(args: string[], io: CliIo): Promise<number> {
   const { flags, rest } = parseFlags(args, ["note"]);
   if (rest.length > 0) throw new UsageError("report takes a state flag and --note, not free text");
-  const kinds = (["done", "stuck", "needs-input"] as const).filter((k) => flags.has(k));
-  if (kinds.length !== 1) throw new UsageError("report needs exactly one of --done, --stuck, --needs-input");
+  const kinds = (["done", "blocked", "question"] as const).filter((k) => flags.has(k));
+  if (kinds.length !== 1) throw new UsageError("report needs exactly one of --done, --blocked, --question");
   const note = flags.get("note");
   if (typeof note !== "string" || note.trim() === "") throw new UsageError("report needs --note <text>");
   if (note.length > NOTE_LIMIT) throw new UsageError(`--note must be at most ${NOTE_LIMIT} characters`);
   const sessionId = requireSession(io);
-  const result = await callDaemon(io.env, "POST", "/api/v1/reports", { sessionId, kind: kinds[0], message: note }, COMMAND_TIMEOUT_MS);
+  const result = await callDaemon(io.env, "POST", "/api/v1/outcomes", { sessionId, kind: kinds[0], message: note }, COMMAND_TIMEOUT_MS);
   io.out(`reported ${kinds[0]} (#${(result as { id: number }).id})`);
   return 0;
 }
@@ -652,13 +652,13 @@ async function project(args: string[], io: CliIo): Promise<number> {
 }
 
 // Prompts run on a cron schedule, each time by a new worker (or orchestrator).
-async function automation(args: string[], io: CliIo): Promise<number> {
+async function routine(args: string[], io: CliIo): Promise<number> {
   const [action, ...more] = args;
   if (action === "list" || action === undefined) {
     type A = { name: string; project: string; cron: string; zone: string; enabled: boolean; nextRunAt: string; role: string; prompt: string; runs: { runId?: string; error?: string; createdAt: string }[] };
-    const { automations } = await callDaemon(io.env, "GET", "/api/v1/automations", undefined, COMMAND_TIMEOUT_MS) as { automations: A[] };
-    if (automations.length === 0) io.out("no automations");
-    for (const a of automations) {
+    const { routines } = await callDaemon(io.env, "GET", "/api/v1/routines", undefined, COMMAND_TIMEOUT_MS) as { routines: A[] };
+    if (routines.length === 0) io.out("no routines");
+    for (const a of routines) {
       const last = a.runs.at(-1);
       io.out(`${a.name.padEnd(20)} ${a.cron.padEnd(16)} ${a.zone.padEnd(18)} ${a.enabled ? `next ${a.nextRunAt}` : "paused"}  ${a.role}  [${a.project}]`);
       io.out(`  ${a.prompt.split(/\r?\n/)[0]!.slice(0, 100)}${last ? `\n  last: ${last.runId ?? `failed: ${last.error}`} at ${last.createdAt}` : ""}`);
@@ -669,26 +669,26 @@ async function automation(args: string[], io: CliIo): Promise<number> {
     const { flags, rest } = parseFlags(more, ["cron", "zone", "agent"]);
     const [name, ...words] = rest;
     const prompt = words.join(" ").trim();
-    if (!name || !prompt || typeof flags.get("cron") !== "string") throw new UsageError('automation add <name> --cron "<min hour day month weekday>" [--zone <tz>] [--orchestrator] [--agent <name>] "<prompt>"');
+    if (!name || !prompt || typeof flags.get("cron") !== "string") throw new UsageError('routine add <name> --cron "<min hour day month weekday>" [--zone <tz>] [--orchestrator] [--agent <name>] "<prompt>"');
     const repo = await repoTop(io.cwd);
-    const created = await callDaemon(io.env, "POST", "/api/v1/automations", {
+    const created = await callDaemon(io.env, "POST", "/api/v1/routines", {
       repo, name, prompt, cron: flags.get("cron"), role: flags.get("orchestrator") === true ? "orchestrator" : "worker",
       ...(typeof flags.get("zone") === "string" ? { zone: flags.get("zone") } : {}),
       ...(typeof flags.get("agent") === "string" ? { agent: flags.get("agent") } : {}),
     }, COMMAND_TIMEOUT_MS) as { nextRunAt: string; zone: string };
-    io.out(`automation ${name} saved; first run ${created.nextRunAt} (${created.zone})`);
+    io.out(`routine ${name} saved; first run ${created.nextRunAt} (${created.zone})`);
     return 0;
   }
   const name = more[0];
-  if (!name || !["rm", "pause", "resume", "run"].includes(action)) throw new UsageError("automation needs list, add, rm <name>, pause <name>, resume <name> or run <name>");
-  const path = `/api/v1/automations/${encodeURIComponent(name)}`;
+  if (!name || !["rm", "pause", "resume", "run"].includes(action)) throw new UsageError("routine needs list, add, rm <name>, pause <name>, resume <name> or run <name>");
+  const path = `/api/v1/routines/${encodeURIComponent(name)}`;
   if (action === "rm") {
     await callDaemon(io.env, "DELETE", path, undefined, COMMAND_TIMEOUT_MS);
-    io.out(`automation ${name} removed`);
+    io.out(`routine ${name} removed`);
     return 0;
   }
   const result = await callDaemon(io.env, "POST", `${path}/${action}`, undefined, RUN_TIMEOUT_MS) as { runId?: string; nextRunAt?: string };
-  io.out(action === "run" ? `automation ${name} started ${result.runId}` : action === "pause" ? `automation ${name} paused` : `automation ${name} resumed; next run ${result.nextRunAt}`);
+  io.out(action === "run" ? `routine ${name} started ${result.runId}` : action === "pause" ? `routine ${name} paused` : `routine ${name} resumed; next run ${result.nextRunAt}`);
   return 0;
 }
 
@@ -732,36 +732,36 @@ async function runFile(args: string[], io: CliIo): Promise<number> {
 }
 
 // Saved prompts and commands for this repository's project.
-async function cue(args: string[], io: CliIo): Promise<number> {
+async function snippet(args: string[], io: CliIo): Promise<number> {
   const [action, name, ...more] = args;
-  const base = `/api/v1/projects/${encodeURIComponent(await projectOf(io))}/cues`;
+  const base = `/api/v1/projects/${encodeURIComponent(await projectOf(io))}/snippets`;
   if (action === "list") {
-    const { cues } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { cues: { name: string; type: string; text: string }[] };
-    if (cues.length === 0) io.out("no cues");
-    for (const c of cues) io.out(`${c.name.padEnd(20)} ${c.type.padEnd(8)} ${c.text.split(/\r?\n/)[0]!.slice(0, 80)}`);
+    const { snippets } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { snippets: { name: string; type: string; text: string }[] };
+    if (snippets.length === 0) io.out("no snippets");
+    for (const c of snippets) io.out(`${c.name.padEnd(20)} ${c.type.padEnd(8)} ${c.text.split(/\r?\n/)[0]!.slice(0, 80)}`);
     return 0;
   }
-  if (!name) throw new UsageError("cue needs list, add <name>, rm <name> or run <name>");
+  if (!name) throw new UsageError("snippet needs list, add <name>, rm <name> or run <name>");
   const path = `${base}/${encodeURIComponent(name)}`;
   if (action === "add") {
     const { flags } = parseFlags(more, ["prompt", "command"]);
     const prompt = flags.get("prompt");
     const command = flags.get("command");
-    if ((typeof prompt === "string") === (typeof command === "string")) throw new UsageError('cue add needs one of --prompt "<text>" or --command "<shell command>"');
+    if ((typeof prompt === "string") === (typeof command === "string")) throw new UsageError('snippet add needs one of --prompt "<text>" or --command "<shell command>"');
     await callDaemon(io.env, "PUT", path, typeof prompt === "string" ? { type: "agent", text: prompt } : { type: "command", text: command }, COMMAND_TIMEOUT_MS);
-    io.out(`cue ${name} saved`);
+    io.out(`snippet ${name} saved`);
     return 0;
   }
   if (action === "rm") {
     await callDaemon(io.env, "DELETE", path, undefined, COMMAND_TIMEOUT_MS);
-    io.out(`cue ${name} removed`);
+    io.out(`snippet ${name} removed`);
     return 0;
   }
-  if (action !== "run") throw new UsageError("cue needs list, add <name>, rm <name> or run <name>");
+  if (action !== "run") throw new UsageError("snippet needs list, add <name>, rm <name> or run <name>");
   const { flags } = parseFlags(more, ["session", "agent"]);
-  const { cues } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { cues: { name: string; type: string; text: string }[] };
-  const found = cues.find((c) => c.name === name);
-  if (!found) throw new UsageError(`no cue "${name}" in this project (see rivet cue list)`);
+  const { snippets } = await callDaemon(io.env, "GET", base, undefined, COMMAND_TIMEOUT_MS) as { snippets: { name: string; type: string; text: string }[] };
+  const found = snippets.find((c) => c.name === name);
+  if (!found) throw new UsageError(`no snippet "${name}" in this project (see rivet snippet list)`);
   const session = typeof flags.get("session") === "string" ? flags.get("session") as string : undefined;
   if (found.type === "agent") {
     // To a running session, or as the task of a new worker.
@@ -969,7 +969,7 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
-const AUTOSTART = new Set(["new-conversation", "move-to-worktree", "app", "console", "transfers", "search", "wait", "fork", "carry-back", "spawn", "review", "cue", "automation", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
+const AUTOSTART = new Set(["new-conversation", "move-to-worktree", "app", "console", "transfers", "search", "wait", "fork", "carry-back", "spawn", "review", "snippet", "routine", "switch", "orchestrator", "status", "stop", "resume", "clean", "merge-policy", "project", "pr", "attach", "panes"]);
 const AUTOSTART_WAIT_MS = 15_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
@@ -1176,7 +1176,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "check": return await check(io);
       case "review": return await review(args, io);
       case "delegate": return await delegate(args, io);
-      case "cue": return await cue(args, io);
+      case "snippet": return await snippet(args, io);
       case "switch": {
         const { flags, rest } = parseFlags(args, ["model"]);
         const [runId, agent] = rest;
@@ -1187,7 +1187,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return 0;
       }
       case "run": return await runFile(args, io);
-      case "automation": return await automation(args, io);
+      case "routine": return await routine(args, io);
       case "daemon": return await daemon(args, io);
       case "init": return await initProject(args,io);
       case "doctor": return await doctorCommand(io);
