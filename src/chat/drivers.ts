@@ -111,7 +111,7 @@ export function claudeAdapterPath(): string {
 }
 
 const CLAUDE_MODES: Record<string, string> = {
-  default: "default", "accept-edits": "acceptEdits", auto: "auto", "bypass-permissions": "bypassPermissions", "read-only": "plan",
+  default: "default", "edits": "acceptEdits", auto: "auto", "full": "bypassPermissions", "read-only": "plan",
 };
 
 // Claude over the Agent Client Protocol.
@@ -330,7 +330,7 @@ export function claudeChat(o: ChatOptions): ChatDriver {
 // wants more; otherwise no sandbox and no questions, as in the terminal.
 function codexApproval(permission: string): { approvalPolicy: string; sandbox: string } {
   if (permission === "read-only") return { approvalPolicy: "never", sandbox: "read-only" };
-  if (permission === "accept-edits" || permission === "auto") return { approvalPolicy: "on-request", sandbox: "workspace-write" };
+  if (permission === "edits" || permission === "auto") return { approvalPolicy: "on-request", sandbox: "workspace-write" };
   return { approvalPolicy: "never", sandbox: "danger-full-access" };
 }
 
@@ -537,7 +537,7 @@ export function deltaModel(model: string | undefined): { provider?: string; mode
 }
 
 // Delta asks before any tool but reads; Rivet's levels decide which questions reach the user.
-const DELTA_POLICY: Record<string, string> = { "read-only": "deny", auto: "auto", "bypass-permissions": "auto" };
+const DELTA_POLICY: Record<string, string> = { "read-only": "deny", auto: "auto", "full": "auto" };
 const DELTA_EDITS = new Set(["Edit", "Write", "MultiEdit"]);
 
 // Delta over its own JSON-lines protocol (--mode rpc): one record per line each way.
@@ -626,7 +626,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
         try { input = JSON.parse(text(e.preview)) as Record<string, unknown>; } catch { /* shown as given */ }
         questions.set(requestId, tool);
         const approval: Approval = { requestId, tool, detail: Object.keys(input).length ? describeTool(input) : text(e.preview), ...(typeof input.command === "string" ? { command: input.command } : {}) };
-        const auto = always.has(tool) || (o.permission === "accept-edits" && DELTA_EDITS.has(tool)) ? "yes" : o.decide(approval);
+        const auto = always.has(tool) || (o.permission === "edits" && DELTA_EDITS.has(tool)) ? "yes" : o.decide(approval);
         if (auto) { answer(requestId, auto); return; }
         o.emit({ type: "activity", requestId, kind: "approval", status: "pending", summary: `${tool}: ${approval.detail}`, tool, turnId: activeTurn });
         return;

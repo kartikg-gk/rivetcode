@@ -24,9 +24,9 @@ describe("claudeSessionId", () => {
 describe("permissions", () => {
   it("maps each level to Claude's permission mode", () => {
     expect(claudePermissionArgs("default")).toEqual([]);
-    expect(claudePermissionArgs("accept-edits")).toEqual(["--permission-mode", "acceptEdits"]);
+    expect(claudePermissionArgs("edits")).toEqual(["--permission-mode", "acceptEdits"]);
     expect(claudePermissionArgs("auto")).toEqual(["--permission-mode", "auto"]);
-    expect(claudePermissionArgs("bypass-permissions")).toEqual(["--permission-mode", "bypassPermissions"]);
+    expect(claudePermissionArgs("full")).toEqual(["--permission-mode", "bypassPermissions"]);
   });
 
   it("treats unknown values as default", () => {
@@ -120,7 +120,7 @@ describe("resume", () => {
 
   it("builds a resume command, prompt last", async () => {
     expect(await claudeResumeCommand({
-      binary: "claude", sessionId: "r1-root.1", permission: "accept-edits", model: "sonnet", prompt: "continue",
+      binary: "claude", sessionId: "r1-root.1", permission: "edits", model: "sonnet", prompt: "continue",
     })).toEqual([
       "claude", "--resume", DERIVED, "--model", "sonnet", "--permission-mode", "acceptEdits", "--", "continue",
     ]);

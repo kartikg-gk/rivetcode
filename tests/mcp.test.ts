@@ -114,7 +114,7 @@ it.each(["claude", "codex"] as const)("registers the bridge in %s start and resu
   expect(cfg.args.at(-1)).toBe("mcp");
   expect(cfg.env.RIVET_CHAT_COMMAND).toBeUndefined();
   for (const resume of [undefined, "existing"]) {
-    const driver = (agent === "claude" ? claudeChat : codexChat)({ binary: "unused", cwd: process.cwd(), permission: "accept-edits", env, resume, emit() {}, decide() { return undefined; } });
+    const driver = (agent === "claude" ? claudeChat : codexChat)({ binary: "unused", cwd: process.cwd(), permission: "edits", env, resume, emit() {}, decide() { return undefined; } });
     try { await driver.start(); } finally { driver.close(); await driver.exited; }
   }
 });

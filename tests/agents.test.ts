@@ -179,7 +179,7 @@ describe("headless launches", () => {
   it("claude runs in print mode and then takes no typed input; the fake always listens", async () => {
     const claude = getAgent("claude");
     const linux = claudeAgent("claude", undefined, undefined, "linux");
-    expect(await linux.launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: true, permission: "accept-edits", model: "haiku", allowedTools: ["Bash(rivet:*)"] }))
+    expect(await linux.launchCommand({ sessionId: "r1-root.1", workspace: ".", prompt: "go", headless: true, permission: "edits", model: "haiku", allowedTools: ["Bash(rivet:*)"] }))
       .toEqual(["claude", "--session-id", "cce53ecb-99f4-55ff-a3cb-693ccbf24d77", "-p", "--model", "haiku", "--permission-mode", "acceptEdits", "--allowedTools", "Bash(rivet:*)", "--output-format", "stream-json", "--verbose", "--", "go"]);
     expect(claude.acceptsInput({ headless: true })).toBe(false);
     expect(claude.acceptsInput({ headless: false })).toBe(true);

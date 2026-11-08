@@ -15,16 +15,16 @@ describe("tomlString", () => {
 
 describe("codex permissions", () => {
   it("maps each level to approval flags", () => {
-    expect(codexPermissionArgs("accept-edits", false)).toEqual(["--ask-for-approval", "on-request"]);
+    expect(codexPermissionArgs("edits", false)).toEqual(["--ask-for-approval", "on-request"]);
     expect(codexPermissionArgs("auto", false)).toEqual(["--ask-for-approval", "on-request", "-c", 'approvals_reviewer="auto_review"']);
     expect(codexPermissionArgs("default", false)).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
-    expect(codexPermissionArgs("bypass-permissions", false)).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
+    expect(codexPermissionArgs("full", false)).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
   });
 
   it("cannot ask anyone when headless, so edits stay inside a writable sandbox", () => {
-    expect(codexPermissionArgs("accept-edits", true)).toEqual(["--sandbox", "workspace-write"]);
+    expect(codexPermissionArgs("edits", true)).toEqual(["--sandbox", "workspace-write"]);
     expect(codexPermissionArgs("auto", true)).toEqual(["--sandbox", "workspace-write"]);
-    expect(codexPermissionArgs("bypass-permissions", true)).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
+    expect(codexPermissionArgs("full", true)).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
   });
 });
 
@@ -33,7 +33,7 @@ describe("codex commands", () => {
 
   it("starts the TUI with trust, hooks, model, instructions and the prompt last", () => {
     expect(codexStartCommand({
-      binary: "codex", workspace: "/w", permission: "accept-edits", model: "gpt-5", systemPrompt: "stay in scope", prompt: "go", hookFlags: hooks,
+      binary: "codex", workspace: "/w", permission: "edits", model: "gpt-5", systemPrompt: "stay in scope", prompt: "go", hookFlags: hooks,
     })).toEqual([
       "codex", ...BASE, "--ask-for-approval", "on-request", ...hooks,
       "-c", "projects={'/w'={trust_level=\"trusted\"}}", "--model", "gpt-5",
@@ -42,7 +42,7 @@ describe("codex commands", () => {
   });
 
   it("runs codex exec when headless", () => {
-    const cmd = codexStartCommand({ binary: "codex", workspace: "/w", permission: "accept-edits", prompt: "go", headless: true, hookFlags: [] });
+    const cmd = codexStartCommand({ binary: "codex", workspace: "/w", permission: "edits", prompt: "go", headless: true, hookFlags: [] });
     expect(cmd.slice(0, 3)).toEqual(["codex", "exec", "--json"]);
     expect(cmd).toContain("workspace-write");
     expect(cmd.slice(-2)).toEqual(["--", "go"]);
@@ -55,7 +55,7 @@ describe("codex commands", () => {
   });
 
   it("resumes headless through exec resume, with the sandbox as config", () => {
-    expect(codexResumeCommand({ binary: "codex", workspace: "/w", capturedId: "th-1", prompt: "messages", permission: "accept-edits", headless: true, hookFlags: [] }))
+    expect(codexResumeCommand({ binary: "codex", workspace: "/w", capturedId: "th-1", prompt: "messages", permission: "edits", headless: true, hookFlags: [] }))
       .toEqual(["codex", "exec", "resume", "--json", ...BASE, "-c", 'sandbox_mode="workspace-write"', "-c", "projects={'/w'={trust_level=\"trusted\"}}", "th-1", "--", "messages"]);
   });
 

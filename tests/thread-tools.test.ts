@@ -176,7 +176,7 @@ describe("completion waits", () => {
 
 it.each([false, true])("initializes provider context lazily with native support unavailable=%s", async (unsupported) => {
   const events: ChatEvent[] = [];
-  const driver = codexChat({ binary: "unused", cwd: process.cwd(), permission: "accept-edits", env: {
+  const driver = codexChat({ binary: "unused", cwd: process.cwd(), permission: "edits", env: {
     RIVET_CHAT_COMMAND: JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "codex"]),
     ...(unsupported ? { RIVET_TEST_NO_FORK: "1" } : {}),
   }, fork: { providerId: "parent", turn: "t1", agent: "codex", context: "pinned old context" }, emit: (e) => events.push(e), decide() { return undefined; } });
@@ -188,7 +188,7 @@ it.each([false, true])("initializes provider context lazily with native support 
 
 it("reconstructs a pinned Claude prefix explicitly", async () => {
   const events: ChatEvent[] = [];
-  const driver = claudeChat({ binary: "unused", cwd: process.cwd(), permission: "accept-edits", env: { RIVET_CHAT_COMMAND: JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "acp"]) }, fork: { providerId: "parent", agent: "claude", context: "pinned prefix" }, emit: (e) => events.push(e), decide() { return undefined; } });
+  const driver = claudeChat({ binary: "unused", cwd: process.cwd(), permission: "edits", env: { RIVET_CHAT_COMMAND: JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "acp"]) }, fork: { providerId: "parent", agent: "claude", context: "pinned prefix" }, emit: (e) => events.push(e), decide() { return undefined; } });
   try { await driver.start(); await driver.prompt("new question"); } finally { driver.close(); await driver.exited; }
   expect(events.find((e) => e.type === "conversation")).toMatchObject({ forkStrategy: "reconstructed" });
   expect(events.filter((e) => e.type === "message").at(-1)).toMatchObject({ text: "echo: pinned prefix\n\nnew question" });

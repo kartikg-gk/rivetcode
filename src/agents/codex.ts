@@ -33,7 +33,7 @@ const BASE_ARGS = [
 export function codexPermissionArgs(permission: Permission, headless: boolean): string[] {
   const p = normalizePermission(permission);
   if (p === "read-only") return headless ? ["--sandbox", "read-only"] : ["--sandbox", "read-only", "--ask-for-approval", "never"];
-  if (p === "accept-edits" || p === "auto") {
+  if (p === "edits" || p === "auto") {
     if (headless) return ["--sandbox", "workspace-write"];
     return p === "auto"
       ? ["--ask-for-approval", "on-request", "-c", 'approvals_reviewer="auto_review"']

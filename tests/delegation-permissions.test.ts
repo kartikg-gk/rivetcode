@@ -3,13 +3,13 @@ import { capDelegatedPermission } from "../src/scheduler/scheduler.js";
 
 describe("delegated permissions", () => {
   it("keeps a read-only parent read-only across providers", () => {
-    expect(capDelegatedPermission("claude", "read-only", "codex", "bypass-permissions")).toBe("read-only");
+    expect(capDelegatedPermission("claude", "read-only", "codex", "full")).toBe("read-only");
   });
   it("does not treat a Codex default child as restricted", () => {
-    expect(capDelegatedPermission("codex", "accept-edits", "codex", "default")).toBe("accept-edits");
+    expect(capDelegatedPermission("codex", "edits", "codex", "default")).toBe("edits");
   });
   it("preserves stricter requests and caps broader same-provider requests", () => {
-    expect(capDelegatedPermission("claude", "accept-edits", "claude", "default")).toBe("default");
+    expect(capDelegatedPermission("claude", "edits", "claude", "default")).toBe("default");
     expect(capDelegatedPermission("claude", "default", "claude", "auto")).toBe("default");
   });
 });

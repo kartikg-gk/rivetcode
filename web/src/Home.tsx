@@ -6,8 +6,8 @@ import { ModelPicker } from "./ModelPicker";
 import { act, repoName, useApp, useLive } from "./state";
 
 const ACCESS = [
-  { value: "default", label: "Ask first" }, { value: "accept-edits", label: "Accept edits" },
-  { value: "auto", label: "Auto" }, { value: "bypass-permissions", label: "Full access" },
+  { value: "default", label: "Ask first" }, { value: "edits", label: "Accept edits" },
+  { value: "auto", label: "Auto" }, { value: "full", label: "Full access" },
 ];
 
 function Pop({ label, icon, children }: { label: string; icon?: ReactNode; children(close: () => void): ReactNode }) {
@@ -32,7 +32,7 @@ function Pop({ label, icon, children }: { label: string; icon?: ReactNode; child
 // Access is the project's setting: it applies to every session started there.
 function Access({ project }: { project: string }) {
   const { data, reload } = useLive(() => api<Record<string, string>>("GET", `/projects/${encodeURIComponent(project)}/config`), [project]);
-  const now = data?.["worker.permission"] ?? "accept-edits";
+  const now = data?.["worker.permission"] ?? "edits";
   return (
     <Pop icon={<Lock size={13} />} label={ACCESS.find((a) => a.value === now)?.label ?? now}>
       {(close) => <ul className="p-1">{ACCESS.map((a) => (

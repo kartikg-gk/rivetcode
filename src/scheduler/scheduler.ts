@@ -23,14 +23,14 @@ import { fileURLToPath } from "node:url";
 import { encodeConfig, type Control } from "../chat/host.js";
 
 // Agents edit files and run rivet and git on their own; a project can widen or narrow this.
-export const DEFAULT_PERMISSION = "accept-edits";
+export const DEFAULT_PERMISSION = "edits";
 
 export function capDelegatedPermission(parentAgent: Node["agent"], parent: Permission, childAgent: Node["agent"], requested: Permission): Permission {
   if (parent === "read-only" || requested === "read-only") return "read-only";
-  if ((parent === "bypass-permissions" && parentAgent !== "delta") || (parentAgent === "codex" && parent === "default")) return requested;
+  if ((parent === "full" && parentAgent !== "delta") || (parentAgent === "codex" && parent === "default")) return requested;
   if (parentAgent !== childAgent) return "read-only";
-  const order: Permission[] = ["read-only", "default", "accept-edits", "auto", "bypass-permissions"];
-  const effectiveRequest = childAgent === "codex" && requested === "default" ? "bypass-permissions" : requested;
+  const order: Permission[] = ["read-only", "default", "edits", "auto", "full"];
+  const effectiveRequest = childAgent === "codex" && requested === "default" ? "full" : requested;
   return order.indexOf(effectiveRequest) > order.indexOf(parent) ? parent : requested;
 }
 // The agent's own id of the last reply: where a native fork of Claude's conversation is pinned.
