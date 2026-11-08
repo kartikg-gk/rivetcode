@@ -70,9 +70,9 @@ describe("claudeStartCommand", () => {
 
   it("prefers a native session id and requires it to be a UUID", async () => {
     const native = "6F9619FF-8B86-D011-B42D-00C04FC964FF";
-    expect(await claudeStartCommand({ binary: "claude", sessionId: "r1-root", nativeSessionId: native }))
+    expect(await claudeStartCommand({ binary: "claude", sessionId: "r1-root", ownSessionId: native }))
       .toEqual(["claude", "--session-id", "6f9619ff-8b86-d011-b42d-00c04fc964ff"]);
-    await expect(claudeStartCommand({ binary: "claude", nativeSessionId: "nope" }))
+    await expect(claudeStartCommand({ binary: "claude", ownSessionId: "nope" }))
       .rejects.toThrow(/invalid native session id/);
   });
 
@@ -81,7 +81,7 @@ describe("claudeStartCommand", () => {
     "urn:uuid:6F9619FF-8B86-D011-B42D-00C04FC964FF",
     "6f9619ff8b86d011b42d00c04fc964ff",
   ])("accepts the native id form %s and writes it canonically", async (native) => {
-    expect(await claudeStartCommand({ binary: "claude", nativeSessionId: native }))
+    expect(await claudeStartCommand({ binary: "claude", ownSessionId: native }))
       .toEqual(["claude", "--session-id", "6f9619ff-8b86-d011-b42d-00c04fc964ff"]);
   });
 

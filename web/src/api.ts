@@ -20,7 +20,7 @@ export type RunDetail = {
 };
 export type Item = {
   position: number; session: string; kind: string; tool?: string; text: string; at: string; streaming?: boolean;
-  textOffset?: number; nextTextOffset?: number | null; cut?: { shown: number; length: number };
+  startChar?: number; nextChar?: number | null; cut?: { shown: number; length: number };
 };
 export type Page = { view: string; total: number; items: Item[]; next?: number };
 

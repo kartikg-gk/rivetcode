@@ -8,7 +8,7 @@ export type AgentLaunch = {
   sessionId: string;
   workspace: string;
   prompt?: string;
-  nativeSessionId?: string;
+  ownSessionId?: string;
   permission?: Permission;
   model?: string;
   effort?: string;
@@ -21,7 +21,7 @@ export type AgentLaunch = {
 };
 
 // capturedId: the agent's own session id, as reported by its hooks.
-export type AgentRestore = Omit<AgentLaunch, "nativeSessionId"> & { capturedId?: string };
+export type AgentRestore = Omit<AgentLaunch, "ownSessionId"> & { capturedId?: string };
 
 // An adapter only describes how to run an agent's own CLI; running it is the runtime's job.
 export type Agent = {

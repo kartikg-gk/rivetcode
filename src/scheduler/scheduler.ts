@@ -664,7 +664,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   // A worker's chat turn failed and its agent is still up: nothing more will happen on its
   // own, so it stops and onExit escalates it with the agent's reason.
-  async function chatTurnFailed(runId: string): Promise<void> {
+  async function turnFailed(runId: string): Promise<void> {
     const run = await load(runId);
     const session = sessionOf(run);
     if (run.role === "worker" && chats.has(session) && !doneReported.has(session) && d.runtime.isAlive(session)) await d.runtime.stop(session);
@@ -842,7 +842,7 @@ export function createScheduler(d: SchedulerDeps) {
   }
   async function checkPrOnce(runId: string): Promise<string | null> {
     if (!d.github) return null;
-    const links = await d.write(() => d.store.linkedPrs(runId));
+    const links = await d.write(() => d.store.prLinks(runId));
     if (links.length) {
       const run = await load(runId);
       const github = await d.github(run);
@@ -852,7 +852,7 @@ export function createScheduler(d: SchedulerDeps) {
           const facts = await github.facts(link.number);
           const status = prStatus(facts);
           if (shuttingDown) return null;
-          if (status !== link.status) await d.write(() => d.store.updateLinkedPr(runId, link.number, status));
+          if (status !== link.status) await d.write(() => d.store.updatePrLink(runId, link.number, status));
           const current = await load(runId);
           const permitted = await reaction(current,link.number,facts,status,link.handled);
           const key = status + ":" + facts.mergeability + ":" + facts.headSha;
@@ -864,7 +864,7 @@ export function createScheduler(d: SchedulerDeps) {
             else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") feedback = "Linked pull request #" + link.number + " needs its branch updated or conflicts resolved: " + link.url;
             if (feedback) {
               await reopen(runId, feedback);
-              await d.write(() => d.store.updateLinkedPr(runId, link.number, status, key));
+              await d.write(() => d.store.updatePrLink(runId, link.number, status, key));
             }
           }
         } catch (error) { report(error); }
@@ -1014,7 +1014,7 @@ export function createScheduler(d: SchedulerDeps) {
 
   // "rivet review submit" from the reviewer. Required changes go to the worker first, so
   // the pull request watcher finds it at work and does not act on the same comments.
-  async function submitReview(runId: string, o: { verdict: "approved" | "changes_requested"; summary: string; comments: { path: string; line: number; body: string }[] }): Promise<{ githubReviewId?: number }> {
+  async function submitReview(runId: string, o: { verdict: "approved" | "changes_requested"; summary: string; comments: { path: string; line: number; body: string }[] }): Promise<{ postedReviewId?: number }> {
     const run = await load(runId);
     const review = (await d.write(() => d.store.reviewsOf(runId))).filter((r) => r.status === "running").at(-1);
     if (!review) throw new SchedulerError(409, "no review of this run is running");
@@ -1027,15 +1027,15 @@ export function createScheduler(d: SchedulerDeps) {
         ...o.comments.map((c) => `- ${c.path}:${c.line}: ${c.body}`),
       ].join("\n"));
     }
-    let githubReviewId: number | undefined;
+    let postedReviewId: number | undefined;
     if (d.github) {
-      githubReviewId = await (await d.github(run)).postReview(pr.number, { commitId: review.sha, body, comments: o.comments })
+      postedReviewId = await (await d.github(run)).postReview(pr.number, { commitId: review.sha, body, comments: o.comments })
         .catch((e) => { report(e); return undefined; });
     }
-    await d.write(() => d.store.endReview(review.id, { status: "complete", verdict: o.verdict, body, ...(githubReviewId ? { githubReviewId } : {}) }));
+    await d.write(() => d.store.endReview(review.id, { status: "complete", verdict: o.verdict, body, ...(postedReviewId ? { postedReviewId } : {}) }));
     if (o.verdict === "approved") await tellOrchestrator(run, `Worker ${run.id}${run.name ? ` (${run.name})` : ""}: its pull request #${pr.number} passed review.`);
     void stopSession(reviewSession(runId)).catch(report);
-    return githubReviewId ? { githubReviewId } : {};
+    return postedReviewId ? { postedReviewId } : {};
   }
 
   // With review=auto, a worker's pull request is reviewed once per commit, after the
@@ -1168,9 +1168,9 @@ export function createScheduler(d: SchedulerDeps) {
     const link = { number, url: `https://github.com/${github.repo}/pull/${number}`, status };
     await d.write(() => {
       if (d.store.getPr(runId)?.number === number) throw new SchedulerError(409, "this is already the primary pull request");
-      const links = d.store.linkedPrs(runId);
+      const links = d.store.prLinks(runId);
       if (links.length >= 10 && !links.some(pr => pr.number === number)) throw new SchedulerError(409, "this thread already has 10 additional pull requests");
-      d.store.addLinkedPr(runId, link);
+      d.store.addPrLink(runId, link);
     });
     return link;
   }
@@ -1185,7 +1185,7 @@ export function createScheduler(d: SchedulerDeps) {
     const github = await d.github(run);
     try { await github.facts(number); } catch (e) { throw new SchedulerError(409, `cannot read pull request #${number}: ${(e as Error).message}`); }
     const pr = { number, url: `https://github.com/${github.repo}/pull/${number}` };
-    await d.write(() => { d.store.setPr(runId, pr); d.store.removeLinkedPr(runId, pr.number); d.store.updateNode(runId, NODE_ID, { prStatus: null }); });
+    await d.write(() => { d.store.setPr(runId, pr); d.store.removePrLink(runId, pr.number); d.store.updateNode(runId, NODE_ID, { prStatus: null }); });
     void checkPr(runId).catch(report);
     return pr;
   }
@@ -1401,7 +1401,7 @@ export function createScheduler(d: SchedulerDeps) {
     try { await work; return true; } finally { startingForks.delete(runId); }
   }
 
-  return { commitWorker, terminalTurnEnded, addPrLink, linkPr, chatTurnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { commitWorker, terminalTurnEnded, addPrLink, linkPr, turnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

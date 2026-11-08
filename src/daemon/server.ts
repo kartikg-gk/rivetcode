@@ -8,7 +8,7 @@ import { parseTaskFile, TaskFileError } from "../scheduler/tasks.js";
 import { searchPage, SearchInputError } from "../search.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
 import { existsSync } from "node:fs";
-import { waitForRun } from "../scheduler/wait.js";
+import { awaitRun } from "../scheduler/wait.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -17,7 +17,7 @@ import { findClaude, findCodex } from "../agents/locate.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
 import { dataDir, assertId, defaultProjectId, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
-import { liveOwner, releaseRunFile, runFilePath, writeRunFile, type RunInfo } from "../runfile.js";
+import { liveOwner, releaseRunFile, runFileAt, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
 import { radar } from "../scheduler/radar.js";
@@ -124,7 +124,7 @@ export type DaemonOptions = {
   port?: number;
   // Which adapter runs a node's agent; tests swap in the fake agent.
   agents?: (name: Node["agent"]) => Agent;
-  stopGraceMs?: number;
+  stopWaitMs?: number;
   checkTimeoutMs?: number;
   // GitHub access for a run (tests pass a client for a mock API).
   github?(run: Run): Promise<GitHub>;
@@ -227,7 +227,7 @@ async function healthy(owner: RunInfo): Promise<boolean> {
 
 export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   const data = opts.data ?? dataDir();
-  const runFile = opts.runFile ?? runFilePath();
+  const runFile = opts.runFile ?? runFileAt();
   const owner = await liveOwner(runFile);
   if (owner && await healthy(owner)) {
     throw new Error(`daemon already running (pid ${owner.pid}, port ${owner.port}); refusing to start`);
@@ -256,7 +256,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     }
     return getAgent(name);
   });
-  const runtime = createRuntime({ logDir: join(data, "logs"), ...(opts.stopGraceMs ? { stopGraceMs: opts.stopGraceMs } : {}) });
+  const runtime = createRuntime({ logDir: join(data, "logs"), ...(opts.stopWaitMs ? { stopWaitMs: opts.stopWaitMs } : {}) });
   // The launch each session is on now; hooks and exits of older launches are ignored.
   const launches = new Map<string, string>();
 
@@ -299,7 +299,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const state = secret ? "secret:"+secret.id : request ? "approval:"+request.at : node.activity === "approval" ? "approval:"+node.activityAt : node.activity === "asking" ? "question:"+node.activityAt : ["done","escalated"].includes(node.status) ? node.status+":"+node.attempts : "";
         const previous = store.lifecycleState(id,"desktop-notice");
         const seen = {...previous.reactions};
-        const numbers = new Set([store.getPr(id)?.number,...store.linkedPrs(id).map(pr=>pr.number)]);
+        const numbers = new Set([store.getPr(id)?.number,...store.prLinks(id).map(pr=>pr.number)]);
         for (const number of numbers) {
           if (number === undefined) continue;
           const reaction = store.lifecycleState(id,"pr-feedback:"+number);
@@ -736,7 +736,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         return;
       }
       if (nodeId === NODE_ID && (payload.events as { type?: string; state?: string }[] | undefined)?.some((e) => e?.type === "turn" && e.state === "failed")) {
-        void scheduler.chatTurnFailed(runId).catch((e) => opts.onError?.(e));
+        void scheduler.turnFailed(runId).catch((e) => opts.onError?.(e));
       }
       const state = outcome.activity ?? null;
       if (nodeId === "review" || nodeId === "partner" || state === null) {
@@ -1134,7 +1134,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const id = prLinks[1]!;
       await write(() => store.loadRun(id));
       if (req.method === "GET" && !prLinks[2]) {
-        reply(res, 200, await write(() => ({ primary: store.getPr(id), linked: store.linkedPrs(id) })));
+        reply(res, 200, await write(() => ({ primary: store.getPr(id), linked: store.prLinks(id) })));
         return;
       }
       if (req.method === "POST" && !prLinks[2]) {
@@ -1146,25 +1146,25 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method === "DELETE" && prLinks[2]) {
         const number = Number(prLinks[2]);
         if (!Number.isSafeInteger(number) || number < 1) throw new HttpError(400, "invalid pull request number");
-        if (!(await write(() => store.removeLinkedPr(id, number)))) throw new HttpError(404, "pull request link not found");
+        if (!(await write(() => store.removePrLink(id, number)))) throw new HttpError(404, "pull request link not found");
         reply(res, 204);
         return;
       }
       throw new HttpError(405, "method not allowed");
     }
-    const prGuides = /^\/api\/v1\/runs\/([^/]+)\/pr-guides(?:\/(\d+))?$/.exec(path);
-    if (prGuides) {
-      const id = prGuides[1]!;
+    const reviewNotes = /^\/api\/v1\/runs\/([^/]+)\/pr-guides(?:\/(\d+))?$/.exec(path);
+    if (reviewNotes) {
+      const id = reviewNotes[1]!;
       await write(() => store.loadRun(id));
-      if (req.method === "GET" && prGuides[2]) {
-        const number = Number(prGuides[2]);
+      if (req.method === "GET" && reviewNotes[2]) {
+        const number = Number(reviewNotes[2]);
         if (!Number.isSafeInteger(number) || number < 1) throw new HttpError(400, "invalid pull request number");
-        const text = await write(() => store.readPrGuide(id, number));
+        const text = await write(() => store.readReviewNotes(id, number));
         if (text === null) throw new HttpError(404, "guide not found");
         reply(res, 200, { number, text, untrusted: true });
         return;
       }
-      if (req.method === "PUT" && !prGuides[2]) {
+      if (req.method === "PUT" && !reviewNotes[2]) {
         const guides = (await body(req)).guides;
         if (!Array.isArray(guides) || guides.length < 1 || guides.length > 10) throw new HttpError(400, "provide 1–10 pull request guides");
         const numbers = new Set<number>();
@@ -1172,7 +1172,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           if (!guide || !Number.isSafeInteger(guide.number) || guide.number < 1 || numbers.has(guide.number) || typeof guide.text !== "string" || !guide.text.trim() || guide.text.length > 16000) throw new HttpError(400, "each guide needs a unique positive PR number and 1–16000 characters of text");
           numbers.add(guide.number);
         }
-        await write(() => store.writePrGuides(id, guides));
+        await write(() => store.writeReviewNotes(id, guides));
         reply(res, 200, { saved: [...numbers] });
         return;
       }
@@ -1319,7 +1319,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const closed = () => abort.abort();
       res.on("close", closed);
       try {
-        const result = await waitForRun(async (turn) => write(() => {
+        const result = await awaitRun(async (turn) => write(() => {
           const run = store.loadRun(runId);
           return { retrying: run.node.status === "failed" && run.node.attempts < (run.spec?.attempts ?? 2), status: run.node.status, activity: run.node.activity, live: runtime.isAlive(sessionIdOf(run.id, run.node.id)), turn: store.waitTurn(run.id, turn), pendingRequest: scheduler.pendingRequest(run.id), pending: runtime.isAlive(sessionIdOf(run.id, run.node.id)) && !run.node.firstHeardAt };
         }), { scope: scope as "turn" | "task", timeoutMs, ...(q.get("turn") ? { turn: q.get("turn")! } : {}) }, AbortSignal.any([abort.signal, waitAbort.signal]));
@@ -1341,11 +1341,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const q = new URL(req.url ?? "", "http://x").searchParams;
       const num = (k: string, d: number, max: number) => Math.min(max, Math.max(1, Number(q.get(k) ?? d) || d));
       const item = q.has("item") ? Number(q.get("item")) : undefined;
-      const textOffset = Number(q.get("textOffset") ?? 0);
-      if (item !== undefined && (!Number.isSafeInteger(item) || item < 1) || !Number.isSafeInteger(textOffset) || textOffset < 0 || textOffset > 0 && item === undefined) throw new HttpError(400, "item must be a positive position; textOffset requires an item and must be nonnegative");
+      const startChar = Number(q.get("startChar") ?? 0);
+      if (item !== undefined && (!Number.isSafeInteger(item) || item < 1) || !Number.isSafeInteger(startChar) || startChar < 0 || startChar > 0 && item === undefined) throw new HttpError(400, "item must be a positive position; startChar requires an item and must be nonnegative");
       const view = item !== undefined || q.get("view") === "activity" ? "activity" : "messages";
       const limit = num("limit", 50, 100);
-      const maxChars = num("maxChars", 20_000, 50_000);
+      const charLimit = num("charLimit", 20_000, 50_000);
       const session = q.get("session") ?? undefined;
       // A chat session's conversation is its timeline.
       const chat = run.node.runMode === "chat" && (!session || session === NODE_ID);
@@ -1353,11 +1353,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         after: item !== undefined ? item - 1 : Number(q.get("after") ?? 0) || 0, limit: item !== undefined ? 1 : limit, ...(view === "messages" ? { kinds: MESSAGE_KINDS } : {}), ...(session ? { session } : {}),
       }));
       if (item !== undefined && page.items[0]?.position !== item) throw new HttpError(404, "history item not found");
-      if (item !== undefined && textOffset > page.items[0]!.text.length) throw new HttpError(400, "textOffset exceeds item length");
+      if (item !== undefined && startChar > page.items[0]!.text.length) throw new HttpError(400, "startChar exceeds item length");
       const items = page.items.map((i) => {
-        const offset = item !== undefined ? textOffset : 0;
-        const end = Math.min(i.text.length, offset + maxChars);
-        return {...i, text: i.text.slice(offset, end), textOffset: offset, nextTextOffset: end < i.text.length ? end : null,
+        const offset = item !== undefined ? startChar : 0;
+        const end = Math.min(i.text.length, offset + charLimit);
+        return {...i, text: i.text.slice(offset, end), startChar: offset, nextChar: end < i.text.length ? end : null,
           ...(end < i.text.length ? {cut:{shown:end-offset,length:i.text.length}} : {})};
       });
       const last = items.at(-1)?.position;

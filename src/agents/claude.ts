@@ -96,10 +96,10 @@ export function claudeAgent(binary: string, configPath = claudeConfigPath(), pro
     // once: a relaunch of the same session (a retry) would reuse it, and Claude refuses an
     // id it already has, so a new one is taken. Hooks report whichever id Claude runs with.
     launchCommand: ({ headless, ...cfg }) => {
-      const taken = !cfg.nativeSessionId && !!cfg.sessionId && conversationExists(projectsDir, claudeSessionId(cfg.sessionId));
+      const taken = !cfg.ownSessionId && !!cfg.sessionId && conversationExists(projectsDir, claudeSessionId(cfg.sessionId));
       const allowedTools = shellRules(cfg.allowedTools, platform);
       return claudeStartCommand({
-        binary, ...cfg, ...(allowedTools ? { allowedTools } : {}), ...(taken ? { nativeSessionId: randomUUID() } : {}),
+        binary, ...cfg, ...(allowedTools ? { allowedTools } : {}), ...(taken ? { ownSessionId: randomUUID() } : {}),
         ...(headless ? { print: true, extraArgs: STREAM_ARGS } : {}), ...(headless === false ? { noChrome: true } : {}),
       });
     },

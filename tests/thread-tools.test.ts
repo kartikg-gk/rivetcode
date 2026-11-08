@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { contextText, forkConversation, mergeConversation } from "../src/scheduler/conversations.js";
-import { waitForRun, type WaitSnapshot } from "../src/scheduler/wait.js";
+import { awaitRun, type WaitSnapshot } from "../src/scheduler/wait.js";
 import { openStore, type Store } from "../src/store.js";
 import { cleanupResult, makeDataDir, makeRepo, removeRepo, sessionRun } from "./helpers.js";
 import { startDaemon, type Daemon } from "../src/daemon/server.js";
@@ -152,24 +152,24 @@ describe("completion waits", () => {
   const signal = () => new AbortController().signal;
   it("returns already completed work immediately, and distinguishes turn from task", async () => {
     const read = async (): Promise<WaitSnapshot> => ({ status: "running", activity: "idle", live: true, turn: { id: "t1", state: "done" } });
-    expect(await waitForRun(read, { scope: "turn", timeoutMs: 0 }, signal())).toMatchObject({ timedOut: false, turnId: "t1" });
-    expect(await waitForRun(read, { scope: "task", timeoutMs: 0 }, signal())).toMatchObject({ timedOut: true });
+    expect(await awaitRun(read, { scope: "turn", timeoutMs: 0 }, signal())).toMatchObject({ timedOut: false, turnId: "t1" });
+    expect(await awaitRun(read, { scope: "task", timeoutMs: 0 }, signal())).toMatchObject({ timedOut: true });
   });
   it("waits for startup instead of returning the preceding completed turn", async () => {
     let calls = 0;
-    const result = await waitForRun(async () => ({ status: "running", live: true, pending: ++calls === 1, turn: { id: calls === 1 ? "old" : "new", state: "done" } }), { scope: "turn", timeoutMs: 1000 }, signal());
+    const result = await awaitRun(async () => ({ status: "running", live: true, pending: ++calls === 1, turn: { id: calls === 1 ? "old" : "new", state: "done" } }), { scope: "turn", timeoutMs: 1000 }, signal());
     expect(result).toMatchObject({ turnId: "new", timedOut: false });
   });
   it("pins the selected turn, handles input requests, completion, restart and cancellation", async () => {
     let calls = 0;
-    const result = await waitForRun(async (turn) => {
+    const result = await awaitRun(async (turn) => {
       calls++; if (calls > 1) expect(turn).toBe("t1");
       return { status: "running", live: true, turn: { id: "t1", state: calls > 1 ? "done" : "working" }, pendingRequest: { tool: "shell", detail: "approval" } };
     }, { scope: "turn", timeoutMs: 1000 }, signal());
     expect(result.timedOut).toBe(false);
-    expect(await waitForRun(async () => ({ status: "running", live: false, activity: "ended" }), { scope: "turn", timeoutMs: 100 }, signal())).toMatchObject({ timedOut: false });
+    expect(await awaitRun(async () => ({ status: "running", live: false, activity: "ended" }), { scope: "turn", timeoutMs: 100 }, signal())).toMatchObject({ timedOut: false });
     const abort = new AbortController();
-    const waiting = waitForRun(async () => ({ status: "running", live: true, activity: "busy" }), { scope: "task", timeoutMs: 60000 }, abort.signal);
+    const waiting = awaitRun(async () => ({ status: "running", live: true, activity: "busy" }), { scope: "task", timeoutMs: 60000 }, abort.signal);
     abort.abort(); await expect(waiting).rejects.toThrow();
   });
 });
@@ -198,7 +198,7 @@ it("exposes lazy forks, search, wait and carry-back through daemon and CLI, prot
   const s = await seed(); repo = await makeRepo();
   const source = s.loadRun("r1"); source.node.worktree = repo; source.repo = repo; s.saveRun(source); s.close(); store = undefined;
   process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "codex"]);
-  daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+  daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
   const api = async (method: string, path: string, body?: unknown) => {
     const r = await fetch(`http://127.0.0.1:${daemon!.port}/api/v1${path}`, { method, headers: { "content-type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
     const value = await r.json() as any;
@@ -297,7 +297,7 @@ describe("conversation recovery and branch lifecycle", () => {
   });
   it("does not finish a task wait while an automatic retry is pending",async()=>{
     let calls=0;
-    const result=await waitForRun(async()=>({status:++calls===1?"failed":"done",retrying:calls===1,live:false}),{scope:"task",timeoutMs:1000},new AbortController().signal);
+    const result=await awaitRun(async()=>({status:++calls===1?"failed":"done",retrying:calls===1,live:false}),{scope:"task",timeoutMs:1000},new AbortController().signal);
     expect(result.status).toBe("done");expect(calls).toBe(2);
   });
   it("keeps message results when metadata fills most of the search cap",async()=>{
@@ -388,7 +388,7 @@ it("reconciles ACP gaps and partial replies without renumbering existing history
 
 it("recovers an inherited long-item tail through MCP and CLI and offers a stable boundary after large-history refusal",async()=>{
  const s=await seed();const long="start "+"bounded context ".repeat(5000)+" TAIL_RECOVERED";exchange(s,"r1","long-turn",long);const position=s.readChat("r1",{limit:20}).items.find(i=>i.text===long)!.position;const child=forkConversation(s,"r1",{at:position});daemon=await startDaemon({data:data!,runFile:join(data!,"running.json"),port:0});
- const env={RIVET_RUN_FILE:join(data!,"running.json"),RIVET_DATA_DIR:data!,RIVET_SESSION_ID:"r1-agent",RIVET_NO_AUTOSTART:"1"};const call=toolCaller(env,process.cwd());let offset=0,whole="";for(;;){const reply:any=await call("rivet_read",{run:child.runId,item:position,textOffset:offset,maxChars:4000});const item=reply.history.items[0];whole+=item.text;if(item.nextTextOffset===null)break;offset=item.nextTextOffset;}expect(whole).toBe(long);
+ const env={RIVET_RUN_FILE:join(data!,"running.json"),RIVET_DATA_DIR:data!,RIVET_SESSION_ID:"r1-agent",RIVET_NO_AUTOSTART:"1"};const call=toolCaller(env,process.cwd());let offset=0,whole="";for(;;){const reply:any=await call("rivet_read",{run:child.runId,item:position,startChar:offset,charLimit:4000});const item=reply.history.items[0];whole+=item.text;if(item.nextChar===null)break;offset=item.nextChar;}expect(whole).toBe(long);
  const lines:string[]=[];const result=await runCli(["read",child.runId,"--item",String(position),"--text-offset",String(long.length-20)],{env,cwd:process.cwd(),readStdin:async()=>"",out:x=>lines.push(x),err:x=>lines.push(x)});expect(result).toBe(0);expect(lines.join("\n")).toContain("TAIL_RECOVERED");
  s.recordChat("r1","agent",Array.from({length:5001},(_,i)=>({type:"message" as const,itemId:"overflow-"+i,role:"assistant" as const,text:"entry "+i})));expect(()=>forkConversation(s,"r1",{})).toThrow(/choose an earlier completed reply/);expect(forkConversation(s,"r1",{at:2}).position).toBe(2);
 });

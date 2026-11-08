@@ -40,7 +40,7 @@ export const realProbes = (overrides: Partial<Probes>): Probes => ({
   ...overrides,
 });
 
-function versionAtLeast(found: string, want: [number, number]): boolean {
+function isAtLeast(found: string, want: [number, number]): boolean {
   const [major = 0, minor = 0] = found.split(".").map((n) => parseInt(n, 10));
   return major > want[0] || (major === want[0] && minor >= want[1]);
 }
@@ -80,14 +80,14 @@ async function loginStatus(name: string, binary: string, p: Probes): Promise<str
 // One line per thing Rivet needs: what works, what is degraded, what blocks it.
 export async function doctor(dataDir: string, p: Probes): Promise<Check[]> {
   const checks: Check[] = [];
-  checks.push(versionAtLeast(p.nodeVersion, [24, 0])
+  checks.push(isAtLeast(p.nodeVersion, [24, 0])
     ? { level: "ok", name: "node", message: p.nodeVersion }
     : { level: "fail", name: "node", message: `${p.nodeVersion}; Rivet needs Node 24 or newer` });
 
   const git = await p.run("git", ["--version"]).catch(() => "");
   const gitVersion = /(\d+\.\d+(\.\d+)?)/.exec(git)?.[1];
   if (!gitVersion) checks.push({ level: "fail", name: "git", message: "git was not found on PATH" });
-  else if (!versionAtLeast(gitVersion, [2, 38])) checks.push({ level: "warn", name: "git", message: `${gitVersion}; the conflict radar needs 2.38 or newer` });
+  else if (!isAtLeast(gitVersion, [2, 38])) checks.push({ level: "warn", name: "git", message: `${gitVersion}; the conflict radar needs 2.38 or newer` });
   else checks.push({ level: "ok", name: "git", message: gitVersion });
 
   try {

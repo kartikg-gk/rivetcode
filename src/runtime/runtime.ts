@@ -122,9 +122,9 @@ const TYPE_CHUNK_GAP_MS = 15;
 const TYPE_SUBMIT_DELAY_MS = 300;
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function createRuntime(o: { logDir: string; keepLines?: number; stopGraceMs?: number }): Runtime {
+export function createRuntime(o: { logDir: string; keepLines?: number; stopWaitMs?: number }): Runtime {
   const keep = o.keepLines ?? 2000;
-  const grace = o.stopGraceMs ?? 5000;
+  const grace = o.stopWaitMs ?? 5000;
   const procs = new Map<string, Proc>();
   const listeners = new Set<ExitListener>();
   // Sessions between "start called" and "process spawned": a second start must see them.

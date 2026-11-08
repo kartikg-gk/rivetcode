@@ -2,7 +2,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { GITIGNORE_MARKER, ensureWorkspaceGitignore, hooksManager } from "../src/agents/hooks.js";
+import { GITIGNORE_MARKER, ignoreHookFiles, hooksManager } from "../src/agents/hooks.js";
 import { git } from "../src/git.js";
 import { createWorktree, removeWorktree } from "../src/worktree.js";
 import { worktreePath } from "../src/paths.js";
@@ -113,7 +113,7 @@ describe("hook files stay out of git", () => {
   it("never overwrites a .gitignore the user wrote", async () => {
     await mkdir(join(ws, ".agent"));
     await writeFile(join(ws, ".agent", ".gitignore"), "mine\n");
-    await ensureWorkspaceGitignore(join(ws, ".agent"), "settings.json");
+    await ignoreHookFiles(join(ws, ".agent"), "settings.json");
     expect(await readFile(join(ws, ".agent", ".gitignore"), "utf8")).toBe("mine\n");
   });
 
@@ -212,7 +212,7 @@ describe("edge cases", () => {
   it("refreshes a .gitignore it owns", async () => {
     await mkdir(join(ws, ".agent"), { recursive: true });
     await writeFile(join(ws, ".agent", ".gitignore"), `${GITIGNORE_MARKER}\n/old\n`);
-    await ensureWorkspaceGitignore(join(ws, ".agent"), "settings.json");
+    await ignoreHookFiles(join(ws, ".agent"), "settings.json");
     expect(await readFile(join(ws, ".agent", ".gitignore"), "utf8")).toBe(`${GITIGNORE_MARKER}\n/.gitignore\n/settings.json\n`);
   });
 });

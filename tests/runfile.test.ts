@@ -7,7 +7,7 @@ import {
   liveOwner,
   readRunFile,
   releaseRunFile,
-  runFilePath,
+  runFileAt,
   writeRunFile,
 } from "../src/runfile.js";
 import { makeDataDir, removeRepo } from "./helpers.js";
@@ -27,7 +27,7 @@ function deadPid(): number {
   return Number(child.stdout.toString());
 }
 
-describe("runFilePath", () => {
+describe("runFileAt", () => {
   const saved = process.env.RIVET_RUN_FILE;
   afterEach(() => {
     if (saved === undefined) delete process.env.RIVET_RUN_FILE;
@@ -36,14 +36,14 @@ describe("runFilePath", () => {
 
   it("defaults to ~/.rivet/running.json", () => {
     delete process.env.RIVET_RUN_FILE;
-    expect(runFilePath()).toBe(join(homedir(), ".rivet", "running.json"));
+    expect(runFileAt()).toBe(join(homedir(), ".rivet", "running.json"));
   });
 
   it("uses RIVET_RUN_FILE when set, made absolute against the current folder", () => {
     process.env.RIVET_RUN_FILE = join(homedir(), "x", "run.json");
-    expect(runFilePath()).toBe(join(homedir(), "x", "run.json"));
+    expect(runFileAt()).toBe(join(homedir(), "x", "run.json"));
     process.env.RIVET_RUN_FILE = "rel/run.json";
-    expect(runFilePath()).toBe(resolve("rel/run.json"));
+    expect(runFileAt()).toBe(resolve("rel/run.json"));
   });
 });
 

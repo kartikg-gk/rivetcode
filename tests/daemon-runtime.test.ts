@@ -36,7 +36,7 @@ afterEach(async () => {
 
 // Every node runs the fake agent, so no real model is needed.
 async function start(): Promise<Daemon> {
-  daemon = await startDaemon({ data, runFile, port: 0, agents: () => getAgent("fake"), stopGraceMs: 500 });
+  daemon = await startDaemon({ data, runFile, port: 0, agents: () => getAgent("fake"), stopWaitMs: 500 });
   return daemon;
 }
 

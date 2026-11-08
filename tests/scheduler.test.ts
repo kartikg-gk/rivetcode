@@ -31,7 +31,7 @@ afterEach(async () => {
 
 async function start(claude?: Agent, more: { radarMs?: number; limitMs?: number; switchWaitMs?: number } = {}): Promise<void> {
   daemon = await startDaemon({
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, ...more,
+    data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, ...more,
     agents: (name) => (name === "claude" && claude ? claude : getAgent("fake")),
     onError: (e) => errors.push(e),
   });
@@ -802,7 +802,7 @@ describe("reading a session's timeline", () => {
     const activity = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&limit=2`)).json;
     expect(activity.total).toBe(5);
     expect(activity.items.map((i: { kind: string }) => i.kind)).toEqual(["prompt", "message"]);
-    const rest = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&after=${activity.next}&maxChars=10`)).json;
+    const rest = (await api("GET", `/api/v1/runs/${runId}/timeline?view=activity&after=${activity.next}&charLimit=10`)).json;
     expect(rest.items.map((i: { kind: string; text: string }) => [i.kind, i.text])).toEqual([["tool", "npm test"], ["result", "ok"], ["assistant", "xxxxxxxxxx"]]);
     expect(rest.items[2].cut).toEqual({ shown: 10, length: 30 });
     expect(rest.next).toBeUndefined();
@@ -841,7 +841,7 @@ describe("reading a session's timeline", () => {
     const fake = getAgent("fake");
     const codexLike: Agent = { ...fake, name: "codex", launchCommand: async () => [process.execPath, "-e", script] };
     daemon = await startDaemon({
-      data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, onError: (e) => errors.push(e),
+      data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, onError: (e) => errors.push(e),
       agents: (name) => (name === "codex" ? codexLike : getAgent("fake")),
     });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "check the tests", agent: "codex" })).json.runId as string;

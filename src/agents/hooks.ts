@@ -74,7 +74,7 @@ async function saveSettings(file: string, settings: Settings, hooks: Record<stri
 }
 
 // Keeps a hook file out of the user's git status. A .gitignore the user wrote is never touched.
-export async function ensureWorkspaceGitignore(dir: string, ...names: string[]): Promise<void> {
+export async function ignoreHookFiles(dir: string, ...names: string[]): Promise<void> {
   const path = join(dir, ".gitignore");
   const current = await readFile(path, "utf8").catch((e: NodeJS.ErrnoException) => {
     if (e.code === "ENOENT") return null;
@@ -146,7 +146,7 @@ export function hooksManager(o: {
           hooks[event] = placeOurs(groupsOf(hooks, event), o.managed.filter((h) => h.event === event));
         }
         await saveSettings(file, settings, hooks);
-        await ensureWorkspaceGitignore(dirname(file), basename(file)).catch((e: Error) => {
+        await ignoreHookFiles(dirname(file), basename(file)).catch((e: Error) => {
           throw new Error(`gitignore: ${e.message}`);
         });
       }),

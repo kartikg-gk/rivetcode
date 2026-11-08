@@ -71,7 +71,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   let posting = Promise.resolve();
   let deliveryFailed = false;
   let completionFailed = false;
-  let lastTurnState: string | undefined;
+  let finalTurnState: string | undefined;
   let accepted: number[] = [];
   let currentMessage: number | undefined;
   let maintenance = false;
@@ -115,7 +115,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   const later = () => { timer ??= setTimeout(() => { void post(); }, BATCH_MS); };
   // A growing reply waits for the batch; everything else is reported at once.
   const emit = (e: ChatEvent) => {
-    if (e.type === "turn") lastTurnState = e.state;
+    if (e.type === "turn") finalTurnState = e.state;
     if (!maintenance && e.type === "turn" && e.state === "done" && currentMessage !== undefined) { accepted.push(currentMessage); currentMessage = undefined; }
     if (e.type === "turn" && e.state === "done") accepted.push(...steered.splice(0));
     pending.push(e);
@@ -251,5 +251,5 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
   if (finishTimer) clearTimeout(finishTimer);
   await post();
   lines.close();
-  return deliveryFailed || completionFailed || lastTurnState === "failed" || lastTurnState === "working" || lastTurnState === "stopped" ? 2 : 0;
+  return deliveryFailed || completionFailed || finalTurnState === "failed" || finalTurnState === "working" || finalTurnState === "stopped" ? 2 : 0;
 }

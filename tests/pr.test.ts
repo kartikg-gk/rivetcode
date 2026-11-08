@@ -57,7 +57,7 @@ async function start(config: Record<string, string> = {}, rapid = false): Promis
   notices = [];
   daemon = await startDaemon({
     notify: async notice => {notices.push(notice);},
-    data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, prWatchMs: rapid ? 1 : 150, onError: (e) => errors.push(e),
+    data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, prWatchMs: rapid ? 1 : 150, onError: (e) => errors.push(e),
     // "claude" stands for a reviewer here (review.agent): it runs reviewerScript.
     agents: (name) => (name === "claude" ? reviewerAgent() : getAgent("fake")),
     github: async () => { const client=githubClient({ repo: "o/r", token: "t0ken", api: gh.api }); return rapid ? {...client, facts:async(n:number)=>{await new Promise(r=>setTimeout(r,50));return client.facts(n);}} : client; },
@@ -306,7 +306,7 @@ describe("runs saved before a run was one session", () => {
 });
 
 describe("the reviewer", () => {
-  type Reviewed = { run: Run; reviews: { status: string; verdict?: string; trigger: string; githubReviewId?: number }[] };
+  type Reviewed = { run: Run; reviews: { status: string; verdict?: string; trigger: string; postedReviewId?: number }[] };
   const reviewsOf = async (id: string) => (await api("GET", `/api/v1/runs/${id}`)).json as Reviewed;
   const submit = (runId: string, body: object) => api("POST", `/api/v1/sessions/${runId}-review/review`, body);
 
@@ -326,10 +326,10 @@ describe("the reviewer", () => {
     expect(reviewerLaunches[0]!.allowedTools!.some((t) => /Edit|Write/.test(t))).toBe(false);
     expect((await submit(runId, { verdict: "changes_requested", summary: "one bug", comments: [] })).status).toBe(400);
     const res = await submit(runId, { verdict: "changes_requested", summary: "Off by one.", comments: [{ path: "a.txt", line: 1, body: "use b" }] });
-    expect(res.json).toEqual({ githubReviewId: 901 });
+    expect(res.json).toEqual({ postedReviewId: 901 });
     const { run, reviews } = await until(() => reviewsOf(runId), (r) => r.run.node.attempts === 2);
     expect(run.node.summary ?? "").toMatch(/A reviewer asked for changes on pull request #1\. Make each one:\n- a\.txt:1: use b/);
-    expect(reviews[0]).toMatchObject({ status: "complete", verdict: "changes_requested", githubReviewId: 901 });
+    expect(reviews[0]).toMatchObject({ status: "complete", verdict: "changes_requested", postedReviewId: 901 });
     expect(gh.posted[0]).toMatchObject({ number: 1, event: "COMMENT", commit_id: expect.any(String), comments: [{ path: "a.txt", line: 1, body: "use b" }] });
   });
 

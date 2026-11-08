@@ -16,7 +16,7 @@ type Side = (typeof SIDE_TABS)[number];
 function useTimeline(id: string, activity: boolean, session: string) {
   const [items, setItems] = useState<Item[]>([]);
   const known = useRef<Item[]>([]);
-  const q = (after: number) => `/timeline?after=${after}&limit=100&maxChars=50000&session=${session}${activity ? "&view=activity" : ""}`;
+  const q = (after: number) => `/timeline?after=${after}&limit=100&charLimit=50000&session=${session}${activity ? "&view=activity" : ""}`;
   const { error, reload } = useLive(async () => {
     const anchor = known.current.find((i) => i.streaming) ?? known.current.at(-1);
     let after = anchor ? anchor.position - 1 : 0;
@@ -46,10 +46,10 @@ function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; t
   const set = useApp((s) => s.set);
   const text = full ?? item.text;
   const showAll = () => void act(async () => {
-    let out = item.text; let offset = item.nextTextOffset ?? null;
+    let out = item.text; let offset = item.nextChar ?? null;
     while (offset !== null) {
-      const page = await api<Page>("GET", runPath(id, `/timeline?item=${item.position}&textOffset=${offset}&maxChars=50000`));
-      out += page.items[0]!.text; offset = page.items[0]!.nextTextOffset ?? null;
+      const page = await api<Page>("GET", runPath(id, `/timeline?item=${item.position}&startChar=${offset}&charLimit=50000`));
+      out += page.items[0]!.text; offset = page.items[0]!.nextChar ?? null;
     }
     setFull(out);
   });
@@ -84,7 +84,7 @@ function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; t
       {/* Agent text is data: markdown renders without raw HTML. */}
       {mine ? <div className="whitespace-pre-wrap break-words">{item.kind === "prompt" && task && text.includes(task) ? task : text}</div>
         : <div className="prose-agent"><Markdown components={{ a: (p) => <a href={p.href} target="_blank" rel="noreferrer noopener">{p.children}</a> }}>{text}</Markdown></div>}
-      {item.nextTextOffset != null && full === undefined && <button className="btn justify-self-start text-xs" onClick={showAll}>Show all ({item.cut?.length} characters)</button>}
+      {item.nextChar != null && full === undefined && <button className="btn justify-self-start text-xs" onClick={showAll}>Show all ({item.cut?.length} characters)</button>}
     </article>
   );
 }

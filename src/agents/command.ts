@@ -26,7 +26,7 @@ export type ClaudeOptions = {
   noChrome?: boolean;
 };
 
-export type ClaudeStart = ClaudeOptions & { sessionId?: string; nativeSessionId?: string };
+export type ClaudeStart = ClaudeOptions & { sessionId?: string; ownSessionId?: string };
 export type ClaudeResume = ClaudeOptions & { sessionId: string; capturedId?: string };
 
 // Fixed namespace for Rivet's name-based Claude session ids. Never change it:
@@ -129,9 +129,9 @@ async function claudeCommand(o: ClaudeOptions, conversation: string[]): Promise<
 
 export async function claudeStartCommand(o: ClaudeStart): Promise<string[]> {
   let id: string | null = null;
-  if (o.nativeSessionId) {
-    id = canonicalUuid(o.nativeSessionId);
-    if (id === null) throw new Error(`claude-code: invalid native session id: ${o.nativeSessionId.trim()}`);
+  if (o.ownSessionId) {
+    id = canonicalUuid(o.ownSessionId);
+    if (id === null) throw new Error(`claude-code: invalid native session id: ${o.ownSessionId.trim()}`);
   } else if (o.sessionId) {
     id = claudeSessionId(o.sessionId);
   }

@@ -100,18 +100,18 @@ export type Store = {
   getConfig(project: string): Record<string, string>;
   setConfig(project: string, key: string, value: string | null): void;
   // A run's pull request; "handled" remembers which feedback was already acted on.
-  readPrGuide(runId: string, number: number): string | null;
-  writePrGuides(runId: string, guides: { number: number; text: string }[]): void;
-  linkedPrs(runId: string): LinkedPullRequest[];
-  addLinkedPr(runId: string, pr: LinkedPullRequest): void;
-  updateLinkedPr(runId: string, number: number, status: string, handled?: string): void;
-  removeLinkedPr(runId: string, number: number): boolean;
+  readReviewNotes(runId: string, number: number): string | null;
+  writeReviewNotes(runId: string, guides: { number: number; text: string }[]): void;
+  prLinks(runId: string): PrLink[];
+  addPrLink(runId: string, pr: PrLink): void;
+  updatePrLink(runId: string, number: number, status: string, handled?: string): void;
+  removePrLink(runId: string, number: number): boolean;
   getPr(runId: string): PullRequest | null;
   setPr(runId: string, pr: PullRequest): void;
   clearPr(runId: string): void;
   // Review passes over a run's pull request, oldest first.
   startReview(runId: string, sha: string, trigger: Review["trigger"]): number;
-  endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; githubReviewId?: number }): void;
+  endReview(id: number, fields: { status: "complete" | "failed"; verdict?: Review["verdict"]; body?: string; postedReviewId?: number }): void;
   reviewsOf(runId: string): Review[];
   saveRoutine(a: Routine): void;
   listRoutines(project?: string): Routine[];
@@ -169,7 +169,7 @@ export type ProjectMetadata = {
   scripts: { id: string; command: string }[];
 };
 
-export type LinkedPullRequest = { number: number; url: string; status: string; handled?: string };
+export type PrLink = { number: number; url: string; status: string; handled?: string };
 export type PullRequest = { number: number; url: string; handled?: string };
 
 // One review pass over a worker's pull request at one commit.
@@ -182,7 +182,7 @@ export type Review = {
   status: "running" | "complete" | "failed";
   verdict?: "approved" | "changes_requested";
   body?: string;
-  githubReviewId?: number;
+  postedReviewId?: number;
   createdAt: string;
 };
 
@@ -423,12 +423,12 @@ MIGRATIONS.push({ version: 29, sql: "", run: (db) => {
   db.exec(`${sql}; INSERT INTO nodes_v29 SELECT * FROM nodes; DROP TABLE nodes; ALTER TABLE nodes_v29 RENAME TO nodes;`);
 } });
 MIGRATIONS.push({version:36,sql:`CREATE TABLE lifecycle_state (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,key));`});
-MIGRATIONS.push({ version: 35, sql: "ALTER TABLE linked_pull_requests ADD COLUMN handled TEXT NOT NULL DEFAULT '';" });
+MIGRATIONS.push({ version: 35, sql: "ALTER TABLE pr_links ADD COLUMN handled TEXT NOT NULL DEFAULT '';" });
 MIGRATIONS.push({ version: 34, sql: `
 CREATE TABLE environment_preferences (id INTEGER PRIMARY KEY CHECK(id=1), instructions TEXT NOT NULL);
 ` });
 MIGRATIONS.push({ version: 33, sql: `
-CREATE TABLE linked_pull_requests (
+CREATE TABLE pr_links (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   number INTEGER NOT NULL CHECK (number > 0),
   url TEXT NOT NULL,
@@ -447,7 +447,7 @@ CREATE TABLE registered_projects (
 );
 ` });
 MIGRATIONS.push({ version: 31, sql: `
-CREATE TABLE pull_request_guides (
+CREATE TABLE review_notes (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   number INTEGER NOT NULL CHECK (number > 0),
   text TEXT NOT NULL,
@@ -683,7 +683,7 @@ CREATE TABLE reviews (
   status TEXT NOT NULL CHECK (status IN ('running', 'complete', 'failed')),
   verdict TEXT CHECK (verdict IN ('approved', 'changes_requested')),
   body TEXT,
-  github_review_id INTEGER,
+  posted_review_id INTEGER,
   created_at TEXT NOT NULL
 );
 ` });
@@ -1345,8 +1345,8 @@ export function openStore(data: string): Store {
         db.prepare("UPDATE chat_sessions SET next_position = max(next_position, ?) WHERE id = ?").run(inheritedMax + 1, c);
         const nextSeq = () => Number((db.prepare("UPDATE chat_sessions SET next_position = next_position + 1, updated_at = ? WHERE id = ? RETURNING next_position - 1 AS position")
           .get(now, c) as { position: number }).position);
-        const turnRow = (providerTurnId?: string) => providerTurnId
-          ? (db.prepare("SELECT id FROM chat_turns WHERE chat_id = ? AND agent_turn = ?").get(c, providerTurnId) as { id: string } | undefined)?.id ?? null
+        const turnRow = (agentTurnId?: string) => agentTurnId
+          ? (db.prepare("SELECT id FROM chat_turns WHERE chat_id = ? AND agent_turn = ?").get(c, agentTurnId) as { id: string } | undefined)?.id ?? null
           : null;
         // State the partial-index predicate explicitly: SQLite cannot infer that a
         // bound provider item id is nonempty, otherwise large imports scan each prefix.
@@ -1625,45 +1625,45 @@ export function openStore(data: string): Store {
     },
 
     endReview(id, f) {
-      const ended = db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, github_review_id = ? WHERE id = ? AND status = 'running'")
-        .run(f.status, f.verdict ?? null, f.body ?? null, f.githubReviewId ?? null, id).changes;
+      const ended = db.prepare("UPDATE reviews SET status = ?, verdict = ?, body = ?, posted_review_id = ? WHERE id = ? AND status = 'running'")
+        .run(f.status, f.verdict ?? null, f.body ?? null, f.postedReviewId ?? null, id).changes;
       const row = ended ? db.prepare("SELECT run_id FROM reviews WHERE id = ?").get(id) as { run_id: string } | undefined : undefined;
       if (row) logEvent(row.run_id, "review", "review.ended", { status: f.status, verdict: f.verdict ?? null });
     },
 
     reviewsOf(runId) {
       type Row = { id: number; run_id: string; sha: string; trigger: Review["trigger"]; status: Review["status"]; verdict: Review["verdict"] | null;
-        body: string | null; github_review_id: number | null; created_at: string };
+        body: string | null; posted_review_id: number | null; created_at: string };
       return (db.prepare("SELECT * FROM reviews WHERE run_id = ? ORDER BY id").all(runId) as Row[]).map((r) => ({
         id: Number(r.id), runId: r.run_id, sha: r.sha, trigger: r.trigger, status: r.status, createdAt: r.created_at,
         ...(r.verdict !== null ? { verdict: r.verdict } : {}), ...(r.body !== null ? { body: r.body } : {}),
-        ...(r.github_review_id !== null ? { githubReviewId: Number(r.github_review_id) } : {}),
+        ...(r.posted_review_id !== null ? { postedReviewId: Number(r.posted_review_id) } : {}),
       }));
     },
 
-    linkedPrs(runId) {
-      return db.prepare("SELECT number,url,status,handled FROM linked_pull_requests WHERE run_id=? ORDER BY number").all(runId) as LinkedPullRequest[];
+    prLinks(runId) {
+      return db.prepare("SELECT number,url,status,handled FROM pr_links WHERE run_id=? ORDER BY number").all(runId) as PrLink[];
     },
 
-    addLinkedPr(runId, pr) {
-      db.prepare("INSERT INTO linked_pull_requests(run_id,number,url,status) VALUES (?,?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET url=excluded.url,status=excluded.status").run(runId, pr.number, pr.url, pr.status);
+    addPrLink(runId, pr) {
+      db.prepare("INSERT INTO pr_links(run_id,number,url,status) VALUES (?,?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET url=excluded.url,status=excluded.status").run(runId, pr.number, pr.url, pr.status);
     },
 
-    updateLinkedPr(runId, number, status, handled) {
-      db.prepare("UPDATE linked_pull_requests SET status=?, handled=coalesce(?,handled) WHERE run_id=? AND number=?").run(status, handled ?? null, runId, number);
+    updatePrLink(runId, number, status, handled) {
+      db.prepare("UPDATE pr_links SET status=?, handled=coalesce(?,handled) WHERE run_id=? AND number=?").run(status, handled ?? null, runId, number);
     },
 
-    removeLinkedPr(runId, number) {
-      return db.prepare("DELETE FROM linked_pull_requests WHERE run_id=? AND number=?").run(runId, number).changes > 0;
+    removePrLink(runId, number) {
+      return db.prepare("DELETE FROM pr_links WHERE run_id=? AND number=?").run(runId, number).changes > 0;
     },
 
-    readPrGuide(runId, number) {
-      const row = db.prepare("SELECT text FROM pull_request_guides WHERE run_id=? AND number=?").get(runId, number) as { text: string } | undefined;
+    readReviewNotes(runId, number) {
+      const row = db.prepare("SELECT text FROM review_notes WHERE run_id=? AND number=?").get(runId, number) as { text: string } | undefined;
       return row?.text ?? null;
     },
 
-    writePrGuides(runId, guides) {
-      const save = db.prepare("INSERT INTO pull_request_guides (run_id, number, text) VALUES (?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET text=excluded.text");
+    writeReviewNotes(runId, guides) {
+      const save = db.prepare("INSERT INTO review_notes (run_id, number, text) VALUES (?,?,?) ON CONFLICT(run_id,number) DO UPDATE SET text=excluded.text");
       for (const guide of guides) save.run(runId, guide.number, redact(guide.text));
     },
 

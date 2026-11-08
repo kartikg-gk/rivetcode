@@ -10,7 +10,7 @@ const locks = new Map<string, Promise<unknown>>();
 const MAX_TEXT_BYTES = 512 * 1024;
 const versionOf = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
-export async function withWorkspaceLock<T>(root: string, work: () => Promise<T>): Promise<T> {
+export async function lockWorkspace<T>(root: string, work: () => Promise<T>): Promise<T> {
   const canonical = await realpath(root);
   const key = process.platform === "win32" ? canonical.toLowerCase() : canonical;
   const pending = (locks.get(key) ?? Promise.resolve()).then(work, work);
@@ -64,7 +64,7 @@ export async function readTextFile(root: string, path: string) {
 
 export async function saveTextFile(root: string, path: string, text: string, expected: string | null) {
   if (Buffer.byteLength(text) > MAX_TEXT_BYTES) throw new WorkspaceError(413, "text editor supports files up to 512 KiB");
-  return withWorkspaceLock(root, async () => {
+  return lockWorkspace(root, async () => {
     const file = await target(root, path, true);
     let current: Buffer | undefined;
     let mode = 0o600;

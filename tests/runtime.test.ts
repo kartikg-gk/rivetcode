@@ -15,7 +15,7 @@ beforeEach(async () => {
   data = await makeDataDir();
   ws = join(data, "work space");
   await mkdir(ws);
-  runtime = createRuntime({ logDir: join(data, "logs"), stopGraceMs: 500 });
+  runtime = createRuntime({ logDir: join(data, "logs"), stopWaitMs: 500 });
 });
 
 afterEach(async () => {

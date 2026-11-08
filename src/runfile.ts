@@ -11,7 +11,7 @@ export type RunInfo = {
   startedAt: string;
 };
 
-export function runFilePath(): string {
+export function runFileAt(): string {
   const override = process.env.RIVET_RUN_FILE;
   if (override) return resolve(override);
   return join(homedir(), ".rivet", "running.json");
