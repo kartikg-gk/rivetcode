@@ -97,7 +97,11 @@ export function toolCaller(env: NodeJS.ProcessEnv, cwd: string) {
       }
       case "rivet_send": return request("POST", `/api/v1/sessions/${encodeURIComponent(a.run as string)}-agent/send`, { message: a.message, mode: a.mode ?? "steer", from: session });
       case "rivet_answer": return request("POST", `${path}/answer`, { choice: a.choice, ...(a.note ? { note: a.note } : {}) });
-      case "rivet_report": return request("POST", "/api/v1/outcomes", { sessionId: session, kind: a.kind, message: a.note });
+      case "rivet_report": {
+        const r = await request("POST", "/api/v1/outcomes", { sessionId: session, kind: a.kind, message: a.note });
+        // A bare acknowledgement left small models reporting again and again.
+        return { ...(object(r) ? r : {}), reported: a.kind, next: a.kind === "done" ? "Reported. Rivet takes the work from here: end your turn now, without more tool calls." : "Reported. End your turn unless you can still make progress." };
+      }
       case "rivet_check": return request("POST", `${own}/check`, {}, 3600000);
       case "rivet_delegate": return request("POST", `${own}/delegate`, a);
       case "rivet_search": {

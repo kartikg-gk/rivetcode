@@ -289,9 +289,23 @@ describe("a delta chat session", () => {
 describe("a delta session that fails", () => {
   it("says why, in delta's own words", async () => {
     process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
-    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
     const runId = (await api("POST", "/api/v1/runs", { repo, task: "CRASH now", agent: "delta" })).json.runId as string;
     await until("the reason", async () => JSON.stringify((await api("GET", `/api/v1/runs/${runId}`)).json).includes("delta failed: openai.APIConnectionError: Connection error."));
+  }, 30_000);
+
+  it("gives the model provider's reason when a request fails", async () => {
+    const { deltaChat } = await import("../src/chat/drivers.js");
+    const events: Record<string, unknown>[] = [];
+    const driver = deltaChat({
+      binary: "delta", cwd: repo, permission: "auto", inheritedTurns: [], raw: () => {}, decide: () => "yes" as const,
+      env: { RIVET_CHAT_COMMAND: JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]), DELTA_LOG_DIR: join(data, "delta-logs") },
+      emit: (e) => events.push(e as Record<string, unknown>),
+    } as Parameters<typeof deltaChat>[0]);
+    await driver.start();
+    await driver.prompt("REFUSED please");
+    driver.close();
+    expect(events.find((e) => e.type === "turn" && e.state === "failed")).toMatchObject({ error: "ollama request failed with status 500: out-of-memory" });
   }, 30_000);
 });
 

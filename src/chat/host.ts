@@ -156,7 +156,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
       options.model = `ollama/${run.model}`;
       options.env = { ...options.env, DELTA_CATALOG: catalogWith(deltaLogs(options.env, options.cwd), run.model, run.window, env) };
     } catch (e) {
-      emit({ type: "activity", kind: "system", status: "failed", summary: `Ollama: ${(e as Error).message}` });
+      emit({ type: "activity", kind: "note", status: "failed", summary: `Ollama: ${(e as Error).message}` });
     }
   }
   const driver: ChatDriver = config.agent === "claude" ? claudeChat(options) : config.agent === "delta" ? deltaChat(options) : codexChat(options);
@@ -203,7 +203,8 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
         completionFailed = true;
         emit({type:"activity",kind:"note",status:"failed",summary:"Completion drain timed out; final provider output may be incomplete"});
         void finish();
-      }, 15000);
+      // A local model writes its last reply far slower than a hosted one.
+      }, config.agent === "delta" && config.model?.startsWith("ollama/") ? 180_000 : 15_000);
       if (!busy && !driver.running) await finish();
       return;
     }

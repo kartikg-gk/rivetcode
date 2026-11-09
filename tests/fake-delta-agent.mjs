@@ -1,5 +1,7 @@
 // Speaks delta's JSON-lines protocol (--mode rpc) well enough for Rivet's tests: each prompt
-// is echoed back, one containing CRASH fails the way delta does when its model is unreachable, and one containing RUN first asks to run a command and waits for the answer.
+// is echoed back, one containing CRASH exits the way delta does when it breaks, one containing
+// REFUSED ends with the model provider's error, and one containing RUN first asks to run a
+// command and waits for the answer.
 import { createInterface } from "node:readline";
 
 const send = (record) => process.stdout.write(JSON.stringify(record) + "\n");
@@ -10,6 +12,13 @@ let hostCall = null;
 async function turn(message) {
   send({ type: "agent_start" });
   if (message.includes("CRASH")) { process.stderr.write("Traceback (most recent call last):\nopenai.APIConnectionError: Connection error.\n"); process.exit(1); }
+  if (message.includes("REFUSED")) {
+    send({ type: "message_start", message: { role: "assistant", content: [] } });
+    send({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "ollama request failed with status 500: out-of-memory" } });
+    send({ type: "agent_end" });
+    send({ type: "agent_settled", outcome: "failed", state: {} });
+    return;
+  }
   if (message.includes("RUN")) {
     send({ type: "tool_execution_start", toolCallId: "call-1", toolName: "Bash", args: { command: "npm publish" } });
     const allowed = await new Promise((resolve) => {

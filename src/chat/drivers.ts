@@ -573,7 +573,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
   let settled: (() => void) | undefined;
   // What delta prints on stderr is its own account of a failure; its last plain lines (not a
   // traceback's indented frames) say why.
-  let errors = "";
+  let errors = "", failure = "";
   const why = () => errors.split(/\r?\n/).filter((l) => l.trim() && !/^\s/.test(l) && !l.startsWith("Traceback (")).slice(-2).join("\n").slice(-500);
   const exited = new Promise<void>((resolve) => child.on("exit", (code) => {
     const said = why();
@@ -618,6 +618,8 @@ export function deltaChat(o: ChatOptions): ChatDriver {
         return;
       case "message_end": {
         if (m.role !== "assistant") return;
+        // A model request that failed ends as an empty reply carrying the provider's reason.
+        if (m.stopReason === "error" && text(m.errorMessage)) failure = text(m.errorMessage).slice(0, 500);
         s.done(itemId, said(m), activeTurn);
         const u = (m.usage ?? {}) as Record<string, unknown>;
         if (num(u.totalTokens)) o.emit({ type: "usage", mode: "add", ...(num(u.input) !== undefined ? { input: num(u.input)! } : {}), ...(num(u.output) !== undefined ? { output: num(u.output)! } : {}), ...(num(u.cacheRead) !== undefined ? { cached: num(u.cacheRead)! } : {}), total: num(u.totalTokens)! });
@@ -657,7 +659,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
       case "agent_settled": {
         const outcome = text(e.outcome);
         o.emit({ type: "turn", turnId: activeTurn, state: outcome === "completed" ? "done" : outcome === "cancelled" ? "stopped" : "failed",
-          ...(e.error ? { error: text(e.error) } : outcome !== "completed" && outcome !== "cancelled" && why() ? { error: why() } : {}) });
+          ...(outcome === "completed" || outcome === "cancelled" ? (e.error ? { error: text(e.error) } : {}) : (failure || text(e.error) || why()) ? { error: failure || text(e.error) || why() } : {}) });
         activeTurn = "";
         void send("get_session_stats").then((st) => {
           const c = ((st ?? {}) as Record<string, unknown>).contextUsage as Record<string, unknown> | undefined;
@@ -692,6 +694,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
     },
     async prompt(message) {
       activeTurn = `turn-${++turns}`;
+      failure = "";
       o.emit({ type: "turn", turnId: activeTurn, state: "working" });
       const ended = new Promise<void>((resolve) => { settled = resolve; });
       try { await send("prompt", { message }); }
