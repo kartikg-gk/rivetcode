@@ -1,5 +1,5 @@
 // Speaks delta's JSON-lines protocol (--mode rpc) well enough for Rivet's tests: each prompt
-// is echoed back, and one containing RUN first asks to run a command and waits for the answer.
+// is echoed back, one containing CRASH fails the way delta does when its model is unreachable, and one containing RUN first asks to run a command and waits for the answer.
 import { createInterface } from "node:readline";
 
 const send = (record) => process.stdout.write(JSON.stringify(record) + "\n");
@@ -9,6 +9,7 @@ let hostCall = null;
 
 async function turn(message) {
   send({ type: "agent_start" });
+  if (message.includes("CRASH")) { process.stderr.write("Traceback (most recent call last):\nopenai.APIConnectionError: Connection error.\n"); process.exit(1); }
   if (message.includes("RUN")) {
     send({ type: "tool_execution_start", toolCallId: "call-1", toolName: "Bash", args: { command: "npm publish" } });
     const allowed = await new Promise((resolve) => {

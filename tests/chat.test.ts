@@ -286,6 +286,15 @@ describe("a delta chat session", () => {
   }, 30_000);
 });
 
+describe("a delta session that fails", () => {
+  it("says why, in delta's own words", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopGraceMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "CRASH now", agent: "delta" })).json.runId as string;
+    await until("the reason", async () => JSON.stringify((await api("GET", `/api/v1/runs/${runId}`)).json).includes("delta failed: openai.APIConnectionError: Connection error."));
+  }, 30_000);
+});
+
 describe("a delta model name", () => {
   it("splits into provider and model", async () => {
     const { deltaModel } = await import("../src/chat/drivers.js");

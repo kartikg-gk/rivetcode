@@ -641,7 +641,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const found = models.out.split("\n").map((l) => { try { return JSON.parse(l) as { id?: string; data?: { models?: { provider: string; id: string }[] } }; } catch { return null; } })
         .find((r) => r?.id === "m")?.data?.models ?? [];
       if (!providers.length && !found.length) throw new HttpError(409, `cannot run delta (${binary}): set delta.binary to a delta with --mode rpc`);
-      reply(res, 200, { providers, models: found.map((m) => ({ provider: m.provider, id: m.id })) });
+      // Delta's Ollama names are examples, not what is pulled; Ollama says what is, and which can call tools.
+      const { ollamaModels } = await import("../chat/ollama.js");
+      const local = (await ollamaModels(process.env)).map((id) => ({ provider: "ollama", id }));
+      reply(res, 200, { providers, models: [...found.filter((m) => m.provider !== "ollama").map((m) => ({ provider: m.provider, id: m.id })), ...local] });
       return;
     }
     if (path === "/api/v1/tasks/parse") {

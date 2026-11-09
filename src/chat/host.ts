@@ -4,7 +4,8 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createInterface } from "node:readline";
 import { callDaemon, dataDirFrom } from "../cli/client.js";
-import { claudeChat, codexChat, deltaChat, type Approval, type ChatDriver, type ChatEvent, type Choice } from "./drivers.js";
+import { catalogWith, localModel } from "./ollama.js";
+import { claudeChat, codexChat, deltaChat, deltaLogs, deltaModel, type Approval, type ChatDriver, type ChatEvent, type Choice } from "./drivers.js";
 
 // The process that runs one chat session: it speaks the agent's protocol, takes Rivet's
 // messages and answers on stdin (one JSON line each), and posts what happens to the
@@ -147,6 +148,17 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
       return undefined;
     },
   };
+  // A local Ollama model gets a context large enough for delta's prompt, and delta is told its size.
+  const local = config.agent === "delta" ? deltaModel(options.model) : {};
+  if (local.provider === "ollama" && local.model && !process.env.RIVET_CHAT_COMMAND && !env.RIVET_CHAT_COMMAND) {
+    try {
+      const run = await localModel(local.model, env);
+      options.model = `ollama/${run.model}`;
+      options.env = { ...options.env, DELTA_CATALOG: catalogWith(deltaLogs(options.env, options.cwd), run.model, run.window, env) };
+    } catch (e) {
+      emit({ type: "activity", kind: "system", status: "failed", summary: `Ollama: ${(e as Error).message}` });
+    }
+  }
   const driver: ChatDriver = config.agent === "claude" ? claudeChat(options) : config.agent === "delta" ? deltaChat(options) : codexChat(options);
 
   let said = 0;

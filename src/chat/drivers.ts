@@ -537,6 +537,11 @@ export function deltaModel(model: string | undefined): { provider?: string; mode
   return at < 0 ? { model: m } : { ...(at > 0 ? { provider: m.slice(0, at) } : {}), ...(m.slice(at + 1) ? { model: m.slice(at + 1) } : {}) };
 }
 
+// Where a delta session's logs and Rivet's files for it go.
+export function deltaLogs(env: Record<string, string>, cwd: string): string {
+  return env.DELTA_LOG_DIR ?? join(env.RIVET_DATA_DIR ?? cwd, "logs", "delta", env.RIVET_SESSION_ID ?? "session");
+}
+
 // Delta asks before any tool but reads; Rivet's levels decide which questions reach the user.
 const DELTA_POLICY: Record<string, string> = { "read-only": "deny", auto: "auto", "full": "auto" };
 const DELTA_EDITS = new Set(["Edit", "Write", "MultiEdit"]);
@@ -548,7 +553,7 @@ export function deltaChat(o: ChatOptions): ChatDriver {
     ...(provider ? ["--provider", provider] : []), ...(model ? ["--model", model] : []), ...(o.resume ? ["--resume", o.resume] : [])];
   // Delta logs each run under the folder it works in unless told otherwise; in a worktree
   // those logs would be committed with the work, so they go to Rivet's data folder.
-  const logs = o.env.DELTA_LOG_DIR ?? join(o.env.RIVET_DATA_DIR ?? o.cwd, "logs", "delta", o.env.RIVET_SESSION_ID ?? "session");
+  const logs = deltaLogs(o.env, o.cwd);
   // Rivet's own tools reach delta as tools it calls and Rivet answers (the same ones Claude
   // and Codex get over MCP), so it need not type rivet commands into a shell.
   const call = o.env.RIVET_SESSION_ID ? toolCaller(o.env, o.cwd) : null;
@@ -566,8 +571,14 @@ export function deltaChat(o: ChatOptions): ChatDriver {
   let next = 0, turns = 0, item = 0;
   let activeTurn = "", itemId = "";
   let settled: (() => void) | undefined;
-  const exited = new Promise<void>((resolve) => child.on("exit", () => {
-    for (const w of waiting.values()) w.reject(new Error("delta exited"));
+  // What delta prints on stderr is its own account of a failure; its last plain lines (not a
+  // traceback's indented frames) say why.
+  let errors = "";
+  const why = () => errors.split(/\r?\n/).filter((l) => l.trim() && !/^\s/.test(l) && !l.startsWith("Traceback (")).slice(-2).join("\n").slice(-500);
+  const exited = new Promise<void>((resolve) => child.on("exit", (code) => {
+    const said = why();
+    for (const w of waiting.values()) w.reject(new Error(said ? `delta exited: ${said}` : "delta exited"));
+    if (activeTurn) { o.emit({ type: "turn", turnId: activeTurn, state: "failed", error: said || `delta exited (${code ?? "killed"})` }); activeTurn = ""; }
     waiting.clear();
     settled?.();
     resolve();
@@ -645,7 +656,8 @@ export function deltaChat(o: ChatOptions): ChatDriver {
         return;
       case "agent_settled": {
         const outcome = text(e.outcome);
-        o.emit({ type: "turn", turnId: activeTurn, state: outcome === "completed" ? "done" : outcome === "cancelled" ? "stopped" : "failed", ...(e.error ? { error: text(e.error) } : {}) });
+        o.emit({ type: "turn", turnId: activeTurn, state: outcome === "completed" ? "done" : outcome === "cancelled" ? "stopped" : "failed",
+          ...(e.error ? { error: text(e.error) } : outcome !== "completed" && outcome !== "cancelled" && why() ? { error: why() } : {}) });
         activeTurn = "";
         void send("get_session_stats").then((st) => {
           const c = ((st ?? {}) as Record<string, unknown>).contextUsage as Record<string, unknown> | undefined;
@@ -668,9 +680,12 @@ export function deltaChat(o: ChatOptions): ChatDriver {
       try { onEvent(JSON.parse(line) as Record<string, unknown>); } catch { /* not a record */ }
     }
   });
-  child.stderr!.on("data", () => {});
+  child.stderr!.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString("utf8")).slice(-4000); });
   return {
     async start() {
+      // Rivet titles its own runs. Unnamed, delta asks the model for a title after the first
+      // reply and every few after, which holds the turn open (minutes on a local model).
+      await send("set_session_name", { name: `rivet ${o.env.RIVET_SESSION_ID ?? "session"}` }).catch(() => {});
       const st = (await send("get_state")) as Record<string, unknown>;
       // The session file is what --resume takes; without one, the id at least names it.
       o.emit({ type: "conversation", id: text(st.sessionFile) || text(st.sessionId) });
