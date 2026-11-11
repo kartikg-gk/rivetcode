@@ -1631,8 +1631,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         if (!to || !AGENTS.includes(to as never)) throw new HttpError(400, `agent must be one of ${AGENTS.join(", ")}`);
         const model = optionalString(payload.model, "model");
         if (model && (to === "claude" || to === "codex") && MODEL_FAMILIES[to === "claude" ? "codex" : "claude"]?.test(model)) throw new HttpError(400, `model "${model}" is not a ${to} model`);
-        await scheduler.switchAgent(run.id, to as never, model, payload.now === true, opts.switchWaitMs);
-        reply(res, 202, { runId: run.id, agent: to });
+        const mode = optionalString(payload.mode, "mode");
+        if (mode !== undefined && mode !== "chat" && mode !== "terminal") throw new HttpError(400, "mode must be chat or terminal");
+        await scheduler.switchAgent(run.id, to as never, model, payload.now === true, opts.switchWaitMs, mode as "chat" | "terminal" | undefined);
+        reply(res, 202, { runId: run.id, agent: to, ...(mode ? { mode } : {}) });
         return;
       }
       if (action === "move-to-worktree") {

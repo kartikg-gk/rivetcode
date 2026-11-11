@@ -66,7 +66,7 @@ const USAGE = `usage: rivet <command>
   review submit --verdict approved|changes_requested --summary <text> [--comment "<path>:<line>: <text>" ...]
                                         submit a review (inside a reviewer)
   clean <run>                           remove a run's worktree (the branch stays)
-  switch <run> claude|codex|delta [--model <id>] [--now]
+  switch <run> claude|codex|delta [--model <id>] [--mode chat|terminal] [--now]
                                         hand a worker's task to another agent in the same worktree
   after-merge <run> terminate|keep     end the run once its pull request merges (default keep)
   snippet list | add <name> --prompt <text>|--command <cmd> | rm <name> | run <name> [--session <id>] [--agent <name>]
@@ -1181,12 +1181,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "delegate": return await delegate(args, io);
       case "snippet": return await snippet(args, io);
       case "switch": {
-        const { flags, rest } = parseFlags(args, ["model"]);
+        const { flags, rest } = parseFlags(args, ["model", "mode"]);
         const [runId, agent] = rest;
         if (!runId || !agent) throw new UsageError("switch needs a run id and claude, codex or delta");
         await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(runId)}/switch`,
-          { agent, ...(typeof flags.get("model") === "string" ? { model: flags.get("model") } : {}), ...(flags.get("now") === true ? { now: true } : {}) }, COMMAND_WAIT_MS);
-        io.out(`${runId} now runs ${agent}, picking up from where the work stands`);
+          { agent, ...(typeof flags.get("model") === "string" ? { model: flags.get("model") } : {}), ...(flags.get("now") === true ? { now: true } : {}), ...(typeof flags.get("mode") === "string" ? { mode: flags.get("mode") } : {}) }, COMMAND_WAIT_MS);
+        io.out(`${runId} now runs ${agent}${typeof flags.get("mode") === "string" ? ` in a ${flags.get("mode")}` : ""}, picking up from where the work stands`);
         return 0;
       }
       case "run": return await runFile(args, io);

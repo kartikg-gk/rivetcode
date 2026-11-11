@@ -1228,11 +1228,15 @@ export function createScheduler(d: SchedulerDeps) {
     return pr;
   }
 
-  async function switchAgent(runId: string, to: Node["agent"], model?: string, now = false, waitMs = SWITCH_WAIT_MS): Promise<void> {
+  // mode moves the session between a terminal and a chat; with the same agent that is all it changes.
+  async function switchAgent(runId: string, to: Node["agent"], model?: string, now = false, waitMs = SWITCH_WAIT_MS, mode?: "chat" | "terminal"): Promise<void> {
     let run = await load(runId);
     if (run.role !== "worker") throw new SchedulerError(409, "only a worker's agent is switched");
     if (run.node.status === "done" || run.node.status === "pending") throw new SchedulerError(409, `run ${runId} is ${run.node.status}; switch a worker that is working, failed or escalated`);
-    if (to === run.node.agent && !model) throw new SchedulerError(409, `run ${runId} already runs ${to}`);
+    const modeChanges = mode !== undefined && mode !== (run.node.runMode ?? "terminal");
+    if (to === run.node.agent && !model && !modeChanges) throw new SchedulerError(409, mode ? `run ${runId} already runs ${to} in a ${mode}` : `run ${runId} already runs ${to}`);
+    if (mode === "terminal" && to === "delta") throw new SchedulerError(409, "delta runs only as a chat");
+    if (mode === "chat" && run.spec?.denyTools?.length) throw new SchedulerError(409, "this task's denyTools cannot be enforced in a chat; keep it in a terminal");
     // Switch agents between turns: stopping mid-turn can leave a git lock,
     // a half-done merge or a half-installed package behind.
     const busy = () => d.runtime.isAlive(sessionOf(run)) && (run.node.activity === "busy" || run.node.activity === "approval");
@@ -1265,12 +1269,13 @@ export function createScheduler(d: SchedulerDeps) {
       d.store.updateNode(runId, NODE_ID, { agent: to, agentOwnId: null });
       const fresh = d.store.loadRun(runId);
       const { model: _old, ...rest } = fresh;
-      d.store.saveRun(model ? { ...rest, model } : rest);
+      const spec = mode ? { ...(rest.spec ?? {}), chat: mode === "chat", terminal: mode === "terminal" } : rest.spec;
+      d.store.saveRun({ ...rest, ...(spec ? { spec } : {}), ...(model ? { model } : {}) });
     });
     if (run.node.status !== "running") await transition(runId, "running");
     const switched = await load(runId);
     await launch(switched, switchPrompt(switched, { agent: from, conversation: history ? null : conversation, history, log, status, notes, turns }), { fresh: true });
-    await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}.`);
+    await tellOrchestrator(switched, `Worker ${runId}${run.name ? ` (${run.name})` : ""} switched from ${from} to ${to}${modeChanges ? ` in a ${mode}` : ""}.`);
   }
 
   // After an agent is stopped: a lock its git left is removed (no one holds it now), and a

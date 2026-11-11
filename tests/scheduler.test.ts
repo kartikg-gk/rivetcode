@@ -684,6 +684,17 @@ describe("switching a worker's agent", () => {
     expect(seen[0]).toMatch(/Commits since the base:\n\w+ half done/);
     expect((await api("GET", `/api/v1/runs/${runId}`)).json.live).toBe(true);
     expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude" })).json.error).toMatch(/already runs claude/);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude", mode: "terminal" })).json.error).toMatch(/already runs claude in a terminal/);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude", mode: "window" })).status).toBe(400);
+    expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "delta", mode: "terminal" })).json.error).toMatch(/delta runs only as a chat/);
+    // The same agent, moved from its terminal into a chat, keeps the worktree.
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "codex"]);
+    try {
+      expect((await api("POST", `/api/v1/runs/${runId}/switch`, { agent: "claude", mode: "chat" })).json).toMatchObject({ agent: "claude", mode: "chat" });
+      const moved = await getRun(runId);
+      expect(moved.spec).toMatchObject({ chat: true, terminal: false });
+      expect(moved.node).toMatchObject({ agent: "claude", runMode: "chat", worktree: before });
+    } finally { delete process.env.RIVET_CHAT_COMMAND; }
     await api("POST", `/api/v1/runs/${runId}/stop`, {});
   });
 
