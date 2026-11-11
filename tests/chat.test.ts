@@ -318,6 +318,46 @@ describe("a delta session that fails", () => {
   }, 30_000);
 });
 
+describe("rolling a conversation back with its files", () => {
+  it("puts the worktree back to before the dropped prompt, or leaves it when not asked", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "WRITE first", agent: "delta" })).json.runId as string;
+    const idle = () => until("an idle session", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
+    await until("the first reply", async () => said(await timeline(runId), "echo: Your task: WRITE first"));
+    await idle();
+    const worktree = (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.worktree as string;
+    expect(await readFile(join(worktree, "agent.txt"), "utf8")).toBe("first");
+    expect((await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "WRITE second", mode: "queue" })).status).toBe(202);
+    await until("the second reply", async () => said(await timeline(runId), "echo: WRITE second"));
+    await idle();
+    expect(await readFile(join(worktree, "agent.txt"), "utf8")).toBe("second");
+
+    const kept = await api("POST", `/api/v1/runs/${runId}/rollback`, { turns: 1 });
+    expect(kept.json.filesystem).toBe("current checkout; historical files are not restored");
+    expect(await readFile(join(worktree, "agent.txt"), "utf8")).toBe("second");
+    await idle();
+    // Back once more, now with the files: before the first prompt agent.txt did not exist.
+    const back = await api("POST", `/api/v1/runs/${runId}/rollback`, { turns: 1, files: true });
+    expect(back.status).toBe(202);
+    expect(back.json).toMatchObject({ filesystem: "restored to before that prompt", files: { removed: 1 } });
+    expect(existsSync(join(worktree, "agent.txt"))).toBe(false);
+  }, 60_000);
+
+  it("is refused for a prompt that has no checkpoint", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "hello", agent: "delta" })).json.runId as string;
+    await until("the reply", async () => said(await timeline(runId), "echo: Your task: hello"));
+    await until("an idle session", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
+    const worktree = (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.worktree as string;
+    for (const ref of execSync("git for-each-ref --format=%(refname) refs/rivet/checkpoints", { cwd: worktree, encoding: "utf8" }).split(/\r?\n/).filter(Boolean)) execSync(`git update-ref -d ${ref}`, { cwd: worktree });
+    const r = await api("POST", `/api/v1/runs/${runId}/rollback`, { turns: 1, files: true });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toContain("no file checkpoint");
+  }, 60_000);
+});
+
 describe("a delta model name", () => {
   it("splits into provider and model", async () => {
     const { deltaModel } = await import("../src/chat/drivers.js");

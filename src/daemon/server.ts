@@ -17,6 +17,7 @@ import { defaultDelta, findClaude, findCodex, findDelta } from "../agents/locate
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
 import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
+import { checkpointRef, hasCheckpoint, restoreCheckpoint } from "../checkpoints.js";
 import { liveOwner, releaseRunFile, runFileAt, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
@@ -1238,6 +1239,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (history.length > 5000) throw new HttpError(409,"conversation exceeds the branch snapshot limit");
       let prefix = history;
       let replacement: string | undefined;
+      // With files, the checkout goes back to how it was before the prompt rolled back to.
+      const withFiles = payload.files === true;
+      if (payload.files !== undefined && typeof payload.files !== "boolean") throw new HttpError(400, "files must be true or false");
+      let boundaryItem: string | undefined;
       const restore = branchRoute[2] === "branches" ? optionalString(payload.branch,"branch") : undefined;
       if (branchRoute[2] === "rollback") {
         const turns = payload.turns;
@@ -1246,12 +1251,22 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const boundary = prompts.at(-(turns as number));
         if (!boundary) throw new HttpError(400,"not enough turns to roll back");
         prefix = history.filter(i=>i.position < boundary.position);
+        boundaryItem = boundary.itemId;
       } else if (branchRoute[2] === "edit") {
         const prompt = history.find(i=>i.position === payload.at && ["prompt","message"].includes(i.kind));
         replacement = optionalString(payload.message,"message");
         if (!prompt || !replacement) throw new HttpError(400,"edit needs a user-message position and replacement message");
         prefix = history.filter(i=>i.position < prompt.position);
+        boundaryItem = prompt.itemId;
       } else if (!restore) throw new HttpError(400,"branch is required");
+      if (withFiles && restore) throw new HttpError(400,"files can only be restored when rolling back or editing");
+      const checkpoint = withFiles ? checkpointRef(sessionIdOf(id,NODE_ID), boundaryItem ?? "") : undefined;
+      if (checkpoint) {
+        if (!boundaryItem || !(await hasCheckpoint(source.node.worktree, checkpoint))) throw new HttpError(409,"no file checkpoint was taken before that prompt; roll back without files");
+        // Another live session in the same checkout would have its files changed under it.
+        const sharing = await write(()=>store.listRuns().map(r=>store.loadRun(r)).filter(r=>r.id!==id && r.node.worktree===source.node.worktree && runtime.isAlive(sessionIdOf(r.id,NODE_ID))).map(r=>r.id));
+        if (sharing.length) throw new HttpError(409,`other sessions are working in this checkout (${sharing.join(", ")}); stop them before restoring files`);
+      }
       if (restore) {
         const target = await write(()=>store.branches(id).find(b=>b.id===restore));
         if (!target) throw new HttpError(404,"unknown conversation branch");
@@ -1260,11 +1275,17 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       }
       if (source.spec?.denyTools?.length) throw new HttpError(409,"this task's denyTools cannot be enforced in chat mode");
       await scheduler.stopSession(sessionIdOf(id,NODE_ID));
+      // Checked again now the session is stopped: nothing may have started in the checkout meanwhile.
+      let files: { restored: number; removed: number } | undefined;
+      if (checkpoint) {
+        if (await write(()=>store.listRuns().some(r=>r!==id && store.loadRun(r).node.worktree===source.node.worktree && runtime.isAlive(sessionIdOf(r,NODE_ID))))) throw new HttpError(409,"another session started in this checkout; files were not restored");
+        files = await restoreCheckpoint(source.node.worktree, checkpoint);
+      }
       const branch = await write(()=>store.changeBranch(id,prefix,history,restore));
       if (replacement) await write(()=>store.queueMessage(id,NODE_ID,replacement,undefined,"queue"));
       const fresh = await write(()=>store.loadRun(id));
       await scheduler.launch(fresh,undefined,fresh.node.agentChatId ? {resume:true} : {});
-      reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "pending",filesystem:"current checkout; historical files are not restored"}); return;
+      reply(res,202,{runId:id,branch,strategy:restore ? "restore" : "pending",...(files ? {filesystem:"restored to before that prompt",files} : {filesystem:"current checkout; historical files are not restored"})}); return;
       } finally {branchChanges.delete(id);}
     }
     const createThreadsRoute = /^\/api\/v1\/runs\/([^/]+)\/threads$/.exec(path);

@@ -52,7 +52,7 @@ const USAGE = `usage: rivet <command>
   fork <run> [--at <position>] [--name <label>]
                                         fork history at a stable reply; share checkout; start with send
   branches <run> [--select <branch>]  inspect or select preserved conversation branches
-  rollback <run> --turns <n>          branch before the last n user prompts; keep current files
+  rollback <run> --turns <n> [--files] branch before the last n user prompts; --files also puts the files back
   edit <run> --at <position> --message <text>  replace a user prompt on a new branch
   reconcile <run>                    request provider history refresh when supported
   transfers <run>                      inspect pending, queued and delivered context transfers
@@ -1108,7 +1108,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const route = `/api/v1/runs/${encodeURIComponent(rest[0]!)}/${command}`;
         const selecting = flags.get("select");
         const method = command === "branches" && !selecting ? "GET" : "POST";
-        const payload = command === "rollback" ? {turns:Number(flags.get("turns"))} : command === "edit" ? {at:Number(flags.get("at")),message:flags.get("message")} : {branch:selecting};
+        const files = flags.has("files") ? {files:true} : {};
+        const payload = command === "rollback" ? {turns:Number(flags.get("turns")),...files} : command === "edit" ? {at:Number(flags.get("at")),message:flags.get("message"),...files} : {branch:selecting};
         io.out(JSON.stringify(await callDaemon(io.env,method,route,method === "GET" ? undefined : payload,COMMAND_WAIT_MS))); return 0;
       }
       case "transfers": {

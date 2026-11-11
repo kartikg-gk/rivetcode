@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createInterface } from "node:readline";
 import { callDaemon, dataDirFrom } from "../cli/client.js";
+import { captureCheckpoint, checkpointRef } from "../checkpoints.js";
 import { catalogWith, localModel } from "./ollama.js";
 import { claudeChat, codexChat, deltaChat, deltaLogs, deltaModel, type Approval, type ChatDriver, type ChatEvent, type Choice } from "./drivers.js";
 
@@ -172,7 +173,13 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
     if (finishTimer) clearTimeout(finishTimer);
     driver.close();
   };
-  const userMessage = (text: string) => emit({ type: "message", itemId: `rivet-${process.pid}-${++said}`, role: "user", text });
+  const userMessage = (text: string) => { const itemId = `rivet-${process.pid}-${++said}`; emit({ type: "message", itemId, role: "user", text }); return itemId; };
+  // The files as they are before each prompt, so the conversation can be rolled back with them.
+  const checkpoint = async (itemId: string) => {
+    if (!env.RIVET_SESSION_ID || env.RIVET_CHECKPOINTS === "off") return;
+    try { await captureCheckpoint(config.cwd, checkpointRef(env.RIVET_SESSION_ID, itemId)); }
+    catch (e) { emit({ type: "activity", kind: "note", status: "failed", summary: `No file checkpoint for this prompt: ${(e as Error).message.slice(0, 300)}` }); }
+  };
   // Turns run one after another; a message that cannot join a turn waits for the next one.
   const pump = async () => {
     if (busy) return;
@@ -183,7 +190,7 @@ export async function runHost(config: HostConfig, env: Record<string, string | u
         currentMessage = next.messageId;
         let text = next.text;
         if (config.fork && said === 0) text += "\n\nThis conversation fork shares its source checkout and branch. Coordinate file edits with other sessions. The source run owns publishing; reporting done here completes the exploration only.";
-        userMessage(text);
+        await checkpoint(userMessage(text));
         await driver.prompt(text);
       }
     } finally { busy = false; if (finishing) await finish(); }

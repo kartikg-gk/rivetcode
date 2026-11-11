@@ -3,6 +3,7 @@
 // REFUSED ends with the model provider's error, and one containing RUN first asks to run a
 // command and waits for the answer.
 import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
 
 const send = (record) => process.stdout.write(JSON.stringify(record) + "\n");
 const respond = (r, data = null) => send({ type: "response", command: r.type, success: true, id: r.id, data });
@@ -12,6 +13,9 @@ let hostCall = null;
 async function turn(message) {
   send({ type: "agent_start" });
   if (message.includes("CRASH")) { process.stderr.write("Traceback (most recent call last):\nopenai.APIConnectionError: Connection error.\n"); process.exit(1); }
+  // WRITE <word> leaves agent.txt holding that word, as an edit by the agent would.
+  const write = /WRITE (\w+)/.exec(message);
+  if (write) writeFileSync("agent.txt", write[1]);
   if (message.includes("REFUSED")) {
     send({ type: "message_start", message: { role: "assistant", content: [] } });
     send({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "ollama request failed with status 500: out-of-memory" } });

@@ -34,10 +34,11 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
         if (next) go(next);
       },
     }) },
-    { id: "rollback", label: "Roll back…", about: "go back in the chat on a new branch; files stay as they are", args: "[turns]", run: (rest) => ask({
-      title: "Roll back conversation", note: "Files in the worktree are not restored. The old branch is kept.", confirm: "Roll back", danger: true,
-      fields: [{ name: "turns", label: "Turns to drop", type: "number", value: rest.trim() || "1" }],
-      run: (v) => api("POST", runPath(id, "/rollback"), { turns: Number(v.turns) }),
+    { id: "rollback", label: "Roll back…", about: "go back in the chat on a new branch; optionally put the files back too", args: "[turns]", run: (rest) => ask({
+      title: "Roll back conversation", note: "The old branch is kept. Restoring files puts the worktree back to how it was before that prompt; changes made since are discarded.", confirm: "Roll back", danger: true,
+      fields: [{ name: "turns", label: "Turns to drop", type: "number", value: rest.trim() || "1" },
+        { name: "files", label: "Files", type: "select", options: ["keep current files", "restore files too"], value: "keep current files" }],
+      run: (v) => api("POST", runPath(id, "/rollback"), { turns: Number(v.turns), ...(v.files === "restore files too" ? { files: true } : {}) }),
     }) },
     { id: "carry-back", label: "Carry back…", about: "copy what this fork learned into its parent's next message; no git merge", run: () => ask({
       title: "Carry back into parent", note: "Moves conversation context only. Files are already shared.", confirm: "Carry back",
