@@ -349,6 +349,18 @@ describe("timeline", () => {
     expect(store.readTimeline("r1", { limit: 10 }).total).toBe(0);
     expect(store.listProjects()).toEqual([sampleRun().project]);
   });
+
+  it("empties the old branches and delivered messages of those runs, keeping what is still waiting", () => {
+    store.saveRun(sampleRun());
+    const delivered = store.queueMessage("r1", "agent", "secret plan")!;
+    store.markDelivered(delivered);
+    store.queueMessage("r1", "agent", "not sent yet");
+    store.updateNode("r1", "agent", { finishedAt: "2026-10-01T00:00:00.000Z" });
+    expect(store.finishedBefore(sampleRun().project, "2026-09-01T00:00:00.000Z")).toEqual([]);
+    expect(store.finishedBefore(sampleRun().project, "2026-11-01T00:00:00.000Z")).toEqual(["r1"]);
+    store.pruneTimeline(sampleRun().project, "2026-11-01T00:00:00.000Z");
+    expect(store.undeliveredMessages("r1", "agent").map((m) => m.message)).toEqual(["not sent yet"]);
+  });
 });
 
 

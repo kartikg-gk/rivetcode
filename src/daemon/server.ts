@@ -8,6 +8,7 @@ import { parseTaskFile, TaskFileError } from "../scheduler/tasks.js";
 import { searchPage, SearchInputError } from "../search.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { waitOnRun } from "../scheduler/wait.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -17,7 +18,7 @@ import { defaultDelta, findClaude, findCodex, findDelta } from "../agents/locate
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
 import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
-import { checkpointRef, hasCheckpoint, restoreCheckpoint } from "../checkpoints.js";
+import { checkpointRef, dropCheckpoints, hasCheckpoint, restoreCheckpoint } from "../checkpoints.js";
 import { liveOwner, releaseRunFile, runFileAt, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
@@ -413,14 +414,25 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   // Finished runs' timelines go after timeline.keep days: they hold tool output, which can
   // carry what redaction misses.
   async function pruneTimelines(): Promise<void> {
-    await write(() => {
+    const expired = await write(() => {
+      const runs: { id: string; repo: string }[] = [];
       for (const project of store.listProjects()) {
         const keep = store.getConfig(project)["timeline.keep"];
         if (keep === "forever") continue;
         const days = keep !== undefined && Number(keep) >= 0 ? Number(keep) : TIMELINE_KEEP_DAYS;
-        store.pruneTimeline(project, new Date(Date.now() - days * 86_400_000).toISOString());
+        const before = new Date(Date.now() - days * 86_400_000).toISOString();
+        runs.push(...store.finishedBefore(project, before).map((id) => ({ id, repo: store.loadRun(id).repo })));
+        store.pruneTimeline(project, before);
       }
+      return runs;
     });
+    // The same runs' files outside the database: attachments, delta's logs and file checkpoints.
+    for (const run of expired) {
+      const session = sessionIdOf(run.id, NODE_ID);
+      await rm(join(data, "attachments", run.id), { recursive: true, force: true }).catch(() => {});
+      await rm(join(data, "logs", "delta", session), { recursive: true, force: true }).catch(() => {});
+      if (existsSync(run.repo)) await dropCheckpoints(run.repo, session).catch(() => {});
+    }
   }
   function stop(): Promise<void> {
     if (stopping) return stopping;

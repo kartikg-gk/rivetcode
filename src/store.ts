@@ -126,6 +126,8 @@ export type Store = {
   // Removes the timelines of a project's runs whose sessions all finished before a time;
   // returns how many entries went.
   pruneTimeline(project: string, before: string): number;
+  // A project's runs whose sessions all finished before a time: those pruneTimeline empties.
+  finishedBefore(project: string, before: string): string[];
   // Every project that has runs.
   listProjects(): string[];
   environmentInstructions(): string;
@@ -1092,11 +1094,26 @@ export function openStore(data: string): Store {
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
           AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
+      // Old conversation branches and delivered messages hold the same history in other places.
+      db.prepare(`UPDATE conversation_branches SET items = '[]', snapshot = '[]' WHERE active = 0 AND (items <> '[]' OR snapshot <> '[]') AND run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
+      db.prepare(`UPDATE outbox SET message = '' WHERE delivered_at IS NOT NULL AND message <> '' AND run_id IN (
+        SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
       return Number(db.prepare(`DELETE FROM timeline WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
           AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`)
         .run(project, before).changes);
+    },
+
+    finishedBefore(project, before) {
+      return (db.prepare(`SELECT r.id FROM runs r WHERE r.project = ?
+          AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?))`).all(project, before) as { id: string }[]).map((r) => r.id);
     },
 
     activeBranch(runId) {return branches(runId).find(b=>b.active);},
