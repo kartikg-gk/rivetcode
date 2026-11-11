@@ -306,6 +306,8 @@ export function createScheduler(d: SchedulerDeps) {
     const sessionId = sessionIdOf(runId, NODE_ID);
     const queued = await d.write(() => d.store.undeliveredMessages(runId, NODE_ID));
     if (queued.length === 0) return;
+    // A hibernating session is resumed, outside this delivery pass (starting it delivers again).
+    if (!d.runtime.isAlive(sessionId) && hibernating.has(runId)) { void wake(runId).catch(report); return; }
     const priority = queued.findIndex(message => message.id === priorityId);
     if (priority > 0) queued.unshift(...queued.splice(priority, 1));
     // A headless agent gets its messages when its turn ends (see messagesAtTurnEnd).
@@ -686,6 +688,7 @@ export function createScheduler(d: SchedulerDeps) {
     if (watcher) clearInterval(watcher);
     if (radarTimer) clearInterval(radarTimer);
     if (limitTimer) clearInterval(limitTimer);
+    if (hibernateTimer) clearInterval(hibernateTimer);
     await d.runtime.stopAll();
     await idle();
   }
@@ -1155,6 +1158,39 @@ export function createScheduler(d: SchedulerDeps) {
     limitTimer.unref();
   }
 
+  // --- Hibernation: a chat session idle for session.hibernate minutes is stopped to free its
+  // agent process, and resumed with its conversation when a message next arrives for it.
+  const hibernating = new Set<string>();
+  let hibernateTimer: NodeJS.Timeout | undefined;
+  async function hibernateIdle(now = Date.now()): Promise<string[]> {
+    const slept: string[] = [];
+    const runs = await d.write(() => d.store.listRuns().map((id) => d.store.loadRun(id)));
+    for (const run of runs) {
+      const sessionId = sessionOf(run);
+      if (!chats.has(sessionId) || !d.runtime.isAlive(sessionId) || run.node.status !== "running" || run.node.activity !== "idle") continue;
+      const minutes = Number((await d.write(() => d.store.getConfig(run.project)))["session.hibernate"] ?? "");
+      if (!Number.isFinite(minutes) || minutes <= 0 || !run.node.activityAt) continue;
+      if (now - Date.parse(run.node.activityAt) < minutes * 60_000) continue;
+      if ((await d.write(() => d.store.undeliveredMessages(run.id, NODE_ID))).length) continue;
+      hibernating.add(run.id);
+      await stopSession(sessionId);
+      await d.write(() => d.store.recordChat(run.id, NODE_ID, [{ type: "activity", kind: "note", status: "done", summary: `Hibernated after ${minutes} idle minutes; the next message resumes the conversation` }]));
+      slept.push(run.id);
+    }
+    return slept;
+  }
+  async function wake(runId: string): Promise<boolean> {
+    if (!hibernating.delete(runId)) return false;
+    const run = await load(runId);
+    await d.write(() => d.store.recordChat(runId, NODE_ID, [{ type: "activity", kind: "note", status: "done", summary: "Woke from hibernation" }]));
+    await launch(run, undefined, run.node.agentChatId ? { resume: true } : {});
+    return true;
+  }
+  function watchHibernation(intervalMs: number): void {
+    hibernateTimer = setInterval(() => { void hibernateIdle().catch(report); }, intervalMs);
+    hibernateTimer.unref();
+  }
+
   // --- Switching a worker to another agent: the running one stops, the new one starts in
   // the same worktree, branch and pull request with a handoff of where things are.
   // A switch waits this long for the agent to finish its turn (unless told to cut it short).
@@ -1405,7 +1441,7 @@ export function createScheduler(d: SchedulerDeps) {
     try { await work; return true; } finally { startingForks.delete(runId); }
   }
 
-  return { commitWorker, terminalTurnEnded, addPrLink, linkPr, turnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent };
+  return { commitWorker, terminalTurnEnded, addPrLink, linkPr, turnFailed, cleanWorkspace, isCleaning: (path: string) => cleaningWorkspaces.has(path), startForkMessage, launch, isChat: (sessionId: string) => chats.has(sessionId), streamsTimeline: (sessionId: string) => streamed.has(sessionId), startRun, onBlocked, answer, setPending, pendingRequest: (runId: string) => pendingRequests.get(runId) ?? null, interruptHeadless, agentCheck, startReview, submitReview, delegate, partnerReport, onReport, resume, stopRun, recover, idle, stopSession, shutdown, deliver: deliverQueued, publish, checkPr, watchPrs, checkRadar, watchRadar, checkLimits, watchLimits, switchAgent, hibernateIdle, watchHibernation, isHibernating: (runId: string) => hibernating.has(runId) };
 }
 
 export type Scheduler = ReturnType<typeof createScheduler>;

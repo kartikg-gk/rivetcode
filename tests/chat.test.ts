@@ -358,6 +358,21 @@ describe("rolling a conversation back with its files", () => {
   }, 60_000);
 });
 
+describe("an idle chat session", () => {
+  it("hibernates after session.hibernate minutes and wakes for its next message", async () => {
+    process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-delta-agent.mjs", import.meta.url))]);
+    daemon = await startDaemon({ data, runFile: join(data, "running.json"), port: 0, stopWaitMs: 500, hibernateMs: 200, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+    const runId = (await api("POST", "/api/v1/runs", { repo, task: "hello", agent: "delta" })).json.runId as string;
+    await until("the reply", async () => said(await timeline(runId), "echo: Your task: hello"));
+    expect((await api("PUT", `/api/v1/projects/${encodeURIComponent(project())}/config`, { key: "session.hibernate", value: "0.001" })).status).toBeLessThan(300);
+    await until("hibernation", async () => (await timeline(runId)).some((i) => i.text.includes("Hibernated after")));
+    const sent = await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "are you there", mode: "queue" });
+    expect(sent.json.delivery).toBe("waking");
+    await until("the answer after waking", async () => said(await timeline(runId), "echo: are you there"));
+    expect((await timeline(runId)).some((i) => i.text.includes("Woke from hibernation"))).toBe(true);
+  }, 60_000);
+});
+
 describe("a delta model name", () => {
   it("splits into provider and model", async () => {
     const { deltaModel } = await import("../src/chat/drivers.js");

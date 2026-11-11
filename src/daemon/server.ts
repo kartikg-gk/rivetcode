@@ -111,6 +111,8 @@ const CONFIG_KEYS = [
   "setup",
   "timeline.keep",
   "run.mode",
+  // Minutes a chat session may sit idle before it is stopped, to resume on its next message.
+  "session.hibernate",
 ];
 // Days a finished run's timeline is kept unless timeline.keep says otherwise ("forever" keeps it).
 const TIMELINE_KEEP_DAYS = 30;
@@ -142,6 +144,7 @@ export type DaemonOptions = {
   switchWaitMs?: number;
   // How often workers are checked against their task's time and token limits.
   limitMs?: number;
+  hibernateMs?: number;
   // Problems the scheduler handled by escalating or could not handle; for logs and tests.
   onError?(error: unknown): void;
 };
@@ -948,6 +951,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         delivery = !left ? (mode === "interrupt" ? "interrupted" : "now") : activity === "approval" ? "after-answer" : "when-idle";
       } else if (runtime.isAlive(target)) {
         delivery = mode === "interrupt" && (await scheduler.interruptHeadless(runId)) ? "interrupted" : "turn-end";
+      } else if (scheduler.isHibernating(runId)) {
+        await scheduler.deliver(runId);
+        delivery = "waking";
       } else delivery = "next-launch";
       reply(res, 202, { id, delivery });
       return;
@@ -1806,6 +1812,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     void runDueRoutines().catch((e) => opts.onError?.(e));
     scheduler.watchRadar(opts.radarMs ?? 60_000);
     scheduler.watchLimits(opts.limitMs ?? 15_000);
+    scheduler.watchHibernation(opts.hibernateMs ?? 60_000);
     // Pick up runs that were in flight when the previous daemon stopped.
     for (const id of await write(() => store.listRuns())) {
       void scheduler.recover(id).catch((e) => opts.onError?.(e));
