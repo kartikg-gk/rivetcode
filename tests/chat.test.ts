@@ -351,7 +351,7 @@ describe("rolling a conversation back with its files", () => {
     await until("the reply", async () => said(await timeline(runId), "echo: Your task: hello"));
     await until("an idle session", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
     const worktree = (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.worktree as string;
-    for (const ref of execSync("git for-each-ref --format=%(refname) refs/rivet/checkpoints", { cwd: worktree, encoding: "utf8" }).split(/\r?\n/).filter(Boolean)) execSync(`git update-ref -d ${ref}`, { cwd: worktree });
+    for (const ref of execSync("git for-each-ref \"--format=%(refname)\" refs/rivet/checkpoints", { cwd: worktree, encoding: "utf8" }).split(/\r?\n/).filter(Boolean)) execSync(`git update-ref -d ${ref}`, { cwd: worktree });
     const r = await api("POST", `/api/v1/runs/${runId}/rollback`, { turns: 1, files: true });
     expect(r.status).toBe(409);
     expect(r.json.error).toContain("no file checkpoint");

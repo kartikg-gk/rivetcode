@@ -1099,10 +1099,13 @@ export function openStore(data: string): Store {
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
           AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
-      db.prepare(`UPDATE outbox SET message = '' WHERE delivered_at IS NOT NULL AND message <> '' AND run_id IN (
+      const emptied = db.prepare(`UPDATE outbox SET message = '' WHERE delivered_at IS NOT NULL AND message <> '' AND run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
-          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?)))`).run(project, before);
+          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id AND (n.finished_at IS NULL OR n.finished_at >= ?))) RETURNING run_id`).all(project, before) as { run_id: string }[];
+      const counts = new Map<string, number>();
+      for (const r of emptied) counts.set(r.run_id, (counts.get(r.run_id) ?? 0) + 1);
+      for (const [runId, count] of counts) logEvent(runId, null, "messages.emptied", { count, reason: "timeline.keep" });
       return Number(db.prepare(`DELETE FROM timeline WHERE run_id IN (
         SELECT r.id FROM runs r WHERE r.project = ?
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.run_id = r.id)
