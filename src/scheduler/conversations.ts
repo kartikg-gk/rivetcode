@@ -36,9 +36,16 @@ export function forkConversation(store: Store, sourceId: string, o: { at?: numbe
   return { runId: id, sourceRun: source.id, position: anchor.position, workspace: "shared", started: false };
 }
 
-export function contextText(items: TimelineItem[], heading: string): string {
+// History handed to a new conversation takes at most a quarter of the model's context
+// (at about 4 characters a token, its window in characters), and never more than 56000.
+export const CONTEXT_CHARS = 56_000;
+export function contextBudget(window?: number): number {
+  return window && window > 0 ? Math.max(8_000, Math.min(CONTEXT_CHARS, Math.floor(window))) : CONTEXT_CHARS;
+}
+
+export function contextText(items: TimelineItem[], heading: string, budget = CONTEXT_CHARS): string {
   const candidates = items.filter(i=>["prompt","message","assistant"].includes(i.kind));
-  const selected: string[] = []; let remaining = 56000; let omitted = 0;
+  const selected: string[] = []; let remaining = budget; let omitted = 0;
   for (const item of [...candidates].reverse()) {
     const label = `[position ${item.position}] ${item.kind}${item.agent ? ` (${item.agent})` : ""}: `;
     if (remaining <= label.length + 100) {omitted++;continue;}
@@ -75,7 +82,7 @@ export function mergeConversation(store: Store, sourceId: string, targetId?: str
   const after = Math.max(fork.position, previous);
   const delta = items.filter((i) => i.position > after);
   if (!delta.some((i) => i.kind === "assistant")) throw new Error("fork has no completed exploration to transfer");
-  const text = contextText(delta, `Merge-back from fork ${source.id}, after position ${after}, through ${through}.`);
+  const text = contextText(delta, `Merge-back from fork ${source.id}, after position ${after}, through ${through}.`, contextBudget(store.chatUsage(target.id)?.contextWindow));
   if (store.pendingContextSize(target.id) + text.length > 60000) throw new Error("pending carry-back context exceeds 60000 characters; continue the target before transferring more");
   return { ...store.transferContext(source.id, target.id, through, text), targetRun: target.id, through, delivery: "pending" };
 }

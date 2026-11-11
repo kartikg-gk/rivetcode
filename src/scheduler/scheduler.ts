@@ -1,5 +1,5 @@
 import { defaultDelta } from "../agents/locate.js";
-import { contextText } from "./conversations.js";
+import { contextBudget, contextText } from "./conversations.js";
 import { existsSync } from "node:fs";
 import { realpath, rm } from "node:fs/promises";
 import { samePath } from "../paths.js";
@@ -240,7 +240,7 @@ export function createScheduler(d: SchedulerDeps) {
     const argv = chat
       ? [process.execPath, "--disable-warning=ExperimentalWarning", chatHostMain(), "chat-runner", encodeConfig({
         inheritedTurns: (await d.write(() => d.store.inherited(run.id))).flatMap(i=>i.turnId ? [i.turnId] : []), agent: node.agent as "claude" | "codex" | "delta", binary: node.agent === "delta" ? config["delta.binary"]?.trim() || (agent.binary && agent.binary !== "delta" ? agent.binary : defaultDelta()) : agent.binary ?? node.agent, cwd: node.worktree, permission: cfg.permission, allow: allowedTools,
-        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.agentChatId ? { resume: node.agentChatId } : {}), ...(fork && !o.fresh && !node.agentChatId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, ...replyAnchor(fork.items), context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`) } } : {}), ...(branch && !node.agentChatId ? { fork: { providerId: branch.items.at(-1)?.agentChatId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, ...replyAnchor(branch.items), context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
+        ...(model ? { model } : {}), ...((o.resume || (fork && !o.fresh)) && node.agentChatId ? { resume: node.agentChatId } : {}), ...(fork && !o.fresh && !node.agentChatId ? { fork: { providerId: fork.providerId, turn: fork.providerTurn, agent: fork.agent, ...replyAnchor(fork.items), context: contextText(fork.items, `Inherited context from ${fork.sourceRun} through position ${fork.position}.`, contextBudget(await d.write(() => d.store.chatUsage(fork.sourceRun)?.contextWindow))) } } : {}), ...(branch && !node.agentChatId ? { fork: { providerId: branch.items.at(-1)?.agentChatId ?? "", turn: branch.items.at(-1)?.turnId, agent: branch.items.at(-1)?.agent ?? node.agent, ...replyAnchor(branch.items), context: contextText(branch.items, `Conversation branch ${branch.id} from run ${run.id}.`) } } : {}), ...(prompt !== undefined ? { prompt } : {}),
       })]
       : o.resume
         ? await agent.restoreCommand({ ...cfg, ...(node.agentOwnId ? { capturedId: node.agentOwnId } : {}) })

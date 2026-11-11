@@ -488,3 +488,14 @@ it("moves a busy shared fork to its own worktree only when asked to stop its tur
     await new Promise((r) => setTimeout(r, 100));
   }
 }, 60000);
+
+it("sizes handed-over history to the receiving model's context", async () => {
+  const { contextBudget } = await import("../src/scheduler/conversations.js");
+  expect(contextBudget(undefined)).toBe(56_000);
+  expect(contextBudget(1_000_000)).toBe(56_000);
+  expect(contextBudget(32_768)).toBe(32_768);
+  expect(contextBudget(4_096)).toBe(8_000);
+  const items = Array.from({ length: 40 }, (_, i) => ({ position: i + 1, session: "agent", kind: i % 2 ? "assistant" : "message", text: "x".repeat(2_000), at: "" })) as any;
+  expect(contextText(items, "h", contextBudget(32_768)).length).toBeLessThan(33_500);
+  expect(contextText(items, "h").length).toBeGreaterThan(56_000 - 5_000);
+});
