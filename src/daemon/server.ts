@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
-import { findClaude, findCodex } from "../agents/locate.js";
+import { defaultDelta, findClaude, findCodex, findDelta } from "../agents/locate.js";
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
 import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
@@ -602,7 +602,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const repoDir = new URL(req.url!, "http://x").searchParams.get("repo");
       const remote = repoDir ? (await git(["remote", "get-url", "origin"], repoDir).catch(() => "")).trim() : "";
       reply(res, 200, { checks: await doctor(data, realProbes({
-        findClaude: () => findClaude(), findCodex: () => findCodex(), loadPty: () => loadPty() !== null,
+        findClaude: () => findClaude(), findCodex: () => findCodex(), findDelta: () => findDelta(), loadPty: () => loadPty() !== null,
         daemonUp: async () => true, githubToken: () => githubToken(process.env, remote),
       })) });
       return;
@@ -613,7 +613,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const q = new URL(req.url!, "http://x").searchParams;
       const payload = req.method === "POST" ? await body(req) : {};
       const project = optionalString(payload.project ?? q.get("project") ?? undefined, "project") ?? "";
-      const binary = (project && (await write(() => store.getConfig(project)))["delta.binary"]?.trim()) || "delta";
+      const binary = (project && (await write(() => store.getConfig(project)))["delta.binary"]?.trim()) || defaultDelta();
       const { execFile } = await import("node:child_process");
       const run = (args: string[], env: Record<string, string> = {}, input?: string) => new Promise<{ code: number; out: string }>((resolve) => {
         // Delta writes run logs where it starts unless told otherwise; not in whatever folder the daemon runs from.

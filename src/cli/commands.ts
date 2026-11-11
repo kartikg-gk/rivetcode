@@ -1014,12 +1014,12 @@ async function doctorCommand(io: CliIo): Promise<number> {
   const { doctor, realProbes } = await import("./doctor.js");
   let probes = io.doctorProbes;
   if (!probes) {
-    const { findClaude, findCodex } = await import("../agents/locate.js");
+    const { findClaude, findCodex, findDelta } = await import("../agents/locate.js");
     const { loadPty } = await import("../runtime/runtime.js");
     const { githubToken } = await import("../github/github.js");
     const remote = (await git(["remote", "get-url", "origin"], io.cwd).catch(() => "")).trim();
     probes = realProbes({
-      findClaude: () => findClaude(), findCodex: () => findCodex(), loadPty: () => loadPty() !== null,
+      findClaude: () => findClaude(), findCodex: () => findCodex(), findDelta: () => findDelta(), loadPty: () => loadPty() !== null,
       daemonUp: () => daemonUp(io), githubToken: () => githubToken(io.env, remote),
     });
   }

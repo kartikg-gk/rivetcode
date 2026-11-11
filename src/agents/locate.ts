@@ -1,4 +1,5 @@
 import { existsSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -101,4 +102,43 @@ export function findCodex(o: LocateEnv = current()): string {
   const dir = dirname(found);
   const real = [join(dir, "codex.exe"), join(dir, "node_modules", "@openai", "codex", "bin", "codex.exe")].find(isFile);
   return real ?? found;
+}
+
+// Delta: the PATH, then the folders pipx and uv install tools into. Rivet talks to delta
+// over its rpc mode, which older deltas lack, so the first one that has it is used.
+export function deltaCandidates(o: LocateEnv = current()): string[] {
+  const win = o.platform === "win32";
+  const names = win ? ["delta.exe", "delta"] : ["delta"];
+  const fromPath = pathDirs(o).flatMap((d) => names.map((n) => join(d, n)));
+  return [...fromPath, ...names.map((n) => join(o.home, ".local", "bin", n))];
+}
+
+// Whether a delta has the rpc mode Rivet needs; its help lists the option.
+export function speaksRpc(binary: string): boolean {
+  const r = spawnSync(binary, ["--help"], { encoding: "utf8", timeout: 30_000, windowsHide: true });
+  return /--mode\b/.test(`${r.stdout ?? ""}${r.stderr ?? ""}`);
+}
+
+const checked = new Map<string, string>();
+// The delta to run when none is configured: the usable one found, else plain "delta" (whose
+// failure then says why).
+export function defaultDelta(): string {
+  try { return findDelta(); } catch { return "delta"; }
+}
+
+export function findDelta(o: LocateEnv = current(), probe: (binary: string) => boolean = speaksRpc): string {
+  const explicit = o.env.RIVET_DELTA_BIN?.trim();
+  if (explicit) {
+    if (!isFile(explicit)) throw new Error(`RIVET_DELTA_BIN points at nothing: ${explicit}`);
+    return explicit;
+  }
+  const found = [...new Set(deltaCandidates(o))].filter(isFile);
+  if (!found.length) throw new Error("delta was not found on PATH or in ~/.local/bin (set delta.binary or RIVET_DELTA_BIN)");
+  const key = found.join("|");
+  const known = checked.get(key);
+  if (known) return known;
+  const usable = found.find(probe);
+  if (!usable) throw new Error(`${found[0]} is a delta without --mode rpc, too old for Rivet; install a newer delta or set delta.binary`);
+  checked.set(key, usable);
+  return usable;
 }

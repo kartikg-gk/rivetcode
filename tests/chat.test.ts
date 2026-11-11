@@ -307,6 +307,15 @@ describe("a delta session that fails", () => {
     driver.close();
     expect(events.find((e) => e.type === "turn" && e.state === "failed")).toMatchObject({ error: "ollama request failed with status 500: out-of-memory" });
   }, 30_000);
+
+  it("says when the delta is too old to talk to", async () => {
+    const { deltaChat } = await import("../src/chat/drivers.js");
+    const driver = deltaChat({
+      binary: "C:/tools/delta.exe", cwd: repo, permission: "auto", inheritedTurns: [], raw: () => {}, decide: () => "yes" as const, emit: () => {},
+      env: { RIVET_CHAT_COMMAND: JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-old-delta.mjs", import.meta.url))]), DELTA_LOG_DIR: join(data, "delta-logs") },
+    } as Parameters<typeof deltaChat>[0]);
+    await expect(driver.start()).rejects.toThrow("C:/tools/delta.exe is a delta without --mode rpc, too old for Rivet");
+  }, 30_000);
 });
 
 describe("a delta model name", () => {

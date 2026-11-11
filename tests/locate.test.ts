@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { claudeCandidates, findClaude, findCodex } from "../src/agents/locate.js";
+import { claudeCandidates, findClaude, findCodex, findDelta } from "../src/agents/locate.js";
 import { makeDataDir, removeRepo } from "./helpers.js";
 
 let dir: string;
@@ -75,5 +75,32 @@ describe("findCodex", () => {
 
   it("says clearly when codex is missing", () => {
     expect(() => findCodex({ platform: "linux", env: { PATH: "" }, home: dir })).toThrow(/codex was not found/);
+  });
+});
+
+describe("findDelta", () => {
+  it("takes the first delta that has the rpc mode, skipping an older one", async () => {
+    const old = await touch("old", "delta.exe");
+    const fresh = await touch("fresh", "delta.exe");
+    const asked: string[] = [];
+    const found = findDelta({ platform: "win32", env: { PATH: [join(dir, "old"), join(dir, "fresh")].join(";") }, home: dir }, (b) => { asked.push(b); return b === fresh; });
+    expect(found).toBe(fresh);
+    expect(asked).toEqual([old, fresh]);
+  });
+
+  it("looks in ~/.local/bin, where pipx and uv put tools", async () => {
+    const tool = await touch(".local", "bin", "delta");
+    expect(findDelta({ platform: "linux", env: { PATH: "" }, home: dir }, () => true)).toBe(tool);
+  });
+
+  it("says when every delta found is too old, and when there is none", async () => {
+    const old = await touch("only", "delta.exe");
+    expect(() => findDelta({ platform: "win32", env: { PATH: join(dir, "only") }, home: join(dir, "nohome") }, () => false)).toThrow(`${old} is a delta without --mode rpc`);
+    expect(() => findDelta({ platform: "win32", env: { PATH: join(dir, "none") }, home: join(dir, "nohome") }, () => true)).toThrow("delta was not found");
+  });
+
+  it("uses RIVET_DELTA_BIN as given", async () => {
+    const mine = await touch("mine", "delta");
+    expect(findDelta({ platform: "linux", env: { RIVET_DELTA_BIN: mine }, home: dir }, () => false)).toBe(mine);
   });
 });

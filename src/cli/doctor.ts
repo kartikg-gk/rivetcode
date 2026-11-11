@@ -13,6 +13,7 @@ export type Probes = {
   run(file: string, args: string[]): Promise<string>;
   findClaude(): string;
   findCodex(): string;
+  findDelta(): string;
   loadPty(): boolean;
   daemonUp(): Promise<boolean>;
   githubToken(): Promise<string>;
@@ -32,6 +33,7 @@ export const realProbes = (overrides: Partial<Probes>): Probes => ({
   run,
   findClaude: () => { throw new Error("not checked"); },
   findCodex: () => { throw new Error("not checked"); },
+  findDelta: () => { throw new Error("not checked"); },
   loadPty: () => false,
   daemonUp: async () => false,
   githubToken: async () => { throw new Error("not checked"); },
@@ -114,6 +116,7 @@ export async function doctor(dataDir: string, p: Probes): Promise<Check[]> {
 
   checks.push(await agentCheck("claude", p.findClaude, p));
   checks.push(await agentCheck("codex", p.findCodex, p));
+  checks.push(await agentCheck("delta", p.findDelta, p));
 
   try {
     await p.githubToken();

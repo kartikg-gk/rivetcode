@@ -16,6 +16,7 @@ const healthy = (over: Partial<Probes> = {}): Probes => realProbes({
   run: async (file) => (file === "git" ? "git version 2.53.0.windows.2" : `${file} 1.2.3`),
   findClaude: () => "/bin/claude",
   findCodex: () => "/bin/codex",
+  findDelta: () => "/bin/delta",
   loadPty: () => true,
   daemonUp: async () => true,
   githubToken: async () => "t",
@@ -31,7 +32,7 @@ describe("doctor", () => {
     const checks = await doctor(data, healthy());
     expect(checks.map((c) => [c.name, c.level])).toEqual([
       ["node", "ok"], ["git", "ok"], ["data dir", "ok"], ["build", "ok"], ["daemon", "ok"],
-      ["terminals", "ok"], ["claude", "ok"], ["codex", "ok"], ["github", "ok"], ["hooks", "ok"],
+      ["terminals", "ok"], ["claude", "ok"], ["codex", "ok"], ["delta", "ok"], ["github", "ok"], ["hooks", "ok"],
     ]);
     expect(checks.find((c) => c.name === "claude")!.message).toBe("/bin/claude 1.2.3 (/bin/claude)");
   });

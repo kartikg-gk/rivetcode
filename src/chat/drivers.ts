@@ -574,10 +574,15 @@ export function deltaChat(o: ChatOptions): ChatDriver {
   // What delta prints on stderr is its own account of a failure; its last plain lines (not a
   // traceback's indented frames) say why.
   let errors = "", failure = "";
-  const why = () => errors.split(/\r?\n/).filter((l) => l.trim() && !/^\s/.test(l) && !l.startsWith("Traceback (")).slice(-2).join("\n").slice(-500);
+  let gone: string | undefined;
+  const plain = () => errors.split(/\r?\n/).filter((l) => l.trim() && !/^\s/.test(l) && !l.startsWith("Traceback (")).slice(-2).join("\n").slice(-500);
+  // An older delta refuses the options Rivet starts it with.
+  const why = () => /unrecognized arguments|invalid choice/.test(errors)
+    ? `${o.binary} is a delta without --mode rpc, too old for Rivet; install a newer delta or set delta.binary (${plain()})` : plain();
   const exited = new Promise<void>((resolve) => child.on("exit", (code) => {
     const said = why();
-    for (const w of waiting.values()) w.reject(new Error(said ? `delta exited: ${said}` : "delta exited"));
+    gone = said ? `delta exited: ${said}` : "delta exited";
+    for (const w of waiting.values()) w.reject(new Error(gone));
     if (activeTurn) { o.emit({ type: "turn", turnId: activeTurn, state: "failed", error: said || `delta exited (${code ?? "killed"})` }); activeTurn = ""; }
     waiting.clear();
     settled?.();
@@ -586,6 +591,8 @@ export function deltaChat(o: ChatOptions): ChatDriver {
   const send = (type: string, fields: Record<string, unknown> = {}): Promise<unknown> => {
     const id = `r${++next}`;
     return new Promise((resolve, reject) => {
+      // Asked after delta is gone, a request gets the reason it went at once.
+      if (gone !== undefined) { reject(new Error(gone)); return; }
       waiting.set(id, { resolve, reject });
       child.stdin!.write(JSON.stringify({ id, type, ...fields }) + "\n");
     });
