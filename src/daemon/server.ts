@@ -1623,11 +1623,19 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         try {
         if ((await write(() => store.readChat(run.id, { limit: 1 }))).total > 5000) throw new HttpError(409, "history exceeds the handoff context limit");
         const payload = await body(req);
-        if (!run.sharedWorkspace || ["busy", "approval"].includes(run.node.activity ?? "")) {
-          throw new HttpError(409, "handoff requires a shared fork with a settled turn");
+        if (!run.sharedWorkspace) throw new HttpError(409, "handoff requires a shared fork");
+        if (payload.interrupt !== undefined && typeof payload.interrupt !== "boolean") throw new HttpError(400, "interrupt must be true or false");
+        // A turn in progress is stopped only when asked; the session then continues in its new worktree.
+        const active = ["busy", "approval"].includes(run.node.activity ?? "");
+        if (active && payload.interrupt !== true) throw new HttpError(409, "a turn is in progress: wait for it, or pass interrupt to stop it and continue in the new worktree");
+        const ref = optionalString(payload.baseRef, "baseRef") ?? "HEAD";
+        // A remote branch (origin/main) is fetched first, so the worktree starts from what the remote has now.
+        const remote = (await git(["remote"], run.node.worktree)).split(/\r?\n/).filter(Boolean).find((r) => ref.startsWith(`${r}/`));
+        if (remote) {
+          try { await git(["fetch", "--no-tags", remote, ref.slice(remote.length + 1)], run.node.worktree); }
+          catch (e) { throw new HttpError(409, `could not fetch ${ref}: ${(e as Error).message.split(/\r?\n/).filter(Boolean).at(-1) ?? "fetch failed"}`); }
         }
         await scheduler.stopRun(run.id);
-        const ref = optionalString(payload.baseRef, "baseRef") ?? "HEAD";
         const from = (await git(["rev-parse", "--verify", "--end-of-options", ref + "^{commit}"], run.node.worktree)).trim();
         const branch = branchName(run.id, NODE_ID);
         const path = worktreePath(data, run.project, run.id, NODE_ID);
@@ -1648,7 +1656,12 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         } catch (error) {
           throw new HttpError(409, "Worktree created and attached, but setup failed. Inspect it before resuming: " + (error as Error).message);
         }
-        reply(res, 201, { runId: run.id, branch, worktree: path, commit: from });
+        if (active) {
+          await write(() => store.queueMessage(run.id, NODE_ID, `Your turn was stopped to move you into your own worktree at ${path} (branch ${branch}, from ${ref}). Files you changed in the shared checkout during that turn stay there; redo what you still need here, then continue the task.`, undefined, "queue"));
+          const fresh = await write(() => store.loadRun(run.id));
+          await scheduler.launch(fresh, undefined, fresh.node.agentChatId ? { resume: true } : {});
+        }
+        reply(res, 201, { runId: run.id, branch, worktree: path, commit: from, ...(active ? { resumed: true } : {}) });
         return;
         } finally { branchChanges.delete(run.id); }
       }

@@ -75,7 +75,9 @@ const USAGE = `usage: rivet <command>
              | rm|pause|resume|run <name>   prompts run on a schedule by a new worker or orchestrator
   project get|set <key> <value>|unset <key>
                                         settings for this repo: check, test, worker.agent
-  move-to-worktree <run> [--base <ref>] move a settled shared fork to its own worktree
+  move-to-worktree <run> [--base <ref>] [--interrupt]
+                                        move a shared fork to its own worktree (origin/x is fetched first;
+                                        --interrupt stops a turn in progress and continues it there)
   attach <session>                      use a session's terminal (interactive mode); Ctrl-] detaches
   app [--no-open]                       open the graphical app in your browser
   panes                                 show every running agent side by side
@@ -1147,7 +1149,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "move-to-worktree": {
         const { flags, rest } = parseFlags(args, ["base"]);
         if (rest.length !== 1) throw new UsageError("move-to-worktree needs one run id");
-        const result = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/move-to-worktree`, { baseRef: flags.get("base") }, COMMAND_WAIT_MS);
+        const result = await callDaemon(io.env, "POST", `/api/v1/runs/${encodeURIComponent(rest[0]!)}/move-to-worktree`, { baseRef: flags.get("base"), ...(flags.has("interrupt") ? { interrupt: true } : {}) }, COMMAND_WAIT_MS);
         io.out(JSON.stringify(result));
         return 0;
       }

@@ -406,11 +406,13 @@ export function Conversation({ id }: { id: string }) {
             {side === "management" && d && <ThreadManagement detail={d} />}
             {side === "details" && d && <>
               <Details d={d} />
-              {d.run.sharedWorkspace && !["busy", "approval"].includes(d.run.node.activity ?? "") && !d.fork?.detached && (
-                <button className="btn" onClick={() => void act(() => api("POST", runPath(id, "/move-to-worktree"), {}), "Moved to a new worktree")}>
-                  Move to a new worktree
-                </button>
-              )}
+              {d.run.sharedWorkspace && !d.fork?.detached && (["busy", "approval"].includes(d.run.node.activity ?? "")
+                ? <button className="btn" onClick={() => void act(() => api("POST", runPath(id, "/move-to-worktree"), { interrupt: true }), "Turn stopped; continuing in a new worktree")}>
+                    Stop turn and move to a new worktree
+                  </button>
+                : <button className="btn" onClick={() => void act(() => api("POST", runPath(id, "/move-to-worktree"), {}), "Moved to a new worktree")}>
+                    Move to a new worktree
+                  </button>)}
             </>}
             {side === "changes" && <Changes id={id} />}
             {side === "terminal" && <TerminalPane id={id} session={session} />}
