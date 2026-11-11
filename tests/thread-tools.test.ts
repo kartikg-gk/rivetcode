@@ -453,3 +453,38 @@ describe("complete logical-history search", () => {
     expect(last.nextCursor).toBeNull();
   });
 });
+
+it("moves a busy shared fork to its own worktree only when asked to stop its turn, then continues there", async () => {
+  const s = await seed(); repo = await makeRepo();
+  const source = s.loadRun("r1"); source.node.worktree = repo; source.repo = repo; s.saveRun(source); s.close(); store = undefined;
+  process.env.RIVET_CHAT_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fake-chat-agent.mjs", import.meta.url)), "codex"]);
+  daemon = await startDaemon({ data: data!, runFile: join(data!, "running.json"), port: 0, stopWaitMs: 500, agents: (name) => ({ ...getAgent("fake"), name, binary: "unused" }) });
+  const api = async (method: string, path: string, body?: unknown) => {
+    const r = await fetch(`http://127.0.0.1:${daemon!.port}/api/v1${path}`, { method, headers: { "content-type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    return { status: r.status, value: await r.json() as any };
+  };
+  const fork = (await api("POST", "/runs/r1/fork", {})).value.runId;
+  expect((await api("POST", `/sessions/${fork}-agent/send`, { message: "SLOW work", mode: "queue" })).status).toBe(202);
+  const end = Date.now() + 15000;
+  while ((await api("GET", `/runs/${fork}`)).value.run.node.activity !== "busy") {
+    if (Date.now() > end) throw new Error("fork never started its turn");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const refused = await api("POST", `/runs/${fork}/move-to-worktree`, {});
+  expect(refused.status).toBe(409);
+  expect(refused.value.error).toContain("pass interrupt");
+  const moved = await api("POST", `/runs/${fork}/move-to-worktree`, { interrupt: true });
+  expect(moved.status).toBe(201);
+  expect(moved.value.resumed).toBe(true);
+  expect(existsSync(moved.value.worktree)).toBe(true);
+  const after = (await api("GET", `/runs/${fork}`)).value.run;
+  expect(after.sharedWorkspace).toBeUndefined();
+  expect(after.node.worktree).toBe(moved.value.worktree);
+  const done = Date.now() + 20000;
+  for (;;) {
+    const items = (await api("GET", `/runs/${fork}/timeline?view=messages&limit=100`)).value.items as { text: string }[];
+    if (items.some((i) => i.text.includes("Your turn was stopped to move you into your own worktree"))) break;
+    if (Date.now() > done) throw new Error("the session did not continue in its new worktree");
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}, 60000);
