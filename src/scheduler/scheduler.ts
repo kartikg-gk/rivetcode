@@ -68,6 +68,15 @@ export function commandRules(command: string): string[] {
 
 // A model name only means something to its own agent: "claude.model" and "codex.model"
 // set each, and "worker.model" applies to the project's default agent only.
+export const HIBERNATE_MINUTES = 30;
+export function hibernateMinutes(setting: string | undefined): number {
+  const v = setting?.trim();
+  if (!v) return HIBERNATE_MINUTES;
+  if (v === "off") return 0;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 export function modelFor(agent: Node["agent"], config: Record<string, string>): string | undefined {
   const own = config[`${agent}.model`]?.trim();
   if (own) return own;
@@ -1159,7 +1168,8 @@ export function createScheduler(d: SchedulerDeps) {
     limitTimer.unref();
   }
 
-  // --- Hibernation: a chat session idle for session.hibernate minutes is stopped to free its
+  // --- Hibernation: a chat session idle for session.hibernate minutes (30 unless set; off or 0
+  // turns it off) is stopped to free its
   // agent process, and resumed with its conversation when a message next arrives for it.
   const hibernating = new Set<string>();
   let hibernateTimer: NodeJS.Timeout | undefined;
@@ -1169,7 +1179,7 @@ export function createScheduler(d: SchedulerDeps) {
     for (const run of runs) {
       const sessionId = sessionOf(run);
       if (!chats.has(sessionId) || !d.runtime.isAlive(sessionId) || run.node.status !== "running" || run.node.activity !== "idle") continue;
-      const minutes = Number((await d.write(() => d.store.getConfig(run.project)))["session.hibernate"] ?? "");
+      const minutes = hibernateMinutes((await d.write(() => d.store.getConfig(run.project)))["session.hibernate"]);
       if (!Number.isFinite(minutes) || minutes <= 0 || !run.node.activityAt) continue;
       if (now - Date.parse(run.node.activityAt) < minutes * 60_000) continue;
       if ((await d.write(() => d.store.undeliveredMessages(run.id, NODE_ID))).length) continue;

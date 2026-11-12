@@ -866,3 +866,15 @@ describe("reading a session's timeline", () => {
     expect(items.slice(1, 5).map((i) => i.kind)).toEqual(["assistant", "tool", "result", "assistant"]);
   });
 });
+
+describe("how long a chat may idle before it sleeps", () => {
+  it("is 30 minutes unless set, and off or 0 turns it off", async () => {
+    const { hibernateMinutes } = await import("../src/scheduler/scheduler.js");
+    expect(hibernateMinutes(undefined)).toBe(30);
+    expect(hibernateMinutes("")).toBe(30);
+    expect(hibernateMinutes("5")).toBe(5);
+    expect(hibernateMinutes("off")).toBe(0);
+    expect(hibernateMinutes("0")).toBe(0);
+    expect(hibernateMinutes("soon")).toBe(0);
+  });
+});

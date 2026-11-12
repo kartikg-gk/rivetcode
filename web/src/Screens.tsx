@@ -181,7 +181,7 @@ const SETTINGS: { key: string; about: string; options?: string[] }[] = [
   { key: "check", about: "command that must pass before a pull request" }, { key: "test", about: "tests that must pass before a pull request" },
   { key: "verify.reuse", about: "reuse a worker's own passing check", options: ["", "off"] },
   { key: "run.mode", about: "run agents as terminals or chats", options: ["", "terminal", "chat"] },
-  { key: "session.hibernate", about: "minutes an idle chat may sit before it is put to sleep; its next message wakes it (empty: never)" },
+  { key: "session.hibernate", about: "minutes an idle chat may sit before it is put to sleep; its next message wakes it (default 30; off to never)" },
   { key: "worker.agent", about: "default agent", options: ["", "claude", "codex", "delta"] }, { key: "worker.view", about: "headless or interactive workers" },
   { key: "worker.permission", about: "permission mode" }, { key: "worker.model", about: "default model" }, { key: "claude.model", about: "Claude's model" }, { key: "codex.model", about: "Codex's model" },
   { key: "delta.model", about: "delta's model as provider/model, e.g. ollama/qwen3:4b" }, { key: "delta.binary", about: "the delta to run (default: the first on PATH that supports Rivet)" },
