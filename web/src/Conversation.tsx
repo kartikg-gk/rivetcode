@@ -363,10 +363,10 @@ export function Conversation({ id }: { id: string }) {
         <header className="topbar relative">
           {d && <span className="text-muted shrink-0 max-sm:hidden">{repoName(d.run.repo)}</span>}
           {d && <span className="text-muted shrink-0 max-sm:hidden">/</span>}
-          <h2 className="font-medium truncate min-w-0">{d ? runLabel({ id, name: d.run.name, task: d.run.task }) : id}</h2>
-          <span className="text-xs text-muted shrink-0 truncate ml-1 mr-auto">{d ? `${d.run.node.agent} · ${d.run.node.activity && d.live ? d.run.node.activity : d.run.node.status}` : ""}</span>
+          <h2 className="font-medium truncate min-w-0 max-sm:mr-auto">{d ? runLabel({ id, name: d.run.name, task: d.run.task }) : id}</h2>
+          <span className="text-xs text-muted truncate ml-1 mr-auto max-sm:hidden">{d ? `${d.run.node.agent} · ${d.run.node.activity && d.live ? d.run.node.activity : d.run.node.status}` : ""}</span>
           <button className={`icon ${activity ? "text-fg bg-raised" : ""}`} title="Show tool steps" aria-label="Show tool steps" aria-pressed={activity} onClick={() => setActivity(!activity)}><ListTree size={16} /></button>
-          <select aria-label="Which agent's record" className="bg-transparent text-xs text-muted outline-none cursor-pointer" value={session} onChange={(e) => setSession(e.target.value)}>
+          <select aria-label="Which agent's record" className="bg-transparent text-xs text-muted outline-none cursor-pointer max-sm:hidden" value={session} onChange={(e) => setSession(e.target.value)}>
             <option value="agent">agent</option><option value="review">reviewer</option><option value="partner">partner</option>
           </select>
           {([["changes", "Changes", FileDiff], ["terminal", "Terminal", SquareTerminal], ["details", "Details", Info]] as const).map(([t, label, Icon]) => (

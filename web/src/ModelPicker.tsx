@@ -136,6 +136,7 @@ export function ModelPicker({ project, agent, model, pick }: { project: string; 
             </ul>
             {tab === "delta" && !delta.data && <p className="px-3 pb-2 text-xs text-muted">Asking delta for its models…</p>}
             {tab === "delta" && delta.data && "error" in delta.data && <p className="px-3 pb-2 text-xs text-danger">{delta.data.error}</p>}
+            {tab === "delta" && delta.data && "models" in delta.data && delta.data.models.length === 0 && <p className="px-3 pb-2 text-xs text-muted">No models yet. For a local one, start Ollama with a model that can call tools (ollama pull qwen3:4b); for a hosted one, save its provider's key below.</p>}
             {tab === "delta" && delta.data && "providers" in delta.data && delta.data.providers.length > 0 && <DeltaKey providers={delta.data.providers} saved={delta.reload} />}
           </div>
         </div>
