@@ -250,7 +250,7 @@ function Details({ d }: { d: RunDetail }) {
   const c = d.chatUsage;
   return (
     <dl className="p-3 grid gap-1.5 text-[13px]">
-      <Fact k="Status" v={`${n.status}${n.activity ? ` · ${n.activity}` : ""}${d.live ? "" : " · not running"}`} />
+      <Fact k="Status" v={`${n.status}${n.activity ? ` · ${n.activity}` : ""}${d.hibernating ? " · asleep (wakes on the next message)" : d.live ? "" : " · not running"}`} />
       <Fact k="Summary" v={n.summary} />
       <Fact k="Role" v={d.run.role} />
       <Fact k="Agent" v={`${n.agent}${d.run.model ? ` (${d.run.model})` : ""}`} />

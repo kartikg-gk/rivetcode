@@ -118,7 +118,7 @@ it("init detects scripts, preserves settings on rerun and invokes doctor",async(
     expect(out.some(s=>s.includes("node") && s.includes("24.14.0"))).toBe(true);
     expect(await runCli(["init","--check","custom-check"],io)).toBe(0);
     const settings=await fetch("http://127.0.0.1:"+daemon.port+"/api/v1/projects/"+encodeURIComponent(projectIdFor(repo))+"/config").then(r=>r.json());
-    expect(settings).toMatchObject({"worker.agent":"codex","worker.viewl":"test-model",check:"custom-check",test:"npm test"});
+    expect(settings).toMatchObject({"worker.agent":"codex","worker.model":"test-model",check:"custom-check",test:"npm test"});
     expect(await runCli(["init","--agent","unknown"],io)).toBe(2);
     expect(await runCli(["init"],{...io,doctorProbes:healthy({nodeVersion:"22.0.0"})})).toBe(1);
   } finally {await daemon.stop();await removeRepo(repo);}

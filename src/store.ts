@@ -22,7 +22,7 @@ export type Run = {
   name: string;
   // The orchestrator session that started this worker, if any; its reports go there.
   orchestrator?: string;
-  // The model asked for when it was started; otherwise the project's worker.viewl.
+  // The model asked for when it was started; otherwise the project's worker.model.
   model?: string;
   // The issue the task came from, in the run's own repository; its pull request closes it.
   issue?: number;

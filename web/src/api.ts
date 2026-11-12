@@ -10,7 +10,7 @@ export type RunDetail = {
     spec?: Record<string, unknown>; sharedWorkspace?: string;
     node: { agent: string; branch: string; worktree: string; status: string; attempts: number; summary?: string; activity?: string; activityAt?: string; runMode?: string; prStatus?: string };
   };
-  live: boolean; pr: { number: number; url: string } | null; endOnMerge: boolean; unheard: unknown;
+  live: boolean; hibernating?: boolean; pr: { number: number; url: string } | null; endOnMerge: boolean; unheard: unknown;
   usage: { conversations: number; inputEquivalent: number; tokens: Record<string, number> };
   reviews: { id: number; sha: string; trigger: string; status?: string; verdict?: string; summary?: string }[];
   terminal: boolean; pendingRequest?: { tool: string; detail: string; at: string };

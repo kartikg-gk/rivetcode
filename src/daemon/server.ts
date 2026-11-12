@@ -94,7 +94,7 @@ const CONFIG_KEYS = [
   "verify.reuse",
   "worker.agent",
   "worker.permission",
-  "worker.viewl",
+  "worker.model",
   "claude.model",
   "codex.model",
   "delta.model",
@@ -1607,7 +1607,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         const reviews = await write(() => store.reviewsOf(run.id));
         const pendingRequest = scheduler.pendingRequest(run.id);
         const chatUsage = run.node.runMode === "chat" ? await write(() => store.chatUsage(run.id)) : null;
-        reply(res, 200, { run, live, pr, endOnMerge, unheard: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, independent: f.independent ?? false, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
+        reply(res, 200, { run, live, ...(scheduler.isHibernating(run.id) ? { hibernating: true } : {}), pr, endOnMerge, unheard: silent, usage, reviews, terminal: runtime.hasTerminal(sessionIdOf(run.id, NODE_ID)), ...(pendingRequest ? { pendingRequest } : {}), ...(secrets.pending(sessionIdOf(run.id, NODE_ID)) ? { secretRequest: secrets.pending(sessionIdOf(run.id, NODE_ID)) } : {}), ...(chatUsage ? { chatUsage } : {}), ...(run.sharedWorkspace ? { fork: await write(() => { const f = store.getFork(run.id); return f ? { sourceRun: f.sourceRun, position: f.position, strategy: f.strategy, independent: f.independent ?? false, detached: f.detached ?? false } : null; }) } : {}), now: new Date(at).toISOString() });
         return;
       }
       if (action === "after-merge") {

@@ -530,12 +530,12 @@ describe("an orchestrator's conversation", () => {
 
 describe("models", () => {
   it("gives each agent only a model meant for it", () => {
-    expect(modelFor("claude", { "worker.viewl": "haiku" })).toBe("haiku");
-    expect(modelFor("codex", { "worker.viewl": "haiku" })).toBeUndefined();
-    expect(modelFor("codex", { "worker.viewl": "haiku", "codex.model": "gpt-5-codex" })).toBe("gpt-5-codex");
-    expect(modelFor("codex", { "worker.agent": "codex", "worker.viewl": "o4" })).toBe("o4");
-    expect(modelFor("claude", { "worker.agent": "codex", "worker.viewl": "o4", "claude.model": "sonnet" })).toBe("sonnet");
-    expect(modelFor("claude", { "worker.agent": "codex", "worker.viewl": "o4" })).toBeUndefined();
+    expect(modelFor("claude", { "worker.model": "haiku" })).toBe("haiku");
+    expect(modelFor("codex", { "worker.model": "haiku" })).toBeUndefined();
+    expect(modelFor("codex", { "worker.model": "haiku", "codex.model": "gpt-5-codex" })).toBe("gpt-5-codex");
+    expect(modelFor("codex", { "worker.agent": "codex", "worker.model": "o4" })).toBe("o4");
+    expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4", "claude.model": "sonnet" })).toBe("sonnet");
+    expect(modelFor("claude", { "worker.agent": "codex", "worker.model": "o4" })).toBeUndefined();
   });
 });
 

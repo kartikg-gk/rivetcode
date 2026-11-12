@@ -67,11 +67,12 @@ export function commandRules(command: string): string[] {
 }
 
 // A model name only means something to its own agent: "claude.model" and "codex.model"
-// set each, and "worker.viewl" applies to the project's default agent only.
+// set each, and "worker.model" applies to the project's default agent only.
 export function modelFor(agent: Node["agent"], config: Record<string, string>): string | undefined {
   const own = config[`${agent}.model`]?.trim();
   if (own) return own;
-  return agent === (config["worker.agent"]?.trim() || "claude") ? config["worker.viewl"]?.trim() || undefined : undefined;
+  // worker.viewl was this key's name for a while; a value saved under it still counts.
+  return agent === (config["worker.agent"]?.trim() || "claude") ? (config["worker.model"] ?? config["worker.viewl"])?.trim() || undefined : undefined;
 }
 
 // What an orchestrator brought back by resume is told before anything else.

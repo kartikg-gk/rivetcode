@@ -17,13 +17,14 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
       run: (v) => api("POST", runPath(id, "/stop"), { keepWorkers: v.keep === "true" }),
     }) },
     { id: "resume", label: "Resume", about: "retry what was escalated or interrupted", run: () => post("/resume", undefined, "resuming") },
-    { id: "switch", label: "Switch agent…", about: "hand this worker to another agent in the same worktree", args: "claude|codex|delta", run: (rest) => ask({
-      title: "Switch agent", note: "Waits for the current turn to end unless you cut it short.", confirm: "Switch",
+    { id: "switch", label: "Switch agent or mode…", about: "hand this worker to another agent, or between its terminal and a chat, in the same worktree", args: "claude|codex|delta", run: (rest) => ask({
+      title: "Switch agent or mode", note: "Waits for the current turn to end unless you cut it short. Delta runs only as a chat.", confirm: "Switch",
       fields: [
-        { name: "agent", label: "Agent", type: "select", options: ["claude", "codex", "delta"].filter((a) => a !== d?.run.node.agent), value: rest.trim() || (d?.run.node.agent === "claude" ? "codex" : "claude") },
+        { name: "agent", label: "Agent", type: "select", options: ["claude", "codex", "delta"], value: rest.trim() || (d?.run.node.agent === "claude" ? "codex" : "claude") },
+        { name: "mode", label: "Mode", type: "select", options: ["keep current", "chat", "terminal"], value: "keep current" },
         { name: "model", label: "Model (optional)" }, { name: "now", label: "Cut the current turn short", type: "check" },
       ],
-      run: (v) => api("POST", runPath(id, "/switch"), { agent: v.agent, ...(v.model ? { model: v.model } : {}), now: v.now === "true" }),
+      run: (v) => api("POST", runPath(id, "/switch"), { agent: v.agent, ...(v.model ? { model: v.model } : {}), ...(v.mode && v.mode !== "keep current" ? { mode: v.mode } : {}), now: v.now === "true" }),
     }) },
     { id: "fork", label: "Fork…", about: "branch this conversation into a new session on the same checkout", run: () => ask({
       title: "Fork conversation", note: "The fork shares this checkout, so file changes are shared too.", confirm: "Fork",
@@ -84,12 +85,18 @@ export function sessionActions(id: string, d: RunDetail | undefined): Action[] {
     })(),
     { id: "archive", label: "Archive", about: "hide this session from the list", run: () => void act(() => api("PATCH", runPath(id, "/organization"), { archived: true }), "archived") },
     { id: "unarchive", label: "Unarchive", about: "show this session in the list again", run: () => void act(() => api("PATCH", runPath(id, "/organization"), { archived: false }), "back in the list") },
+    { id: "move", label: "Move to its own worktree…", about: "give this shared fork its own worktree and branch, from this branch or a remote one", run: () => ask({
+      title: "Move to its own worktree", note: "Uncommitted files in the shared checkout stay there. A remote branch such as origin/main is fetched first.", confirm: "Move",
+      fields: [{ name: "base", label: "Start from (empty: the checkout's current commit)" },
+        ...(["busy", "approval"].includes(d?.run.node.activity ?? "") ? [{ name: "interrupt", label: "Stop the current turn and continue in the new worktree", type: "check" as const }] : [])],
+      run: (v) => api("POST", runPath(id, "/move-to-worktree"), { ...(v.base?.trim() ? { baseRef: v.base.trim() } : {}), ...(v.interrupt === "true" ? { interrupt: true } : {}) }),
+    }) },
     { id: "clean", label: "Remove worktree…", about: "remove this run's worktree; the branch stays and dirty worktrees are kept", run: () => ask({
       title: "Remove this worktree?", note: "The branch stays. A worktree with uncommitted work is kept, not forced.", danger: true, confirm: "Remove",
       run: () => api("POST", runPath(id, "/clean")),
     }) },
   ];
-  return all.filter((a) => chat || !["rollback", "compact", "reconcile"].includes(a.id));
+  return all.filter((a) => (chat || !["rollback", "compact", "reconcile"].includes(a.id)) && (a.id !== "move" || (!!d?.run.sharedWorkspace && !d.fork?.detached)));
 }
 
 export async function startSession(body: Record<string, unknown>): Promise<void> {

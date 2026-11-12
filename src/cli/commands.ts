@@ -619,8 +619,8 @@ async function initProject(args: string[], io: CliIo): Promise<number> {
   const root = (await git(["rev-parse","--show-toplevel"],io.cwd)).trim();
   let scripts: Record<string,string> = {};
   try { scripts = JSON.parse(await readFile(join(root,"package.json"),"utf8")).scripts ?? {}; } catch {}
-  const defaults: Record<string,string> = {"worker.agent":"claude","worker.viewl":"","check":scripts.typecheck ? "npm run typecheck" : scripts.lint ? "npm run lint" : "","test":scripts.test ? "npm test" : ""};
-  const names: Record<string,string> = {agent:"worker.agent",model:"worker.viewl",check:"check",test:"test"};
+  const defaults: Record<string,string> = {"worker.agent":"claude","worker.model":"","check":scripts.typecheck ? "npm run typecheck" : scripts.lint ? "npm run lint" : "","test":scripts.test ? "npm test" : ""};
+  const names: Record<string,string> = {agent:"worker.agent",model:"worker.model",check:"check",test:"test"};
   for (const [flag,key] of Object.entries(names)) {
     if (!flags.has(flag) && existing[key] !== undefined) continue;
     const value = String(flags.get(flag) ?? defaults[key]);
