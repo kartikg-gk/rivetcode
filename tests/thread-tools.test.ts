@@ -484,9 +484,11 @@ it("moves a busy shared fork to its own worktree only when asked to stop its tur
   for (;;) {
     const items = (await api("GET", `/runs/${fork}/timeline?view=messages&limit=100`)).value.items as { text: string }[];
     if (items.some((i) => i.text.includes("Your turn was stopped to move you into your own worktree"))) break;
+
     if (Date.now() > done) throw new Error("the session did not continue in its new worktree");
     await new Promise((r) => setTimeout(r, 100));
   }
+  expect((await api("GET", `/runs/${fork}`)).value.run.node.status).toBe("running");
 }, 60000);
 
 it("sizes handed-over history to the receiving model's context", async () => {

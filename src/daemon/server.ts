@@ -1678,8 +1678,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
         }
         if (active) {
           await write(() => store.queueMessage(run.id, NODE_ID, `Your turn was stopped to move you into your own worktree at ${path} (branch ${branch}, from ${ref}). Files you changed in the shared checkout during that turn stay there; redo what you still need here, then continue the task.`, undefined, "queue"));
-          const fresh = await write(() => store.loadRun(run.id));
-          await scheduler.launch(fresh, undefined, fresh.node.agentChatId ? { resume: true } : {});
+          // Resumed as a fork is, so it is running again rather than left stopped by the user.
+          await scheduler.resume(run.id);
         }
         reply(res, 201, { runId: run.id, branch, worktree: path, commit: from, ...(active ? { resumed: true } : {}) });
         return;

@@ -205,7 +205,9 @@ describe("removeWorktree after a partial removal", () => {
     await createWorktree({ repo, path, branch: "rivet/settling/root", from: "main" });
     await rm(join(path, ".git"));
     const finish = new Promise<void>((resolve, reject) => {
-      setTimeout(() => { void rm(path, { recursive: true }).then(resolve, reject); }, 250);
+      // Windows refuses to delete a folder another process is looking into (EBUSY); the
+      // finishing process retries, as real removal tools do.
+      setTimeout(() => { void rm(path, { recursive: true, maxRetries: 20, retryDelay: 50 }).then(resolve, reject); }, 250);
     });
     await removeWorktree(data, repo, path);
     await finish;
