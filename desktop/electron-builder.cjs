@@ -17,5 +17,6 @@ module.exports = {
   win: { target: ['nsis', 'portable'] },
   nsis: { oneClick: false, allowToChangeInstallationDirectory: true },
   mac: { target: ['dmg', 'zip'], category: 'public.app-category.developer-tools' },
-  linux: { target: ['AppImage', 'deb'], category: 'Development' },
+  // A .deb names a maintainer; the GitHub no-reply address keeps a personal one out of it.
+  linux: { target: ['AppImage', 'deb'], category: 'Development', maintainer: 'kartikg-gk <kartikg-gk@users.noreply.github.com>' },
 };
