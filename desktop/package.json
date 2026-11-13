@@ -16,7 +16,7 @@
   },
   "description": "Desktop workspace for Rivet coding agents",
   "author": { "name": "kartikg-gk", "email": "kartikg-gk@users.noreply.github.com" },
-  "homepage": "https://github.com/kartikg-gk/rivet-code1",
+  "homepage": "https://github.com/kartikg-gk/rivetcode",
   "overrides": {
     "minimatch@>=7 <11.0.1": "11.0.1"
   }

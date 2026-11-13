@@ -13,7 +13,7 @@ module.exports = {
   },
   asar: true,
   forceCodeSigning: process.env.RIVET_REQUIRE_SIGNING === '1',
-  publish: [{ provider: 'github', owner: 'kartikg-gk', repo: 'rivet-code1' }],
+  publish: [{ provider: 'github', owner: 'kartikg-gk', repo: 'rivetcode' }],
   win: { target: ['nsis', 'portable'] },
   nsis: { oneClick: false, allowToChangeInstallationDirectory: true },
   mac: { target: ['dmg', 'zip'], category: 'public.app-category.developer-tools' },
