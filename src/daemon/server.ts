@@ -276,6 +276,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const saved = await listCheckpoints(run.node.worktree, sessionIdOf(run.id, NODE_ID));
     return items.filter((i) => i.itemId).map((i) => ({ itemId: i.itemId!, position: i.position, text: i.text, checkpoint: saved.get(checkpointName(i.itemId!)) ?? null }));
   }
+  let setupCache: { at: number; value: Promise<import("../setup.js").Setup> } | undefined;
   let queue = Promise.resolve();
   function write<T>(work: () => T): Promise<T> {
     const result = queue.then(work);
@@ -731,6 +732,17 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0) });
       }
       reply(res, 200, { turns: shown, untrusted: true });
+      return;
+    }
+    // What a new user still needs: agents installed and logged in, or a local model.
+    if (path === "/api/v1/setup") {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const fresh = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("refresh") === "1";
+      if (fresh || !setupCache || Date.now() - setupCache.at > 30_000) {
+        const { checkSetup } = await import("../setup.js");
+        setupCache = { at: Date.now(), value: checkSetup() };
+      }
+      try { reply(res, 200, await setupCache.value); } catch (e) { setupCache = undefined; throw e; }
       return;
     }
     if (path === "/api/v1/recovery") {
