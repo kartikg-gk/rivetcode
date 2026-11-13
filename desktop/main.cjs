@@ -1,6 +1,7 @@
 const { app, BrowserWindow, dialog } = require('electron');
 const { execFile } = require('node:child_process');
 const { join } = require('node:path');
+const { homedir } = require('node:os');
 const { promisify } = require('node:util');
 
 const run = promisify(execFile);
@@ -8,6 +9,19 @@ const cli = app.isPackaged ? join(process.resourcesPath, 'runtime', 'node_module
 const node = app.isPackaged ? join(process.resourcesPath, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node') : 'node';
 const smoke = process.env.RIVET_DESKTOP_SMOKE === "1";
 let window;
+
+// Opened from the Dock or a menu, the app gets a bare PATH that lacks where claude, codex and
+// git usually live; the user's login shell knows the real one.
+async function userPath() {
+  if (process.platform === 'win32') return process.env.PATH;
+  const shell = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
+  try {
+    const { stdout } = await run(shell, ['-ilc', 'printf "__RIVET_PATH__%s__RIVET_PATH__" "$PATH"'], { timeout: 10_000 });
+    const found = /__RIVET_PATH__(.*)__RIVET_PATH__/.exec(stdout)?.[1];
+    if (found) return [...new Set([...found.split(':'), ...(process.env.PATH || '').split(':')])].filter(Boolean).join(':');
+  } catch { /* keep what the app was given */ }
+  return process.env.PATH;
+}
 
 function configureUpdates() {
   if (!app.isPackaged) return;
@@ -46,7 +60,11 @@ function configureUpdates() {
 }
 
 async function openWindow() {
-  const { stdout } = await run(node, [cli, 'app', '--no-open'], { cwd: process.env.INIT_CWD || process.cwd(), windowsHide: true, timeout: 90_000 });
+  // Started from the home folder: a daemon working inside the install folder would keep it
+  // locked on Windows, and updates could not replace it.
+  const env = process.platform === 'win32' ? { ...process.env } : { ...process.env, PATH: await userPath() };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const { stdout } = await run(node, [cli, 'app', '--no-open'], { cwd: process.env.INIT_CWD || homedir(), env, windowsHide: true, timeout: 90_000 });
   const line = stdout.split(/\r?\n/).find(value => value.startsWith('Rivet is at '));
   const url = new URL(line?.slice('Rivet is at '.length) ?? '');
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password) {
