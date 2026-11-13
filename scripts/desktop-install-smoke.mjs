@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 
 if (process.platform !== "win32") { console.log("desktop install smoke: Windows only, skipped"); process.exit(0); }
 const release = fileURLToPath(new URL("../desktop/release/", import.meta.url));
-const installer = readdirSync(release).find((f) => /^Rivet Setup .*\.exe$/.test(f));
+const installer = readdirSync(release).find((f) => /^Rivet[- ]Setup[- ].*\.exe$/.test(f));
 if (!installer) throw new Error("no Rivet Setup *.exe in desktop/release; run npm run desktop:package first");
 
 const work = join(tmpdir(), `rivet install smoke ${Date.now()}`);
