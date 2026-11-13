@@ -5,7 +5,7 @@ import { projectIdFor } from "../paths.js";
 import { totalTokens, type TokenUse } from "../usage.js";
 import type { Run } from "../store.js";
 import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { readRunFile } from "../runfile.js";
 import type { Probes } from "./doctor.js";
 import { agentOwnIdOf, deriveActivity } from "./activity.js";
@@ -31,9 +31,13 @@ export type CliIo = {
   err(line: string): void;
 };
 
-const USAGE = `usage: rivet <command>
-  (no command)                          open Claude and Codex beside a prompt with / commands
-  console                               only the prompt with / commands
+const USAGE = `usage: rivet [<project folder>] | rivet <command>
+  (no command)                          start Rivet and open it in the browser
+  <folder>                              open Rivet on that project (e.g. rivet ./my-project)
+  serve                                 start Rivet without opening a browser
+  update                                move to the newest release
+  uninstall                             stop Rivet and remove the rivet command (your data stays)
+  console                               Claude and Codex beside a prompt with / commands
   spawn [--name <label>] [--agent <name>] [--model <id>] [--issue <n|owner/repo#n|url>] [--repo <dir>] [--base <branch>] [<task>]
                                         start a worker on a task in its own worktree
   run <tasks.yaml|tasks.json> [--dry-run] [--repo <dir>]
@@ -909,8 +913,11 @@ async function home(io: CliIo, agents: string[] = ["claude", "codex"]): Promise<
 
 // The app, in the browser, served by the daemon; it opens on this repository.
 async function openApp(args: string[], io: CliIo): Promise<number> {
-  const { flags } = parseFlags(args, []);
-  const repo = await repoTop(resolve(io.cwd, ".")).catch(() => "");
+  const { flags, rest } = parseFlags(args, []);
+  const folder = resolve(io.cwd, rest[0] ?? ".");
+  if (rest[0] && !existsSync(folder)) throw new UsageError(`no folder ${rest[0]}`);
+  const repo = await repoTop(folder).catch(() => "");
+  if (rest[0] && !repo) io.err(`rivet: ${rest[0]} is not a git repository; choose a project folder in the app`);
   const info = await readRunFile(runFileFrom(io.env));
   if (!info) throw new DaemonDownError();
   const url = `http://127.0.0.1:${info.port}/${repo ? `?repo=${encodeURIComponent(repo)}` : ""}`;
@@ -1061,19 +1068,92 @@ async function doctorCommand(io: CliIo): Promise<number> {
   return checks.some((c) => c.level === "fail") ? 1 : 0;
 }
 
+const PACKAGE = "rivet-code";
+
+// A path, not a command name: rivet ., rivet ./x, rivet ../x, rivet C:\x, rivet ~/x, rivet /x.
+function looksLikeFolder(word: string): boolean {
+  if (/^(\.{1,2}([\\/]|$)|~|[\\/]|[A-Za-z]:[\\/])/.test(word)) return true;
+  return false;
+}
+
+// Run through npx (npm's exec cache), the command is not installed yet.
+function viaNpx(): boolean {
+  return /[\\/]_npx[\\/]/.test(process.argv[1] ?? "") || process.env.npm_command === "exec";
+}
+
+async function npmRun(args: string[], io: CliIo): Promise<boolean> {
+  const { spawn } = await import("node:child_process");
+  return new Promise((done) => {
+    const child = spawn(process.platform === "win32" ? "npm.cmd" : "npm", args, { stdio: "inherit", shell: process.platform === "win32" });
+    child.on("error", (e) => { io.err(`rivet: npm could not run: ${e.message}`); done(false); });
+    child.on("exit", (code) => done(code === 0));
+  });
+}
+
+// As t3: npx asks once per minor release whether to install the rivet command for good.
+async function offerInstall(io: CliIo): Promise<void> {
+  if (!viaNpx() || !io.tty || !io.ask || io.env.RIVET_NO_INSTALL_PROMPT === "1") return;
+  const version = await ownVersion();
+  const minor = version.split(".").slice(0, 2).join(".");
+  const file = join(dataDirFrom(io.env), "install-prompt.json");
+  const { readFile: read, writeFile, mkdir } = await import("node:fs/promises");
+  const seen = await read(file, "utf8").then((t) => JSON.parse(t) as { declined?: string }, () => ({} as { declined?: string }));
+  if (seen.declined === minor) return;
+  const answer = (await io.ask(`Install the rivet command so you can run it without npx? [Y/n] `)).trim().toLowerCase();
+  if (answer === "" || answer === "y" || answer === "yes") {
+    io.out(`Installing ${PACKAGE}@${version}...`);
+    if (await npmRun(["install", "-g", `${PACKAGE}@${version}`], io)) io.out("Installed. Next time just run: rivet");
+    else io.err(`rivet: the install did not finish; run it yourself later: npm install -g ${PACKAGE}`);
+    return;
+  }
+  await mkdir(dataDirFrom(io.env), { recursive: true });
+  await writeFile(file, JSON.stringify({ declined: minor }));
+  io.out(`Not installed. Later: npx ${PACKAGE} install, or npm install -g ${PACKAGE}`);
+}
+
+async function update(io: CliIo): Promise<number> {
+  const mine = await ownVersion();
+  io.out(`rivet ${mine}: installing the newest ${PACKAGE}...`);
+  if (!(await npmRun(["install", "-g", `${PACKAGE}@latest`], io))) { io.err("rivet: the update did not finish"); return 1; }
+  // The running daemon is the old one; the next command restarts it on the new version.
+  if (await daemonUp(io)) await callDaemon(io.env, "POST", "/shutdown", undefined, 10_000).catch(() => {});
+  io.out("Updated. Run rivet to start the new version.");
+  return 0;
+}
+
+async function uninstall(io: CliIo): Promise<number> {
+  if (await daemonUp(io)) {
+    io.out("Stopping Rivet...");
+    await callDaemon(io.env, "POST", "/shutdown", undefined, 10_000).catch(() => {});
+  }
+  const ok = await npmRun(["uninstall", "-g", PACKAGE], io);
+  io.out(ok ? `Removed the rivet command. Your sessions and settings stay in ${dataDirFrom(io.env)}; delete that folder to remove them too.` : `rivet: npm could not remove ${PACKAGE}; run: npm uninstall -g ${PACKAGE}`);
+  return ok ? 0 : 1;
+}
+
 // Returns the process exit code: 0 ok, 1 failed, 2 usage error.
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
+  argv = [...argv];
+  // A folder in place of a command opens the app on it: rivet ./my-project.
+  if (argv[0] !== undefined && looksLikeFolder(argv[0])) argv = ["app", ...argv];
   const [command, ...args] = argv;
   try {
-    if (AUTOSTART.has(command ?? "") || (command === undefined && io.tty)) await ensureDaemon(io);
+    if (command === undefined) await offerInstall(io);
+    if (AUTOSTART.has(command ?? "") || command === undefined) await ensureDaemon(io);
     switch (command) {
-      case undefined:
-        if (!io.tty) throw new UsageError("no command given");
-        // The agents open beside a prompt that takes slash commands.
-        await home(io).catch((e: Error) => { io.err(e.message); });
-        return await slashConsole(io);
+      // As t3: the bare command starts the daemon and opens the web app.
+      case undefined: return await openApp([], io);
+      case "serve": return await daemon(["start"], io);
+      case "install": {
+        const version = await ownVersion();
+        return (await npmRun(["install", "-g", `${PACKAGE}@${version}`], io)) ? (io.out("Installed. Run: rivet"), 0) : 1;
+      }
+      case "update": return await update(io);
+      case "uninstall": return await uninstall(io);
       case "console":
         if (!io.tty) throw new UsageError("console needs a terminal");
+        // The agents open beside a prompt that takes slash commands.
+        await home(io).catch((e: Error) => { io.err(e.message); });
         return await slashConsole(io);
       case "--help":
       case "help": io.out(USAGE); return 0;
