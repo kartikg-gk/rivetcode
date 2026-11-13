@@ -29,6 +29,9 @@ export function dataDirFrom(env: Record<string, string | undefined>): string {
   return join(homedir(), ".rivet", "data");
 }
 
+// Tries after a refused connection: 100 ms doubling, about 3 s in all.
+const REFUSED_RETRIES = 5;
+
 export async function callDaemon(
   env: Record<string, string | undefined>,
   method: string,
@@ -39,17 +42,23 @@ export async function callDaemon(
 ): Promise<unknown> {
   const info = await readRunFile(runFileFrom(env));
   if (!info) throw new DaemonDownError();
-  let response: Response;
-  try {
-    response = await fetch(`http://127.0.0.1:${info.port}${path}`, {
-      method,
-      headers: body === undefined ? {} : { "content-type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
-    });
-  } catch {
-    if (signal?.aborted) throw signal.reason;
-    throw new DaemonDownError();
+  let response: Response | undefined;
+  // A busy daemon can refuse a connection for a moment (on Windows only a few wait to be
+  // accepted). A refused connection sent nothing, so it is tried again before giving up.
+  for (let attempt = 0; !response; attempt++) {
+    try {
+      response = await fetch(`http://127.0.0.1:${info.port}${path}`, {
+        method,
+        headers: body === undefined ? {} : { "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      const code = ((error as { cause?: { code?: string } }).cause)?.code;
+      if (code !== "ECONNREFUSED" || attempt >= REFUSED_RETRIES) throw new DaemonDownError();
+      await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
+    }
   }
   const text = await response.text();
   const value: unknown = text ? JSON.parse(text) : null;

@@ -18,7 +18,7 @@ import { defaultDelta, findClaude, findCodex, findDelta } from "../agents/locate
 import { githubClient, githubToken, repoSlug, type GitHub, ghInstalled } from "../github/github.js";
 import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
-import { checkpointDiff, checkpointRef, dropCheckpoints, hasCheckpoint, parseNumstat, restoreCheckpoint, type FileChange } from "../checkpoints.js";
+import { checkpointDiff, checkpointName, checkpointRef, checkpointStat, dropCheckpoints, hasCheckpoint, listCheckpoints, parseNumstat, restoreCheckpoint } from "../checkpoints.js";
 import { liveOwner, releaseRunFile, runFileAt, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
@@ -268,16 +268,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   const launches = new Map<string, string>();
 
   // A chat's prompts in order, each marked with whether a file checkpoint was taken before it.
-  async function promptTurns(run: Run): Promise<{ itemId: string; position: number; text: string; checkpoint: boolean }[]> {
+  async function promptTurns(run: Run): Promise<{ itemId: string; position: number; text: string; checkpoint: string | null }[]> {
     if (run.node.runMode !== "chat") return [];
     const { items } = await write(() => store.readChat(run.id, { limit: 5000, kinds: ["prompt", "message"], session: NODE_ID }));
-    const sid = sessionIdOf(run.id, NODE_ID);
-    const out: { itemId: string; position: number; text: string; checkpoint: boolean }[] = [];
-    for (const i of items.slice(-200)) {
-      if (!i.itemId) continue;
-      out.push({ itemId: i.itemId, position: i.position, text: i.text, checkpoint: await hasCheckpoint(run.node.worktree, checkpointRef(sid, i.itemId)) });
-    }
-    return out;
+    const saved = await listCheckpoints(run.node.worktree, sessionIdOf(run.id, NODE_ID));
+    return items.filter((i) => i.itemId).map((i) => ({ itemId: i.itemId!, position: i.position, text: i.text, checkpoint: saved.get(checkpointName(i.itemId!)) ?? null }));
   }
   let queue = Promise.resolve();
   function write<T>(work: () => T): Promise<T> {
@@ -725,12 +720,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (!run) throw new HttpError(404, "unknown run");
       if (!existsSync(run.node.worktree)) { reply(res, 200, { turns: [] }); return; }
       const turns = await promptTurns(run);
-      const sid = sessionIdOf(run.id, NODE_ID);
       const shown: { itemId: string; position: number; text: string; files: number; added: number; removed: number }[] = [];
       const kept = turns.map((t, i) => ({ ...t, i })).filter((t) => t.checkpoint).slice(-TURN_DIFFS);
       for (const t of kept) {
         const next = turns.slice(t.i + 1).find((n) => n.checkpoint);
-        const { files } = await checkpointDiff(run.node.worktree, checkpointRef(sid, t.itemId), next ? checkpointRef(sid, next.itemId) : undefined).catch(() => ({ files: [] as FileChange[] }));
+        const files = await checkpointStat(run.node.worktree, t.checkpoint!, next?.checkpoint ?? undefined).catch(() => []);
         shown.push({ itemId: t.itemId, position: t.position, text: t.text.slice(0, 200), files: files.length,
           added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0) });
       }
@@ -1820,7 +1814,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(port, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen({ port, host: "127.0.0.1", backlog: 2048 }, () => { server.off("error", reject); resolve(); });
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");

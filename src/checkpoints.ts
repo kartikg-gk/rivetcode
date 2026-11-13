@@ -11,8 +11,9 @@ import { git } from "./git.js";
 const PREFIX = "refs/rivet/checkpoints";
 const IDENTITY = { GIT_AUTHOR_NAME: "Rivet", GIT_AUTHOR_EMAIL: "rivet@localhost", GIT_COMMITTER_NAME: "Rivet", GIT_COMMITTER_EMAIL: "rivet@localhost" };
 
+export const checkpointName = (itemId: string) => itemId.replace(/[^A-Za-z0-9._-]/g, "-");
 export function checkpointRef(runId: string, itemId: string): string {
-  return `${PREFIX}/${runId}/${itemId.replace(/[^A-Za-z0-9._-]/g, "-")}`;
+  return `${PREFIX}/${runId}/${checkpointName(itemId)}`;
 }
 
 // A private index, so the real one (and what is staged in it) is never touched.
@@ -98,4 +99,32 @@ export async function checkpointDiff(cwd: string, fromRef: string, toRef?: strin
     git(["-c", "core.autocrlf=false", "diff", "--numstat", from, to], cwd),
   ]);
   return { diff, files: parseNumstat(numstat) };
+}
+
+// Every checkpoint of a session at once, item id to commit: one git call however long the chat.
+export async function listCheckpoints(cwd: string, runId: string): Promise<Map<string, string>> {
+  const prefix = `${PREFIX}/${runId}/`;
+  const out = await git(["for-each-ref", "--format=%(objectname) %(refname)", prefix], cwd).catch(() => "");
+  const found = new Map<string, string>();
+  for (const line of out.split(/\r?\n/)) {
+    const at = line.indexOf(" ");
+    if (at > 0) found.set(line.slice(at + 1 + prefix.length), line.slice(0, at));
+  }
+  return found;
+}
+
+// Lines changed between two checkpoint commits, or since one when no second is given.
+// Two saved checkpoints never change, so their counts are kept.
+const statCache = new Map<string, FileChange[]>();
+export async function checkpointStat(cwd: string, from: string, to?: string): Promise<FileChange[]> {
+  const key = to ? `${from}:${to}` : "";
+  const kept = key ? statCache.get(key) : undefined;
+  if (kept) return kept;
+  const toTree = to ? `${to}^{tree}` : await snapshotTree(cwd);
+  const files = parseNumstat(await git(["-c", "core.autocrlf=false", "diff", "--numstat", `${from}^{tree}`, toTree], cwd));
+  if (key) {
+    if (statCache.size > 5000) statCache.clear();
+    statCache.set(key, files);
+  }
+  return files;
 }
