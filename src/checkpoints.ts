@@ -1,4 +1,4 @@
-import { rm } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { git } from "./git.js";
 
@@ -36,7 +36,24 @@ async function snapshotTree(cwd: string): Promise<string> {
   }
 }
 
-export async function captureCheckpoint(cwd: string, ref: string): Promise<string> {
+// Untracked, unignored files are copied into git by a checkpoint; past this many bytes of
+// them a checkpoint is not taken, so big data or build output is not copied before every prompt.
+export const UNTRACKED_LIMIT = 200 * 1024 * 1024;
+
+async function untrackedBytes(cwd: string, limit: number): Promise<number> {
+  const names = (await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd)).split("\0").filter(Boolean);
+  let total = 0;
+  for (const name of names) {
+    total += await stat(join(cwd, name)).then((s) => s.size, () => 0);
+    if (total > limit) break;
+  }
+  return total;
+}
+
+export async function captureCheckpoint(cwd: string, ref: string, limit = UNTRACKED_LIMIT): Promise<string> {
+  if ((await untrackedBytes(cwd, limit)) > limit) {
+    throw new Error(`more than ${Math.round(limit / 1024 / 1024)} MB of untracked files; add them to .gitignore or commit them to get checkpoints`);
+  }
   const tree = await snapshotTree(cwd);
   const head = await git(["rev-parse", "--verify", "-q", "HEAD"], cwd).then((s) => s.trim(), () => "");
   const commit = (await git(["commit-tree", tree, ...(head ? ["-p", head] : []), "-m", `rivet checkpoint ${ref}`], cwd, IDENTITY)).trim();

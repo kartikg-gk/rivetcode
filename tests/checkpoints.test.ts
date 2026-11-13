@@ -28,6 +28,13 @@ describe("a turn's diff", () => {
 });
 
 describe("a file checkpoint", () => {
+  it("is not taken when untracked files are too big to copy before every prompt", async () => {
+    writeFileSync(join(repo, "data.bin"), "x".repeat(2048));
+    const ref = checkpointRef("run1-agent", "rivet-9-9");
+    await expect(captureCheckpoint(repo, ref, 1024)).rejects.toThrow(/untracked files/);
+    expect(await hasCheckpoint(repo, ref)).toBe(false);
+  });
+
   it("saves the files without staging, committing or changing anything", async () => {
     writeFileSync(join(repo, "work.txt"), "draft");
     await git(["add", "work.txt"], repo);
