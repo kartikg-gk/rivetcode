@@ -26,7 +26,7 @@ async function ask(question: string): Promise<string> {
 
 // A detached "rivet daemon start" that outlives this command; its output goes to
 // <data>/daemon.log.
-async function startDaemon(): Promise<void> {
+async function startDaemon(): Promise<() => boolean> {
   const { spawn } = await import("node:child_process");
   const { mkdirSync, openSync } = await import("node:fs");
   const { join } = await import("node:path");
@@ -37,7 +37,10 @@ async function startDaemon(): Promise<void> {
   const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", process.argv[1]!, "daemon", "start"], {
     detached: true, stdio: ["ignore", log, log], windowsHide: true, env: process.env,
   });
+  let exited = false;
+  child.on("exit", () => { exited = true; });
   child.unref();
+  return () => exited;
 }
 
 process.exitCode = await runCli(process.argv.slice(2), {

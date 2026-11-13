@@ -12,6 +12,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "smoke:package": "node scripts/package-smoke.mjs",
+    "smoke:desktop-install": "node scripts/desktop-install-smoke.mjs",
     "desktop:package": "npm run build && node scripts/stage-desktop.mjs && npm --prefix desktop run package"
   },
   "devDependencies": {

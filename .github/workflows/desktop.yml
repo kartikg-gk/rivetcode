@@ -40,6 +40,9 @@ jobs:
             if [ -z "${!v}" ]; then unset "$v"; fi
           done
           npm run desktop:package
+      # The installed app, not the build folder: install, launch, daemon ready, uninstall.
+      - if: matrix.os == 'windows-latest'
+        run: npm run smoke:desktop-install
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: rivet-desktop-${{ matrix.os }}

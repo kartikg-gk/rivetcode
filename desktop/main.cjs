@@ -46,7 +46,7 @@ function configureUpdates() {
 }
 
 async function openWindow() {
-  const { stdout } = await run(node, [cli, 'app', '--no-open'], { cwd: process.env.INIT_CWD || process.cwd(), windowsHide: true, timeout: 30_000 });
+  const { stdout } = await run(node, [cli, 'app', '--no-open'], { cwd: process.env.INIT_CWD || process.cwd(), windowsHide: true, timeout: 90_000 });
   const line = stdout.split(/\r?\n/).find(value => value.startsWith('Rivet is at '));
   const url = new URL(line?.slice('Rivet is at '.length) ?? '');
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password) {

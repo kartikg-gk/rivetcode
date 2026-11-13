@@ -1812,9 +1812,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
 
   const port = opts.port ?? (process.env.RIVET_PORT === undefined ? 4319 : Number(process.env.RIVET_PORT));
   try {
-    await new Promise<void>((resolve, reject) => {
+    const listen = (p: number) => new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen({ port, host: "127.0.0.1", backlog: 2048 }, () => { server.off("error", reject); resolve(); });
+      server.listen({ port: p, host: "127.0.0.1", backlog: 2048 }, () => { server.off("error", reject); resolve(); });
+    });
+    // The usual port taken by another program: any free one will do, since clients find
+    // the daemon through the run file. A port someone asked for is not swapped.
+    const chosen = opts.port !== undefined || process.env.RIVET_PORT !== undefined;
+    await listen(port).catch(async (e: NodeJS.ErrnoException) => {
+      if (e.code !== "EADDRINUSE" || chosen) throw e;
+      await listen(0);
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("daemon has no TCP port");

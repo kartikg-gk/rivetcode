@@ -1,6 +1,6 @@
 import {journalStore,recoveryStatus,snapshotStore,verifyJournal} from "./recovery.js";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertId, assertProjectId, branchName } from "./paths.js";
@@ -725,15 +725,64 @@ type NodeRow = {
   shared: string; run_mode: string; agent_chat_id: string;
 };
 
-// One database for all projects. The daemon is meant to be its only writer.
-export function openStore(data: string): Store {
-  mkdirSync(data, { recursive: true });
-  const db = new DatabaseSync(join(data, "rivet.db"));
+function openDb(file: string): DatabaseSync {
+  const db = new DatabaseSync(file);
   // WAL lets readers run beside the writer; busy_timeout absorbs brief contention.
   db.exec(
     "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
   );
-  migrate(db);
+  return db;
+}
+
+const columnsOf = (db: DatabaseSync, table: string) =>
+  (db.prepare(`PRAGMA table_info("${table.replace(/"/g, '""')}")`).all() as { name: string }[]).map((c) => c.name).sort().join(",");
+
+// What is wrong with a database's tables compared with what the migrations build: a table
+// missing or with other columns. Empty when they match.
+export function schemaProblems(db: DatabaseSync): string[] {
+  const expected = new DatabaseSync(":memory:");
+  try {
+    migrate(expected);
+    const tables = (expected.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_search%'").all() as { name: string }[]).map((t) => t.name);
+    const problems: string[] = [];
+    for (const t of tables) {
+      const want = columnsOf(expected, t), have = columnsOf(db, t);
+      if (!have) problems.push(`table ${t} is missing`);
+      else if (want !== have) problems.push(`table ${t} has columns ${have}, expected ${want}`);
+    }
+    return problems;
+  } finally {
+    expected.close();
+  }
+}
+
+// A database another, incompatible Rivet build made (its migrations ran under the same
+// numbers but built other tables) would fail on first use. It is moved aside, kept whole,
+// and a new one started, so Rivet always starts.
+function openCompatible(data: string): DatabaseSync {
+  const file = join(data, "rivet.db");
+  const db = openDb(file);
+  let problem: string | undefined;
+  try {
+    migrate(db);
+    problem = schemaProblems(db)[0];
+  } catch (e) {
+    problem = (e as Error).message;
+  }
+  if (!problem) return db;
+  db.close();
+  const aside = `${file}.incompatible-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  for (const suffix of ["", "-wal", "-shm"]) if (existsSync(file + suffix)) renameSync(file + suffix, aside + suffix);
+  console.error(`rivet: the database was made by an incompatible Rivet build (${problem}); it was moved to ${aside} and a new one started`);
+  const fresh = openDb(file);
+  migrate(fresh);
+  return fresh;
+}
+
+// One database for all projects. The daemon is meant to be its only writer.
+export function openStore(data: string): Store {
+  mkdirSync(data, { recursive: true });
+  const db = openCompatible(data);
 
   const upsertRun = db.prepare(`
     INSERT INTO runs (id, project, repo, base, task, created_at, role, name, orchestrator, model, issue, spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

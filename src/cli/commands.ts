@@ -23,7 +23,8 @@ export type CliIo = {
   // Replaces what doctor checks on this machine (tests).
   doctorProbes?: Probes;
   // Starts the daemon in the background (absent in tests that do not want it).
-  startDaemon?(): Promise<void>;
+  // Starts the daemon in the background; the answer tells whether that process has exited.
+  startDaemon?(): Promise<void | (() => boolean)>;
   // Writes output exactly as received (a session's screen), without a newline.
   raw?(chunk: string): void;
   out(line: string): void;
@@ -972,7 +973,8 @@ async function showPanes(sessions: { id: string; title: string }[], io: CliIo): 
 // Commands you type yourself start the daemon when it is down. Commands agents run
 // (hooks, report, send) never do: their daemon is the one that started them.
 const AUTOSTART = new Set(["new-conversation", "move-to-worktree", "app", "console", "transfers", "search", "wait", "fork", "carry-back", "spawn", "review", "snippet", "routine", "switch", "orchestrator", "status", "stop", "resume", "clean", "after-merge", "project", "pr", "attach", "panes"]);
-const AUTOSTART_WAIT_MS = 15_000;
+// A first start after install can be slow (antivirus scanning the bundled runtime), so it gets a minute.
+const AUTOSTART_WAIT_MS = 60_000;
 
 async function daemonUp(io: CliIo): Promise<boolean> {
   try {
@@ -986,10 +988,17 @@ async function daemonUp(io: CliIo): Promise<boolean> {
 async function ensureDaemon(io: CliIo): Promise<void> {
   if (!io.startDaemon || io.env.RIVET_NO_AUTOSTART === "1" || (await daemonUp(io))) return;
   io.err("rivet: starting the daemon in the background");
-  await io.startDaemon();
+  const exited = await io.startDaemon();
   const end = Date.now() + AUTOSTART_WAIT_MS;
   while (!(await daemonUp(io))) {
-    if (Date.now() > end) throw new Error(`the daemon did not come up within ${AUTOSTART_WAIT_MS / 1000} s; see ${join(dataDirFrom(io.env), "daemon.log")}`);
+    const gone = typeof exited === "function" && exited();
+    if (gone || Date.now() > end) {
+      // The reason is in the daemon's log; its last lines say why, so they are shown.
+      const log = join(dataDirFrom(io.env), "daemon.log");
+      const { readFile } = await import("node:fs/promises");
+      const tail = (await readFile(log, "utf8").catch(() => "")).trim().split(/\r?\n/).slice(-5).join("\n");
+      throw new Error(`the daemon ${gone ? "stopped while starting" : `did not come up within ${AUTOSTART_WAIT_MS / 1000} s`}; see ${log}${tail ? `\n${tail}` : ""}`);
+    }
     await new Promise((r) => setTimeout(r, 150));
   }
 }
