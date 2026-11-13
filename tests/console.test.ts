@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { COMMANDS, matching, menuLines, parseLine } from "../src/cli/console.js";
+import { PassThrough } from "node:stream";
+import { COMMANDS, matching, menuLines, parseLine, runConsole } from "../src/cli/console.js";
 import { addPaneArgs, panesPlan } from "../src/cli/panes.js";
 
 const RUN = "rmvy75x1c5qc0";
@@ -21,6 +22,7 @@ describe("a typed line", () => {
     expect(parseLine(`/send ${RUN} go on please`)).toEqual({ argv: ["send", "--session", `${RUN}-agent`, "--message", "go on please"] });
     expect(parseLine(`/answer ${RUN} no do not publish`)).toEqual({ argv: ["answer", RUN, "no", "--note", "do not publish"] });
     expect(parseLine(`/rollback ${RUN} 2`)).toEqual({ argv: ["rollback", RUN, "--turns", "2"] });
+    expect(parseLine(`/rollback ${RUN} files`)).toEqual({ argv: ["rollback", RUN, "--turns", "1", "--files"] });
   });
 
   it("uses the last session when the run is left out", () => {
@@ -37,6 +39,26 @@ describe("a typed line", () => {
     expect(parseLine("/answer maybe", RUN)).toEqual({ error: "/answer needs yes, always or no" });
     expect(parseLine("  ")).toEqual({ none: true });
     expect(parseLine("/quit")).toEqual({ quit: true });
+  });
+});
+
+describe("the prompt itself", () => {
+  it("runs /worker, then /read on the worker it started, then leaves", async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    let shown = "";
+    output.on("data", (b) => { shown += String(b); });
+    const ran: string[][] = [];
+    const done = runConsole({
+      input: input as unknown as NodeJS.ReadStream, output: output as unknown as NodeJS.WriteStream,
+      run: async (argv, started) => { ran.push(argv); if (argv[0] === "spawn") started(RUN); },
+    });
+    for (const line of ["/worker add a login page", "/read", "/quit"]) {
+      input.write(line + String.fromCharCode(13));
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    expect(await done).toBe(0);
+    expect(ran).toEqual([["spawn", "add a login page"], ["read", RUN, "--activity"]]);
+    expect(shown).toContain("Sessions keep running");
   });
 });
 
