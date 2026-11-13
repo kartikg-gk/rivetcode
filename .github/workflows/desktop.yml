@@ -31,13 +31,26 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm --prefix desktop ci
-      - run: npm run desktop:package
+      # Without a certificate the signing settings arrive empty, and an empty CSC_LINK is read
+      # as a file path; unset, the build skips signing (unless signing is required).
+      - name: Package
+        shell: bash
+        run: |
+          for v in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then unset "$v"; fi
+          done
+          npm run desktop:package
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: rivet-desktop-${{ matrix.os }}
           path: |
             desktop/release/*.exe
+            desktop/release/*.dmg
+            desktop/release/*.zip
+            desktop/release/*.AppImage
+            desktop/release/*.deb
             desktop/release/*.blockmap
+            desktop/release/*.yml
             desktop/release/*.yml
             desktop/release/*.dmg
             desktop/release/*.zip
