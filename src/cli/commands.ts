@@ -455,10 +455,16 @@ async function daemon(args: string[], io: CliIo): Promise<number> {
       io.out(`running (pid ${info!.pid}, port ${info!.port})`);
       return 0;
     }
-    case "stop":
+    case "stop": {
+      const before = await readRunFile(runFile);
       await callDaemon(io.env, "POST", "/shutdown", undefined, HOOK_WAIT_MS);
       io.out("stopping");
+      // Returns once the process is gone, so its files can be replaced (an update) right after.
+      const end = Date.now() + 30_000;
+      const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      while (before && alive(before.pid) && Date.now() < end) await new Promise((r) => setTimeout(r, 200));
       return 0;
+    }
     default:
       throw new UsageError("daemon needs start, stop or status");
   }
