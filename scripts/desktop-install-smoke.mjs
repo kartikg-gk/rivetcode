@@ -57,6 +57,8 @@ try {
   if (!readdirSync(data).some((f) => f.startsWith("rivet.db.incompatible-"))) throw new Error("the incompatible database was not moved aside");
   console.log(JSON.stringify({ installed: target, appLoaded: true, daemon: health, incompatibleDbMovedAside: true }, null, 2));
 } finally {
+  // Stop the daemon the installed app started, whether or not the checks passed.
+  try { daemonPid ??= JSON.parse(readFileSync(join(data, "running.json"), "utf8")).pid; } catch { /* never started */ }
   if (daemonPid) { try { process.kill(daemonPid); } catch { /* already gone */ } }
   const uninstaller = join(target, "Uninstall Rivet.exe");
   if (existsSync(uninstaller)) await run(uninstaller, ["/S"]).catch(() => {});

@@ -985,8 +985,24 @@ async function daemonUp(io: CliIo): Promise<boolean> {
   }
 }
 
+// The version this command line belongs to.
+async function ownVersion(): Promise<string> {
+  return (JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
+}
+
 async function ensureDaemon(io: CliIo): Promise<void> {
-  if (!io.startDaemon || io.env.RIVET_NO_AUTOSTART === "1" || (await daemonUp(io))) return;
+  if (!io.startDaemon || io.env.RIVET_NO_AUTOSTART === "1") return;
+  if (await daemonUp(io)) {
+    // A daemon left running by an older (or newer) install keeps serving its own code after
+    // an update; it is restarted, and recovery picks its sessions up again.
+    const health = await callDaemon(io.env, "GET", "/healthz", undefined, 2_000).catch(() => null) as { version?: string } | null;
+    const mine = await ownVersion();
+    if (!health || health.version === mine) return;
+    io.err(`rivet: restarting the daemon (it is ${health.version ?? "an older build"}, this is ${mine})`);
+    await callDaemon(io.env, "POST", "/shutdown", undefined, 10_000).catch(() => {});
+    const gone = Date.now() + 30_000;
+    while ((await daemonUp(io)) && Date.now() < gone) await new Promise((r) => setTimeout(r, 200));
+  }
   io.err("rivet: starting the daemon in the background");
   const exited = await io.startDaemon();
   const end = Date.now() + AUTOSTART_WAIT_MS;

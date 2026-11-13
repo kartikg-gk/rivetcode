@@ -146,7 +146,7 @@ describe("daemon routes", () => {
   it("answers healthz and rejects unknown routes or methods", async () => {
     const health = await fetch(url("/healthz"));
     expect(health.status).toBe(200);
-    expect(await health.json()).toEqual({ status: "ok", service: "rivet-daemon", pid: process.pid });
+    expect(await health.json()).toEqual({ status: "ok", service: "rivet-daemon", pid: process.pid, version: expect.any(String) });
     expect((await fetch(url("/missing"))).status).toBe(404);
     expect((await post("/healthz", {})).status).toBe(405);
   });

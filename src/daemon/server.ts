@@ -7,7 +7,7 @@ import { allowedRequest, liveSocket, serveApp } from "./web.js";
 import { parseTaskFile, TaskFileError } from "../scheduler/tasks.js";
 import { searchPage, SearchInputError } from "../search.js";
 import { forkConversation, mergeConversation } from "../scheduler/conversations.js";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { waitOnRun } from "../scheduler/wait.js";
 import { randomBytes } from "node:crypto";
@@ -85,6 +85,8 @@ import { createWorktree, emptyTrash, removeWorktree } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 const DIFF_LIMIT = 2 * 1024 * 1024;
+// This build's version, so a client of another version (after an update) can restart it.
+const VERSION = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
 // How many of a chat's latest turns list what they changed.
 const TURN_DIFFS = 50;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
@@ -478,7 +480,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     }
     if (path === "/healthz") {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
-      reply(res, 200, { status: "ok", service: "rivet-daemon", pid: process.pid });
+      reply(res, 200, { status: "ok", service: "rivet-daemon", pid: process.pid, version: VERSION });
       return;
     }
     if (path === "/shutdown") {
