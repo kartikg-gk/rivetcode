@@ -23,36 +23,56 @@ async function userPath() {
   return process.env.PATH;
 }
 
+// Updates come from the GitHub releases. Rivet looks once at start, quietly, and asks only
+// when there is one; "Check for updates" in the menu says either way. A Mac app updates itself
+// only when signed, so an unsigned one opens the download page instead.
+const RELEASES = 'https://github.com/kartikg-gk/rivetcode/releases/latest';
+const updateTest = process.env.RIVET_DESKTOP_UPDATE_TEST === '1';
+let manualCheck = false;
+let updatesReady = false;
+
 function configureUpdates() {
-  if (!app.isPackaged) return;
+  if (!app.isPackaged || updatesReady) return;
+  updatesReady = true;
   const { autoUpdater } = require('electron-updater');
+  const { shell } = require('electron');
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
+  const ask = async (options) => (updateTest ? 0 : (await dialog.showMessageBox(options)).response);
   autoUpdater.on('update-available', async info => {
-    const result = await dialog.showMessageBox({
-      type: 'info', buttons: ['Download', 'Later'], defaultId: 1, cancelId: 1,
-      message: `Rivet ${info.version} is available. Download it?`,
-    });
-    if (result.response === 0) void autoUpdater.downloadUpdate().catch(() => {});
+    if (process.platform === 'darwin') {
+      const answer = await ask({ type: 'info', buttons: ['Open download page', 'Later'], defaultId: 0, cancelId: 1,
+        message: `Rivet ${info.version} is available.`, detail: 'Download it, then replace Rivet in Applications.' });
+      if (answer === 0) void shell.openExternal(RELEASES);
+      return;
+    }
+    const answer = await ask({ type: 'info', buttons: ['Download', 'Later'], defaultId: 0, cancelId: 1,
+      message: `Rivet ${info.version} is available. Download it?` });
+    if (answer === 0) void autoUpdater.downloadUpdate().catch(() => {});
   });
   autoUpdater.on('update-not-available', () => {
-    void dialog.showMessageBox({ message: 'This Rivet version is up to date.' });
+    if (manualCheck) void dialog.showMessageBox({ message: 'This Rivet version is up to date.' });
   });
   autoUpdater.on('update-downloaded', async () => {
-    const result = await dialog.showMessageBox({
-      type: 'info', buttons: ['Install and restart', 'Later'], defaultId: 1, cancelId: 1,
-      message: 'The update is ready. Stop your running work before restarting Rivet.',
-    });
-    if (result.response === 0) autoUpdater.quitAndInstall();
+    const answer = await ask({ type: 'info', buttons: ['Install and restart', 'Later'], defaultId: 0, cancelId: 1,
+      message: 'The update is ready. Running sessions stop and pick up again after the restart.' });
+    if (answer === 0) {
+      if (updateTest) console.log('Rivet update downloaded; installing');
+      // The daemon runs from the installed files; stopped first, nothing is in use while they are replaced.
+      await run(node, [cli, 'daemon', 'stop'], { windowsHide: true, timeout: 30_000 }).catch(() => {});
+      autoUpdater.quitAndInstall(true, true);
+    }
   });
-  autoUpdater.on('error', () => {
-    void dialog.showMessageBox({ type: 'warning', message: 'Could not check or download the update. Try again later.' });
+  autoUpdater.on('error', (error) => {
+    if (updateTest) console.error('update error: ' + error.message);
+    if (manualCheck) void dialog.showMessageBox({ type: 'warning', message: 'Could not check or download the update. Try again later.', detail: String(error?.message ?? '') });
   });
+  if (!smoke) void autoUpdater.checkForUpdates().catch(() => {});
   const { Menu } = require('electron');
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
     { label: 'Rivet', submenu: [
-      { label: 'Check for updates', click: () => { void autoUpdater.checkForUpdates().catch(() => {}); } },
+      { label: 'Check for updates', click: () => { manualCheck = true; void autoUpdater.checkForUpdates().catch(() => {}); } },
       { role: 'quit' },
     ] },
     { role: 'editMenu' },
