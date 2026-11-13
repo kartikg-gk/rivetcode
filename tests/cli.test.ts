@@ -183,8 +183,9 @@ describe("rivet send", () => {
 });
 
 describe("rivet (top level)", () => {
-  it("prints usage for no or unknown commands", async () => {
-    expect(await runCli([], io({}))).toBe(2);
+  it("opens the app with no command, and prints usage for an unknown one", async () => {
+    // No daemon can be started here, so the app cannot open.
+    expect(await runCli([], io({}))).toBe(1);
     expect(await runCli(["fly"], io({}))).toBe(2);
     expect(err.join("\n")).toMatch(/usage: rivet/);
   });
