@@ -43,6 +43,27 @@ jobs:
       # The installed app, not the build folder: install, launch, daemon ready, uninstall.
       - if: matrix.os == 'windows-latest'
         run: npm run smoke:desktop-install
+      # The packaged app on Mac and Linux: start it, daemon up, app page loaded.
+      - if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env: { RIVET_DESKTOP_SMOKE: '1', RIVET_DATA_DIR: '${{ runner.temp }}/rivet data', RIVET_PORT: '0' }
+        run: |
+          export RIVET_RUN_FILE="$RIVET_DATA_DIR/running.json"
+          sudo apt-get install -y xvfb >/dev/null
+          out=$(timeout 120 xvfb-run -a desktop/release/linux-unpacked/rivet --no-sandbox 2>&1 || true)
+          echo "$out" | tail -5
+          echo "$out" | grep -q "Rivet desktop app loaded from the local daemon"
+          kill "$(node -p "require(process.env.RIVET_RUN_FILE).pid")" || true
+      - if: matrix.os == 'macos-latest'
+        shell: bash
+        env: { RIVET_DESKTOP_SMOKE: '1', RIVET_DATA_DIR: '${{ runner.temp }}/rivet data', RIVET_PORT: '0' }
+        run: |
+          export RIVET_RUN_FILE="$RIVET_DATA_DIR/running.json"
+          app=$(ls -d desktop/release/mac*/Rivet.app | head -1)
+          out=$(timeout 120 "$app/Contents/MacOS/Rivet" 2>&1 || true)
+          echo "$out" | tail -5
+          echo "$out" | grep -q "Rivet desktop app loaded from the local daemon"
+          kill "$(node -p "require(process.env.RIVET_RUN_FILE).pid")" || true
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: rivet-desktop-${{ matrix.os }}
