@@ -9,7 +9,7 @@ describe("pull request feedback for a worker", () => {
       "CI failed on pull request #12 (https://github.com/o/r/pull/12).",
       'See what failed with "gh pr checks 12" and read the failing run\'s log with "gh run view <run id> --log-failed", then fix it.',
     ].join("\n"));
-    expect(ciFeedback(pr, ["a.ts"])).toBe("CI failed on the pull request in: a.ts. Fix it.");
+    expect(ciFeedback(pr, [{ check: "validate", notes: [{ path: "a.ts", line: 3, message: "boom" }] }])).toContain("validate: a.ts:3 boom");
     expect(reviewFeedback(pr)).toMatch(/gh pr view 12 --comments" and the comments on code lines with "gh api repos\/o\/r\/pulls\/12\/comments"/);
     expect(reviewFeedback(pr, [{ path: "a.ts", line: 3, body: "null" }])).toBe("Review comments on the pull request:\na.ts:3: null\nAddress them.");
   });

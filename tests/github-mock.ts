@@ -18,7 +18,7 @@ export type MockGitHub = {
   api: string;
   prs: MockPr[];
   checks: Record<string, { id: number; status: string; conclusion: string | null }[]>;
-  annotations: Record<number, { path: string }[]>;
+  annotations: Record<number, { path: string; message?: string }[]>;
   reviews: Record<number, { user: { login: string }; state: string }[]>;
   comments: Record<number, { commit_id: string; path: string; line: number | null; body: string }[]>;
   requests: string[];

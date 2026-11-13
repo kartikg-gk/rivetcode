@@ -12,7 +12,7 @@ import { agentEnv, sessionIdOf } from "../runtime/env.js";
 import { newLaunchId, type Runtime } from "../runtime/runtime.js";
 import type { PullRequest, Run, Store } from "../store.js";
 import { NODE_ID, setStatus, type Node, type Status } from "../model.js";
-import { prStatus, type GitHub } from "../github/github.js";
+import { ciNotStarted, prStatus, type GitHub } from "../github/github.js";
 import { handoffTurns } from "./prompts.js";
 import { checkNote, ciFeedback, conflictPrompt, feedbackRules, orchestratorPrompt, partnerPrompt, reviewerPrompt, switchPrompt, reviewFeedback, workerPrompt } from "./prompts.js";
 import { radar } from "./radar.js";
@@ -108,6 +108,9 @@ export type SchedulerDeps = {
   testTimeoutMs?: number;
   // GitHub access for a run's repository; without it there are no pull requests.
   github?(run: Run): Promise<GitHub>;
+  // Whether the gh CLI is on this machine (taken as yes when not given). Without it a worker
+  // cannot read its pull request's feedback itself, so Rivet fetches it and hands it over.
+  ghCli?(): Promise<boolean>;
   // Called with every problem the scheduler could not handle itself (for logs and tests).
   onError?(error: unknown): void;
   workspaceBusy?(path: string): boolean;
@@ -224,7 +227,7 @@ export function createScheduler(d: SchedulerDeps) {
         for (const rule of commandRules(command)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       }
       // A worker with a pull request may read its feedback itself (see checkPr).
-      const pr = config["pr.feedback"] !== "full" ? await d.write(() => d.store.getPr(run.id)) : null;
+      const pr = !(await feedbackFull(run.project)) ? await d.write(() => d.store.getPr(run.id)) : null;
       if (pr) for (const rule of feedbackRules(pr)) if (!allowedTools.includes(rule)) allowedTools.push(rule);
       const check = (run.spec?.doneWhen ?? config.check)?.trim();
       if (check && prompt !== undefined && node.agent !== "fake" && !o.resume) prompt += checkNote(check, config["verify.reuse"] !== "off");
@@ -798,6 +801,25 @@ export function createScheduler(d: SchedulerDeps) {
   }
 
   // Sends finished work back to its worker with feedback from the pull request.
+  // Rivet fetches the pull request's feedback when asked to, or when gh is not here to read it.
+  async function feedbackFull(project: string): Promise<boolean> {
+    if ((await d.write(() => d.store.getConfig(project)))["pr.feedback"] === "full") return true;
+    return d.ghCli ? !(await d.ghCli()) : false;
+  }
+
+  // CI that GitHub never started (billing, spending limit) is the user's to fix, not the agent's.
+  async function ciNotRun(run: Run, number: number, reason: string): Promise<void> {
+    await d.write(() => {
+      const key = "pr-feedback:" + number;
+      const state = d.store.lifecycleState(run.id, key);
+      const message = "CI did not run on pull request #" + number + ": " + reason;
+      d.store.addTimeline(run.id, NODE_ID, [{ kind: "event", text: message }]);
+      d.store.organizeRun(run.id, { unread: true });
+      d.store.updateNode(run.id, NODE_ID, { summary: message });
+      d.store.saveLifecycleState(run.id, key, { ...state, attention: message });
+    });
+  }
+
   async function reopen(runId: string, feedback: string): Promise<void> {
     await transition(runId, "running", feedback);
     await d.write(() => d.store.updateNode(runId, NODE_ID, { finishedAt: null }));
@@ -872,9 +894,15 @@ export function createScheduler(d: SchedulerDeps) {
           const permitted = await reaction(current,link.number,facts,status,link.handled);
           const key = status + ":" + facts.mergeability + ":" + facts.headSha;
           if (permitted && facts.open && current.node.status === "done" && link.handled !== key) {
-            const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
+            const full = await feedbackFull(run.project);
             let feedback: string | undefined;
-            if (status === "checks-failing") feedback = ciFeedback(link, full ? await github.failedPaths(link.number) : undefined);
+            const failures = status === "checks-failing" ? await github.ciFailures(link.number).catch(() => []) : [];
+            const notRun = ciNotStarted(failures);
+            if (notRun) {
+              await ciNotRun(current, link.number, notRun);
+              await d.write(() => d.store.updatePrLink(runId, link.number, status, key));
+            }
+            else if (status === "checks-failing") feedback = ciFeedback(link, full ? failures : undefined);
             else if (status === "changes-wanted") feedback = reviewFeedback(link, full ? await github.reviewComments(link.number) : undefined);
             else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") feedback = "Linked pull request #" + link.number + " needs its branch updated or conflicts resolved: " + link.url;
             if (feedback) {
@@ -914,9 +942,12 @@ export function createScheduler(d: SchedulerDeps) {
     if (!permitted || pr.handled === key || node.status !== "done") return status;
     // By default the worker is told where the feedback is and reads it itself; "full" has
     // Rivet fetch it and hand it over.
-    const full = (await d.write(() => d.store.getConfig(run.project)))["pr.feedback"] === "full";
+    const full = await feedbackFull(run.project);
     if (status === "checks-failing") {
-      await reopen(runId, ciFeedback(pr, full ? await github.failedPaths(pr.number) : undefined));
+      const failures = await github.ciFailures(pr.number).catch(() => []);
+      const notRun = ciNotStarted(failures);
+      if (notRun) await ciNotRun(run, pr.number, notRun);
+      else await reopen(runId, ciFeedback(pr, full ? failures : undefined));
     } else if (status === "changes-wanted") {
       await reopen(runId, reviewFeedback(pr, full ? await github.reviewComments(pr.number) : undefined));
     } else if (facts.mergeability === "behind" || facts.mergeability === "conflicting") {

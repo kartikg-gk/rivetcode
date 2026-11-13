@@ -19,6 +19,16 @@ export type PrFacts = {
 };
 
 export type ReviewComment = { path: string; line: number | null; body: string };
+// A failing check and what its annotations say (file, line and message).
+export type CiFailure = { check: string; notes: { path: string; line: number | null; message: string }[] };
+
+// GitHub's reason when it refused to start every failing check (billing, spending limit,
+// a locked account): nothing in the code can fix that, so it goes to the user.
+export function ciNotStarted(failures: CiFailure[]): string | null {
+  if (failures.length === 0) return null;
+  const reasons = failures.map((f) => f.notes.find((n) => /job was not started/i.test(n.message))?.message);
+  return reasons.every((r) => r) ? reasons[0]! : null;
+}
 
 export type GitHub = {
   // "owner/repo".
@@ -31,6 +41,8 @@ export type GitHub = {
   postReview(number: number, o: { commitId: string; body: string; comments: { path: string; line: number; body: string }[] }): Promise<number>;
   // Files named by annotations of failing checks.
   failedPaths(number: number): Promise<string[]>;
+  // Each failing check with its annotations.
+  ciFailures(number: number): Promise<CiFailure[]>;
   // Inline comments on the current head commit.
   reviewComments(number: number): Promise<ReviewComment[]>;
 };
@@ -40,6 +52,13 @@ export class GitHubError extends Error {
     super(message);
     this.name = "GitHubError";
   }
+}
+
+// Whether the gh CLI answers on this machine; asked once per process.
+let ghAnswer: Promise<boolean> | undefined;
+export function ghInstalled(): Promise<boolean> {
+  ghAnswer ??= run("gh", ["--version"]).then(() => true, () => false);
+  return ghAnswer;
 }
 
 // owner/name from a GitHub remote URL (https, with or without a user, or ssh).
@@ -97,7 +116,7 @@ export function githubClient(o: { repo: string; token: string; api?: string }): 
   }
 
   type Pull = { number: number; html_url: string; state: string; merged: boolean; draft: boolean; mergeable_state?: string; head: { sha: string }; requested_reviewers?: unknown[] };
-  type CheckRun = { id: number; status: string; conclusion: string | null };
+  type CheckRun = { id: number; name?: string; status: string; conclusion: string | null };
 
   async function ciOf(sha: string): Promise<{ state: CiState; failing: CheckRun[] }> {
     const checks = (await call<{ check_runs: CheckRun[] }>("GET", `/commits/${sha}/check-runs?per_page=100`)).check_runs;
@@ -162,14 +181,20 @@ export function githubClient(o: { repo: string; token: string; api?: string }): 
     },
 
     async failedPaths(number) {
+      const paths = new Set<string>();
+      for (const f of await this.ciFailures(number)) for (const n of f.notes) if (n.path) paths.add(n.path);
+      return [...paths];
+    },
+
+    async ciFailures(number) {
       const pr = await call<Pull>("GET", `/pulls/${number}`);
       const { failing } = await ciOf(pr.head.sha);
-      const paths = new Set<string>();
+      const out: CiFailure[] = [];
       for (const check of failing) {
-        const notes = await call<{ path: string }[]>("GET", `/check-runs/${check.id}/annotations?per_page=100`).catch(() => []);
-        for (const n of notes) if (n.path) paths.add(n.path);
+        const notes = await call<{ path: string; start_line?: number | null; message?: string }[]>("GET", `/check-runs/${check.id}/annotations?per_page=100`).catch(() => []);
+        out.push({ check: check.name ?? String(check.id), notes: notes.map((n) => ({ path: n.path ?? "", line: n.start_line ?? null, message: (n.message ?? "").slice(0, 500) })) });
       }
-      return [...paths];
+      return out;
     },
 
     async reviewComments(number) {

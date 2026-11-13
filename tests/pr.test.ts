@@ -209,7 +209,18 @@ describe("watching the pull request", () => {
     gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
     gh.annotations[9] = [{ path: "a.txt" }];
     await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("checks-failing"));
-    expect(gh.requests.some((r) => r.includes("/annotations"))).toBe(false);
+    const said = JSON.stringify((await api("GET", `/api/v1/runs/${runId}/events?limit=200`)).json.events);
+    expect(said).toContain("gh pr checks");
+    expect(said).not.toContain("a.txt");
+  });
+
+  it("tells the user, not the worker, when GitHub never started CI", async () => {
+    const runId = await opened();
+    gh.checks.sha1 = [{ id: 9, status: "completed", conclusion: "failure" }];
+    gh.annotations[9] = [{ path: ".github", message: "The job was not started because recent account payments have failed." }];
+    const { run } = await until(() => runOf(runId), (r) => (r.pr?.handled ?? "").startsWith("checks-failing"));
+    expect(run.node.attempts).toBe(1);
+    expect(run.node.summary).toContain("CI did not run on pull request #1: The job was not started");
   });
 
   it("fetches the failing paths itself when pr.feedback is full", async () => {

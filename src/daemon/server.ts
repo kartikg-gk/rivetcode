@@ -15,7 +15,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { join } from "node:path";
 import { getAgent, type Agent } from "../agents/agent.js";
 import { defaultDelta, findClaude, findCodex, findDelta } from "../agents/locate.js";
-import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
+import { githubClient, githubToken, repoSlug, type GitHub, ghInstalled } from "../github/github.js";
 import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
 import { checkpointDiff, checkpointRef, dropCheckpoints, hasCheckpoint, parseNumstat, restoreCheckpoint, type FileChange } from "../checkpoints.js";
@@ -350,6 +350,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   runtime.onExit((sessionId) => { void secrets.forget(sessionId).catch(() => {}); });
   const scheduler = createScheduler({
     data, runFile, store, write, runtime, agents, launches, github,
+    // A GitHub given by the caller (tests) keeps its own feedback setting.
+    ...(opts.github ? {} : { ghCli: ghInstalled }),
     ...(opts.checkTimeoutMs ? { checkTimeoutMs: opts.checkTimeoutMs } : {}),
     onError: (error) => { opts.onError?.(error); },
     workspaceBusy: path => [...scriptRuns.values()].some(process => process.worktree === path && (process.starting || runtime.isAlive(process.session))),

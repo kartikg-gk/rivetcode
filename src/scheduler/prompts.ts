@@ -1,3 +1,4 @@
+import type { CiFailure } from "../github/github.js";
 import type { PullRequest, Run } from "../store.js";
 
 // What a worker's agent is told. The fake agent's prompt is a script, so it gets it verbatim.
@@ -100,10 +101,15 @@ export function feedbackRules(pr: PullRequest): string[] {
   ];
 }
 
-// What a worker is told when CI fails on its pull request. With the failing paths it gets
-// them; without, it is told where to look.
-export function ciFeedback(pr: PullRequest, paths?: string[]): string {
-  if (paths) return `CI failed on the pull request${paths.length ? ` in: ${paths.join(", ")}` : ""}. Fix it.`;
+// What a worker is told when CI fails on its pull request. With the failing checks it gets
+// what they said; without, it is told where to look.
+export function ciFeedback(pr: PullRequest, failures?: CiFailure[]): string {
+  if (failures) {
+    const lines = failures.flatMap((f) => f.notes.length
+      ? f.notes.map((n) => `${f.check}: ${n.path}${n.line ? `:${n.line}` : ""}${n.message ? ` ${n.message}` : ""}`)
+      : [`${f.check}: failed`]);
+    return [`CI failed on pull request #${pr.number} (${pr.url}).`, ...lines, "Run the failing check yourself to see its output, then fix it."].join("\n");
+  }
   return [
     `CI failed on pull request #${pr.number} (${pr.url}).`,
     `See what failed with "gh pr checks ${pr.number}" and read the failing run's log with "gh run view <run id> --log-failed", then fix it.`,
