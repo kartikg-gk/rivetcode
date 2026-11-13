@@ -61,5 +61,6 @@ try {
   const uninstaller = join(target, "Uninstall Rivet.exe");
   if (existsSync(uninstaller)) await run(uninstaller, ["/S"]).catch(() => {});
   await new Promise((r) => setTimeout(r, 2000));
-  rmSync(work, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+  try { rmSync(work, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 }); }
+  catch (e) { console.error(`could not remove ${work}: ${e.message}`); }
 }

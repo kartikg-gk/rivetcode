@@ -1,5 +1,6 @@
 import { copyFile, chmod, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -21,6 +22,10 @@ const [{ filename }] = JSON.parse(result);
 execFileSync(process.execPath, [npm, "install", "--prefix", runtime, join(temporary, filename), "--omit=optional", "--no-audit", "--no-fund"], {
   cwd: root, windowsHide: true, stdio: "inherit",
 });
+
+// The window shows the web app the daemon serves; a package without it must not ship.
+const page = join(runtime, "node_modules", "rivet-code", "dist", "web", "index.html");
+if (!existsSync(page)) throw new Error("the packed rivet-code has no dist/web/index.html; run the build again before packaging");
 
 // Type declarations, source maps and docs never run; leaving them out roughly halves the
 // files the installer has to write.
