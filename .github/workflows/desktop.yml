@@ -50,7 +50,8 @@ jobs:
         run: |
           export RIVET_RUN_FILE="$RIVET_DATA_DIR/running.json"
           sudo apt-get install -y xvfb >/dev/null
-          out=$(timeout 120 xvfb-run -a desktop/release/linux-unpacked/rivet --no-sandbox 2>&1 || true)
+          bin=desktop/release/linux-unpacked/rivet-desktop
+          out=$(timeout 120 xvfb-run -a "$bin" --no-sandbox 2>&1 || true)
           echo "$out" | tail -5
           echo "$out" | grep -q "Rivet desktop app loaded from the local daemon"
           kill "$(node -p "require(process.env.RIVET_RUN_FILE).pid")" || true
