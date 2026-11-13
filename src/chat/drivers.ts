@@ -345,7 +345,8 @@ export function codexChat(o: ChatOptions): ChatDriver {
   let turnEnded: (() => void) | null = null;
   // Turns already over: turn/start's reply can arrive after its turn ended.
   const finished = new Set<string>();
-  const questions = new Map<string, number | string>();
+  // Each open question with its JSON-RPC id; an MCP tool's approval is answered as an elicitation.
+  const questions = new Map<string, { id: number | string; elicitation: boolean }>();
   const settings = codexApproval(o.permission);
   const stream = streamer(o.emit);
   const growing = new Map<string, string>();
@@ -424,12 +425,28 @@ export function codexChat(o: ChatOptions): ChatDriver {
       }
     },
     request(method, params, id) {
+      if (method === "mcpServer/elicitation/request") {
+        // Codex asks before an MCP tool runs. Other elicitations want a form filled in,
+        // which nobody here can do, so they are declined.
+        const meta = (params._meta ?? {}) as Record<string, unknown>;
+        if (meta.codex_approval_kind !== "mcp_tool_call") { rpc.respond(id, { action: "decline", content: null }); return; }
+        const server = text(params.serverName);
+        const name = /tool "([^"]+)"/.exec(text(params.message))?.[1] ?? "";
+        const requestId = String(id);
+        questions.set(requestId, { id, elicitation: true });
+        const tool = `mcp__${server}__${name}`;
+        const detail = text(meta.tool_description) || text(params.message);
+        const auto = o.decide({ requestId, tool, detail });
+        if (auto) { answer(requestId, auto); return; }
+        o.emit({ type: "activity", requestId, kind: "question", status: "waiting", summary: `${tool}: ${detail}`, tool, turnId: text(params.turnId) || activeTurn });
+        return;
+      }
       if (method !== "item/commandExecution/requestApproval" && method !== "item/fileChange/requestApproval") {
         rpc.fail(id, -32601, `${method} is not supported`);
         return;
       }
       const requestId = String(id);
-      questions.set(requestId, id);
+      questions.set(requestId, { id, elicitation: false });
       const command = method === "item/commandExecution/requestApproval"
         ? ((Array.isArray(params.commandActions) ? (params.commandActions as { command?: string }[]) : []).map((a) => a.command).filter(Boolean).join(" && ") || text(params.command))
         : undefined;
@@ -443,11 +460,12 @@ export function codexChat(o: ChatOptions): ChatDriver {
   if (o.raw) rpc.onLine(o.raw);
 
   function answer(requestId: string, choice: Choice): boolean {
-    const id = questions.get(requestId);
-    if (id === undefined) return false;
+    const q = questions.get(requestId);
+    if (q === undefined) return false;
     // Answered here, so Codex's later "resolved" notice says nothing new.
     questions.delete(requestId);
-    rpc.respond(id, { decision: choice === "yes" ? "accept" : choice === "always" ? "acceptForSession" : "decline" });
+    if (q.elicitation) rpc.respond(q.id, choice === "no" ? { action: "decline", content: null } : { action: "accept", content: {}, ...(choice === "always" ? { _meta: { persist: "session" } } : {}) });
+    else rpc.respond(q.id, { decision: choice === "yes" ? "accept" : choice === "always" ? "acceptForSession" : "decline" });
     return true;
   }
 

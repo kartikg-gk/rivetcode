@@ -3,6 +3,7 @@
 // with "echo: <text>" and one command; words in it script the rest:
 //   ASK  - ask permission for "npm publish" first     RIVET - ask for "rivet status" (allowed)
 //   SLOW - take 3 s, so a message can steer or interrupt it
+//   MCPTOOL - (codex) ask, as an MCP elicitation, to run Rivet's own rivet_check tool
 import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 
@@ -51,6 +52,12 @@ async function turn(text, finish) {
       : await ask("item/commandExecution/requestApproval", { threadId, turnId: t.id, itemId: "c0", command: `powershell -Command '${command}'`, commandActions: [{ type: "unknown", command }] });
     allowed = acp ? answer.outcome?.optionId !== "no" : answer.decision !== "decline";
     if (!acp) out({ method: "serverRequest/resolved", params: { threadId, requestId: 100 + 0 } });
+  }
+  if (!acp && text.includes("MCPTOOL")) {
+    const answer = await ask("mcpServer/elicitation/request", { threadId, turnId: t.id, serverName: "rivet", mode: "form",
+      _meta: { codex_approval_kind: "mcp_tool_call", persist: ["session", "always"], tool_description: "Run this worker's configured check and tests." },
+      message: 'Allow the rivet MCP server to run tool "rivet_check"?', requestedSchema: { type: "object", properties: {} } });
+    allowed = answer.action === "accept";
   }
   if (process.env.RIVET_TEST_STREAM_GATE && ["SLOW work", "SLOW long job"].includes(text)) {
     // Keep the intended turn open until the reader sends its steer or interrupt.

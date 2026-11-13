@@ -204,6 +204,12 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "RIVET check", mode: "queue" });
     await until("the queued turn", async () => said(await timeline(runId), "echo: RIVET check"));
     await until("the queued turn finishing", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
+    if (protocol === "codex") {
+      // Codex asks before running one of Rivet's own MCP tools; a worker may use them unasked.
+      await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "MCPTOOL now", mode: "queue" });
+      await until("the MCP tool turn", async () => said(await timeline(runId), "echo: MCPTOOL now"));
+      await until("idle after the MCP tool", async () => (await api("GET", `/api/v1/runs/${runId}`)).json.run.node.activity === "idle");
+    }
 
     // A steer joins the turn in progress.
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "SLOW work", mode: "queue" });
