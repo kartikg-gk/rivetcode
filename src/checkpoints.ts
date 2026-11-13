@@ -76,3 +76,26 @@ export async function dropCheckpoints(cwd: string, runId: string): Promise<numbe
   for (const ref of refs) await git(["update-ref", "-d", ref], cwd);
   return refs.length;
 }
+
+// One changed file in a diff: lines added and removed (binary files count none).
+export type FileChange = { path: string; added: number; removed: number; binary: boolean };
+
+export function parseNumstat(out: string): FileChange[] {
+  return out.split(/\r?\n/).filter(Boolean).map((line) => {
+    const [a, r, ...rest] = line.split("\t");
+    const binary = a === "-";
+    return { path: rest.join("\t"), added: binary ? 0 : Number(a), removed: binary ? 0 : Number(r), binary };
+  });
+}
+
+// What one turn changed: the files as they were before its prompt against the files before
+// the next prompt, or against the worktree now when no prompt came after it.
+export async function checkpointDiff(cwd: string, fromRef: string, toRef?: string): Promise<{ diff: string; files: FileChange[] }> {
+  const from = (await git(["rev-parse", "--verify", `${fromRef}^{tree}`], cwd)).trim();
+  const to = toRef ? (await git(["rev-parse", "--verify", `${toRef}^{tree}`], cwd)).trim() : await snapshotTree(cwd);
+  const [diff, numstat] = await Promise.all([
+    git(["-c", "core.autocrlf=false", "diff", from, to], cwd),
+    git(["-c", "core.autocrlf=false", "diff", "--numstat", from, to], cwd),
+  ]);
+  return { diff, files: parseNumstat(numstat) };
+}

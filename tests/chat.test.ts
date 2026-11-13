@@ -335,7 +335,15 @@ describe("rolling a conversation back with its files", () => {
     await idle();
     expect(await readFile(join(worktree, "agent.txt"), "utf8")).toBe("second");
 
-    const kept = await api("POST", `/api/v1/runs/${runId}/rollback`, { turns: 1 });
+    // Each turn lists what it changed, and its diff shows only that.
+    const { turns } = (await api("GET", `/api/v1/runs/${runId}/turns`)).json as { turns: { itemId: string; files: number; added: number; removed: number }[] };
+    expect(turns.map((t) => [t.files, t.added, t.removed])).toEqual([[1, 1, 0], [1, 1, 1]]);
+    const second = (await api("GET", `/api/v1/runs/${runId}/diff?turn=${encodeURIComponent(turns[1]!.itemId)}`)).json;
+    expect(second.files).toEqual([{ path: "agent.txt", added: 1, removed: 1, binary: false }]);
+    expect(second.diff).toContain("-first");
+    expect((await api("GET", `/api/v1/runs/${runId}/diff?turn=nope`)).status).toBe(404);
+
+    const kept =await api("POST", `/api/v1/runs/${runId}/rollback`, { turns: 1 });
     expect(kept.json.filesystem).toBe("current checkout; historical files are not restored");
     expect(await readFile(join(worktree, "agent.txt"), "utf8")).toBe("second");
     await idle();

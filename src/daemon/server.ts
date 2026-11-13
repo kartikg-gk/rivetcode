@@ -18,7 +18,7 @@ import { defaultDelta, findClaude, findCodex, findDelta } from "../agents/locate
 import { githubClient, githubToken, repoSlug, type GitHub } from "../github/github.js";
 import { dataDir, assertId, projectIdFor, branchName, worktreePath } from "../paths.js";
 import { git } from "../git.js";
-import { checkpointRef, dropCheckpoints, hasCheckpoint, restoreCheckpoint } from "../checkpoints.js";
+import { checkpointDiff, checkpointRef, dropCheckpoints, hasCheckpoint, parseNumstat, restoreCheckpoint, type FileChange } from "../checkpoints.js";
 import { liveOwner, releaseRunFile, runFileAt, writeRunFile, type RunInfo } from "../runfile.js";
 import { sessionIdOf } from "../runtime/env.js";
 import { createRuntime } from "../runtime/runtime.js";
@@ -85,6 +85,8 @@ import { createWorktree, emptyTrash, removeWorktree } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 const DIFF_LIMIT = 2 * 1024 * 1024;
+// How many of a chat's latest turns list what they changed.
+const TURN_DIFFS = 50;
 // Per-project settings: the check and the tests a worker's work must pass, the default agent.
 const CONFIG_KEYS = [
   "feedback.ciRetries",
@@ -265,6 +267,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   // The launch each session is on now; hooks and exits of older launches are ignored.
   const launches = new Map<string, string>();
 
+  // A chat's prompts in order, each marked with whether a file checkpoint was taken before it.
+  async function promptTurns(run: Run): Promise<{ itemId: string; position: number; text: string; checkpoint: boolean }[]> {
+    if (run.node.runMode !== "chat") return [];
+    const { items } = await write(() => store.readChat(run.id, { limit: 5000, kinds: ["prompt", "message"], session: NODE_ID }));
+    const sid = sessionIdOf(run.id, NODE_ID);
+    const out: { itemId: string; position: number; text: string; checkpoint: boolean }[] = [];
+    for (const i of items.slice(-200)) {
+      if (!i.itemId) continue;
+      out.push({ itemId: i.itemId, position: i.position, text: i.text, checkpoint: await hasCheckpoint(run.node.worktree, checkpointRef(sid, i.itemId)) });
+    }
+    return out;
+  }
   let queue = Promise.resolve();
   function write<T>(work: () => T): Promise<T> {
     const result = queue.then(work);
@@ -676,15 +690,49 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       if (req.method !== "GET") throw new HttpError(405, "method not allowed");
       const run = await write(() => store.loadRun(diffRoute[1]!)).catch(() => null);
       if (!run) throw new HttpError(404, "unknown run");
-      if (!existsSync(run.node.worktree)) { reply(res, 200, { available: false, diff: "", stat: "", untracked: [], cut: false, untrusted: true }); return; }
+      if (!existsSync(run.node.worktree)) { reply(res, 200, { available: false, diff: "", stat: "", files: [], untracked: [], cut: false, untrusted: true }); return; }
+      const turn = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("turn");
+      if (turn) {
+        // One turn: the files before its prompt against the files before the next one.
+        const turns = await promptTurns(run);
+        const at = turns.findIndex((t) => t.itemId === turn);
+        if (at < 0 || !turns[at]!.checkpoint) throw new HttpError(404, "no file checkpoint for that turn");
+        const next = turns.slice(at + 1).find((t) => t.checkpoint);
+        const sid = sessionIdOf(run.id, NODE_ID);
+        const { diff, files } = await checkpointDiff(run.node.worktree, checkpointRef(sid, turn), next ? checkpointRef(sid, next.itemId) : undefined);
+        const cut = diff.length > DIFF_LIMIT;
+        reply(res, 200, { available: true, diff: cut ? diff.slice(0, DIFF_LIMIT) : diff, stat: "", files, untracked: [], cut, untrusted: true });
+        return;
+      }
       // Everything this worktree changed from where it branched, committed or not.
       const from = (await git(["merge-base", run.base, "HEAD"], run.node.worktree).catch(() => run.base)).trim();
-      const [full, stat, untracked] = await Promise.all([
+      const [full, stat, numstat, untracked] = await Promise.all([
         git(["diff", from], run.node.worktree), git(["diff", "--stat", from], run.node.worktree),
+        git(["diff", "--numstat", from], run.node.worktree),
         git(["ls-files", "--others", "--exclude-standard"], run.node.worktree),
       ]);
       const cut = full.length > DIFF_LIMIT;
-      reply(res, 200, { available: true, diff: cut ? full.slice(0, DIFF_LIMIT) : full, stat, untracked: untracked.split(/\r?\n/).filter(Boolean), cut, untrusted: true });
+      reply(res, 200, { available: true, diff: cut ? full.slice(0, DIFF_LIMIT) : full, stat, files: parseNumstat(numstat), untracked: untracked.split(/\r?\n/).filter(Boolean), cut, untrusted: true });
+      return;
+    }
+    // Each prompt of a chat with what its turn changed, for the per-turn diff.
+    const turnsRoute = /^\/api\/v1\/runs\/([^/]+)\/turns$/.exec(path);
+    if (turnsRoute) {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      const run = await write(() => store.loadRun(turnsRoute[1]!)).catch(() => null);
+      if (!run) throw new HttpError(404, "unknown run");
+      if (!existsSync(run.node.worktree)) { reply(res, 200, { turns: [] }); return; }
+      const turns = await promptTurns(run);
+      const sid = sessionIdOf(run.id, NODE_ID);
+      const shown: { itemId: string; position: number; text: string; files: number; added: number; removed: number }[] = [];
+      const kept = turns.map((t, i) => ({ ...t, i })).filter((t) => t.checkpoint).slice(-TURN_DIFFS);
+      for (const t of kept) {
+        const next = turns.slice(t.i + 1).find((n) => n.checkpoint);
+        const { files } = await checkpointDiff(run.node.worktree, checkpointRef(sid, t.itemId), next ? checkpointRef(sid, next.itemId) : undefined).catch(() => ({ files: [] as FileChange[] }));
+        shown.push({ itemId: t.itemId, position: t.position, text: t.text.slice(0, 200), files: files.length,
+          added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0) });
+      }
+      reply(res, 200, { turns: shown, untrusted: true });
       return;
     }
     if (path === "/api/v1/recovery") {
