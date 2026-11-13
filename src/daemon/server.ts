@@ -85,6 +85,14 @@ import { createWorktree, emptyTrash, removeWorktree } from "../worktree.js";
 
 const BODY_LIMIT = 1024 * 1024;
 const DIFF_LIMIT = 2 * 1024 * 1024;
+// Whether version a is later than b (plain x.y.z).
+function newerVersion(a: string, b: string): boolean {
+  const n = (v: string) => v.split("-")[0]!.split(".").map((x) => Number(x) || 0);
+  const [x, y] = [n(a), n(b)];
+  for (let i = 0; i < 3; i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
+  return false;
+}
+
 // This build's version, so a client of another version (after an update) can restart it.
 const VERSION = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
 // How many of a chat's latest turns list what they changed.
@@ -276,6 +284,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     const saved = await listCheckpoints(run.node.worktree, sessionIdOf(run.id, NODE_ID));
     return items.filter((i) => i.itemId).map((i) => ({ itemId: i.itemId!, position: i.position, text: i.text, checkpoint: saved.get(checkpointName(i.itemId!)) ?? null }));
   }
+  let latestRelease: { at: number; value: Promise<string | null> } | undefined;
   let setupCache: { at: number; value: Promise<import("../setup.js").Setup> } | undefined;
   let queue = Promise.resolve();
   function write<T>(work: () => T): Promise<T> {
@@ -732,6 +741,18 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
           added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0) });
       }
       reply(res, 200, { turns: shown, untrusted: true });
+      return;
+    }
+    // This version and the newest on npm (asked at most every six hours; null when unknown).
+    if (path === "/api/v1/version") {
+      if (req.method !== "GET") throw new HttpError(405, "method not allowed");
+      if (!latestRelease || Date.now() - latestRelease.at > 6 * 3_600_000) {
+        latestRelease = { at: Date.now(), value: process.env.VITEST || process.env.RIVET_NO_UPDATE_CHECK === "1" ? Promise.resolve(null)
+          : fetch("https://registry.npmjs.org/rivet-code/latest", { signal: AbortSignal.timeout(5_000) })
+            .then(async (r) => (r.ok ? ((await r.json()) as { version?: string }).version ?? null : null), () => null) };
+      }
+      const latest = await latestRelease.value;
+      reply(res, 200, { current: VERSION, latest: latest && newerVersion(latest, VERSION) ? latest : null });
       return;
     }
     // What a new user still needs: agents installed and logged in, or a local model.

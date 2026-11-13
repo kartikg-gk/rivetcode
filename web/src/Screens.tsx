@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import { ProviderCards } from "./Welcome";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { sessionActions, startSession } from "./actions";
 import { api, runPath, type RunDetail, type RunRow } from "./api";
@@ -199,7 +200,10 @@ function SettingsScreen({ close }: { close(): void }) {
     reload();
   }, `saved ${key}`);
   return (
-    <Modal title="Project settings" wide onClose={close}>
+    <Modal title="Settings" wide onClose={close}>
+      <h3 className="font-medium">Agents on this machine</h3>
+      <ProviderCards />
+      <h3 className="font-medium mt-2">Project settings</h3>
       {!project ? <NoProject /> : <>
         {picker}
         {data && SETTINGS.map((s) => (

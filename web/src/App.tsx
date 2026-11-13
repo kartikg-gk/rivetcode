@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, onConnection, type RunRow } from "./api";
 import { Conversation } from "./Conversation";
 import { Home } from "./Home";
+import { Welcome, welcomed } from "./Welcome";
 import { AskDialog, Palette, Screens } from "./Screens";
 import { ago, repoName, runLabel, useApp, useLive } from "./state";
 
@@ -99,9 +100,25 @@ export function App() {
   const { selected, beside, set, toast } = useApp();
   const [online, setOnline] = useState(true);
   const [sidebar, setSidebar] = useState(() => innerWidth >= 768);
+  const [greeted, setGreeted] = useState(welcomed);
   const list = useLive(() => api<{ runs: RunRow[] }>("GET", "/runs"), []);
+  // A newer release on npm: said once at the top, with the command that updates.
+  const version = useLive(() => api<{ current: string; latest: string | null }>("GET", "/version"), []);
+  const [hideUpdate, setHideUpdate] = useState(false);
+  const newer = version.data?.latest && version.data.latest !== version.data.current ? version.data.latest : null;
+  // First run, with nothing done yet: the welcome page, as t3 opens with.
+  const welcome = !greeted && !!list.data && list.data.runs.length === 0;
   useEffect(() => { if (list.data) set({ runs: list.data.runs }); }, [list.data]);
-  useEffect(() => onConnection(setOnline), []);
+  // Lost only after the live connection stays down for a while: page loads and brief
+  // reconnects say nothing.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stop = onConnection((up) => {
+      if (up) { if (timer) clearTimeout(timer); timer = undefined; setOnline(true); }
+      else timer ??= setTimeout(() => setOnline(false), 3000);
+    });
+    return () => { stop(); if (timer) clearTimeout(timer); };
+  }, []);
   useEffect(() => {
     const count = list.data?.runs.filter(r=>!r.organization.archivedAt && (r.needsAnswer || r.activity === "approval" || r.activity === "asking" || r.organization.unread)).length ?? 0;
     document.title = count ? "("+count+") Rivet · needs attention" : "Rivet";
@@ -123,12 +140,13 @@ export function App() {
   return (
     <div className="h-full flex flex-col">
       {!online && <div role="status" className="bg-danger text-white text-center text-sm py-1">Lost the daemon. Reconnecting… if this stays, run: rivet daemon start</div>}
+      {online && newer && !hideUpdate && <div role="status" className="bg-raised text-center text-sm py-1 px-3">Rivet {newer} is out (you have {version.data!.current}). Update with <code className="mono">rivet update</code> <button className="underline ml-2 cursor-pointer" onClick={() => setHideUpdate(true)}>Dismiss</button></div>}
       <div className="flex-1 flex min-h-0">
         {sidebar ? <Sidebar close={() => setSidebar(false)} /> : (
           <div className="w-11 shrink-0 border-r border-line bg-panel p-1"><button className="icon" title="Show sidebar" aria-label="Show sidebar" onClick={() => setSidebar(true)}><PanelLeft size={16} /></button></div>
         )}
         <main className="flex-1 flex min-w-0 min-h-0">
-          {selected ? <Conversation key={selected} id={selected} /> : <Home />}
+          {welcome && !selected ? <Welcome done={() => setGreeted(true)} /> : selected ? <Conversation key={selected} id={selected} /> : <Home />}
           {selected && beside && beside !== selected && <div className="flex-1 flex min-w-0 border-l border-line"><Conversation key={beside} id={beside} /></div>}
         </main>
       </div>

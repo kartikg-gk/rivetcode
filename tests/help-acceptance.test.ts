@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { runCli, type CliIo } from "../src/cli/commands.js";
 
 // `rivet --help` and `rivet help` must answer without a daemon: a user asking for help may have none running.
-// A bare `rivet` stays a usage error (exit 2) and prints usage to stderr.
+// A bare `rivet` starts the daemon to open the app, as the bare command of the web app does.
 describe("rivet --help", () => {
   function helpIo(out: string[], err: string[], started: { value: boolean }): CliIo {
     return {
@@ -25,20 +25,19 @@ describe("rivet --help", () => {
 
     expect(await runCli([flag], helpIo(out, err, started))).toBe(0);
     const usage = out.join("\n");
-    expect(usage).toMatch(/^usage: rivet <command>/);
+    expect(usage).toMatch(/^usage: rivet /);
     expect(usage).toMatch(/^\s+switch <run> claude\|codex/m);
     expect(usage).toMatch(/^\s+read <run> /m);
     expect(err).toEqual([]);
     expect(started.value).toBe(false);
   });
 
-  it("keeps a bare rivet a usage error that prints usage to stderr", async () => {
+  it("starts the daemon for a bare rivet, to open the app", async () => {
     const out: string[] = [];
     const err: string[] = [];
     const started = { value: false };
 
-    expect(await runCli([], helpIo(out, err, started))).toBe(2);
-    expect(err.join("\n")).toMatch(/usage: rivet/);
-    expect(started.value).toBe(false);
+    expect(await runCli([], helpIo(out, err, started))).toBe(1);
+    expect(started.value).toBe(true);
   });
 });
