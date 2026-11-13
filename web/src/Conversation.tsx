@@ -8,6 +8,7 @@ import Markdown from "react-markdown";
 import { send, sessionActions, type Action } from "./actions";
 import { api, runPath, type Item, type Page, type RunDetail } from "./api";
 import { act, repoName, runLabel, toast, useApp, useLive } from "./state";
+import { Changes, type Turn } from "./Changes";
 
 const SIDE_TABS = ["files", "management", "details", "changes", "terminal", "events", "raw", "branches", "provider"] as const;
 type Side = (typeof SIDE_TABS)[number];
@@ -41,7 +42,7 @@ function useTimeline(id: string, activity: boolean, session: string) {
 
 const WHO: Record<string, string> = { prompt: "Task", message: "You", assistant: "Agent", tool: "Tool", result: "Result", event: "Event" };
 
-function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; task?: string; canEdit: boolean; canFork: boolean }) {
+function Entry({ item, id, task, canEdit, canFork, changed, showChanges }: { item: Item; id: string; task?: string; canEdit: boolean; canFork: boolean; changed?: Turn; showChanges?: (t: Turn) => void }) {
   const [full, setFull] = useState<string>();
   const set = useApp((s) => s.set);
   const text = full ?? item.text;
@@ -85,6 +86,11 @@ function Entry({ item, id, task, canEdit, canFork }: { item: Item; id: string; t
       {mine ? <div className="whitespace-pre-wrap break-words">{item.kind === "prompt" && task && text.includes(task) ? task : text}</div>
         : <div className="prose-agent"><Markdown components={{ a: (p) => <a href={p.href} target="_blank" rel="noreferrer noopener">{p.children}</a> }}>{text}</Markdown></div>}
       {item.continueFrom != null && full === undefined && <button className="btn justify-self-start text-xs" onClick={showAll}>Show all ({item.cut?.length} characters)</button>}
+      {changed && changed.files > 0 && showChanges && (
+        <button className="justify-self-end text-xs text-muted cursor-pointer inline-flex items-center gap-1 hover:text-fg" onClick={() => showChanges(changed)}>
+          <FileDiff size={11} /> {changed.files} {changed.files === 1 ? "file" : "files"} changed <span className="diff-add">+{changed.added}</span> <span className="diff-del">−{changed.removed}</span>
+        </button>
+      )}
     </article>
   );
 }
@@ -272,24 +278,6 @@ function Details({ d }: { d: RunDetail }) {
   );
 }
 
-function Changes({ id }: { id: string }) {
-  const { data, error } = useLive(() => api<{ available: boolean; diff: string; stat: string; untracked: string[]; cut: boolean }>("GET", runPath(id, "/diff")), [id]);
-  if (error) return <p className="p-3 text-danger">{error}</p>;
-  if (!data) return <p className="p-3 text-muted">Loading…</p>;
-  if (!data.available) return <p className="p-3 text-muted">This run's worktree has been removed.</p>;
-  if (!data.diff && data.untracked.length === 0) return <p className="p-3 text-muted">No changes from its base yet.</p>;
-  return (
-    <div className="p-3 grid gap-3 text-xs">
-      {data.untracked.length > 0 && <div><div className="font-medium">New, not yet added</div><pre className="mono whitespace-pre-wrap">{data.untracked.join("\n")}</pre></div>}
-      <pre className="mono whitespace-pre-wrap text-muted">{data.stat}</pre>
-      <pre className="mono overflow-x-auto">{data.diff.split("\n").map((l, i) => (
-        <div key={i} className={l.startsWith("diff ") ? "diff-file mt-3" : l.startsWith("@@") ? "diff-hunk" : l.startsWith("+") ? "diff-add" : l.startsWith("-") ? "diff-del" : ""}>{l || " "}</div>
-      ))}</pre>
-      {data.cut && <p className="text-warn">Too long to show in full.</p>}
-    </div>
-  );
-}
-
 function Lines({ id, tail, field }: { id: string; tail: string; field: string }) {
   const { data, error } = useLive(() => api<Record<string, unknown[]>>("GET", runPath(id, tail)), [id, tail]);
   if (error) return <p className="p-3 text-muted">{error}</p>;
@@ -339,9 +327,16 @@ export function Conversation({ id }: { id: string }) {
   const activity = picked ?? (!!d && d.run.node.runMode !== "chat");
   const [session, setSession] = useState("agent");
   const [side, setSide] = useState<Side | null>(null);
+  const [turn, setTurn] = useState<string | null>(null);
   const [menu, setMenu] = useState(false);
   const { set } = useApp();
   const { items, error: readError } = useTimeline(id, activity, session);
+  // What each prompt's turn changed, from the file checkpoints taken before it.
+  const chatRun = d?.run.node.runMode === "chat";
+  const turnList = useLive(() => (chatRun ? api<{ turns: Turn[] }>("GET", runPath(id, "/turns")) : Promise.resolve({ turns: [] as Turn[] })), [id, chatRun, items.length]);
+  const turns = turnList.data?.turns ?? [];
+  const turnAt = new Map(turns.map((t) => [t.position, t]));
+  const showChanges = (t: Turn) => { setTurn(t.itemId); setSide("changes"); };
   const list = useRef<HTMLDivElement>(null);
   const stuck = useRef(true);
   useEffect(() => {
@@ -387,7 +382,7 @@ export function Conversation({ id }: { id: string }) {
         <div ref={list} onScroll={(e) => { const t = e.currentTarget; stuck.current = t.scrollHeight - t.scrollTop - t.clientHeight < 60; }} className="flex-1 overflow-y-auto" aria-live="off"><div className="w-full max-w-3xl mx-auto p-4 grid grid-cols-[minmax(0,1fr)] gap-4 content-start">
           {readError && <p className="text-danger">{readError}</p>}
           {items.length === 0 && !readError && <p className="text-muted">Nothing recorded yet.</p>}
-          {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} task={d?.run.task} canEdit={chat && session === "agent"} canFork={session === "agent"} />)}
+          {items.map((i) => <Entry key={`${i.position}-${i.at}`} item={i} id={id} task={d?.run.task} canEdit={chat && session === "agent"} canFork={session === "agent"} changed={session === "agent" ? turnAt.get(i.position) : undefined} showChanges={showChanges} />)}
         </div></div>
         {d?.secretRequest && <SecretCard key={d.secretRequest.id} id={id} request={d.secretRequest} />}
         {d?.pendingRequest && <Question id={id} request={d.pendingRequest} />}
@@ -414,7 +409,7 @@ export function Conversation({ id }: { id: string }) {
                     Move to a new worktree
                   </button>)}
             </>}
-            {side === "changes" && <Changes id={id} />}
+            {side === "changes" && <Changes id={id} turns={turns} turn={turn} setTurn={setTurn} />}
             {side === "terminal" && <TerminalPane id={id} session={session} />}
             {side === "events" && <Lines id={id} tail="/events?limit=500" field="events" />}
             {side === "raw" && <Lines id={id} tail="/provider-events?limit=500" field="lines" />}
