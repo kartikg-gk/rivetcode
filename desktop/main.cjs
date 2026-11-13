@@ -4,7 +4,7 @@ const { join } = require('node:path');
 const { promisify } = require('node:util');
 
 const run = promisify(execFile);
-const cli = app.isPackaged ? join(process.resourcesPath, 'runtime', 'node_modules', 'rivet', 'dist', 'cli', 'main.js') : join(__dirname, '..', 'dist', 'cli', 'main.js');
+const cli = app.isPackaged ? join(process.resourcesPath, 'runtime', 'node_modules', 'rivet-code', 'dist', 'cli', 'main.js') : join(__dirname, '..', 'dist', 'cli', 'main.js');
 const node = app.isPackaged ? join(process.resourcesPath, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node') : 'node';
 const smoke = process.env.RIVET_DESKTOP_SMOKE === "1";
 let window;

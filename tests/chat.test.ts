@@ -218,6 +218,8 @@ describe.each([["claude", "acp"], ["codex", "codex"]] as const)("a %s chat sessi
     await api("POST", `/api/v1/sessions/${runId}-agent/send`, { message: "ASK first", mode: "queue" });
     const blocked = await until("the question", async () => { const r = (await api("GET", `/api/v1/runs/${runId}`)).json; return r.run.node.activity === "approval" && r; });
     expect(blocked.pendingRequest).toMatchObject({ detail: "npm publish" });
+    // With no orchestrator to tell, the question shows in the run list for the user to answer.
+    expect((await api("GET", "/api/v1/runs")).json.runs.find((r: { id: string }) => r.id === runId).needsAnswer).toBe(true);
     expect((await api("POST", `/api/v1/runs/${runId}/answer`, { choice: "no", note: "do not publish" })).status).toBeLessThan(300);
     items = await until("the answered turn", async () => { const t = await timeline(runId); return said(t, "do not publish") && t; });
     expect(said(items, "echo: ASK first (declined)")).toBe(true);
