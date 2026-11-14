@@ -55,6 +55,12 @@ function validate(name: string, value: unknown): ObjectValue {
   const tool = mcpTools.find((t) => t.name === name);
   if (!tool) throw new Error(`unknown tool: ${name}`);
   if (!object(value)) throw new Error("arguments must be an object");
+  // Before an agent has loaded the report tool's schema it tends to say status for kind;
+  // taken as meant, so the report does not cost a failed call and a retry.
+  if (name === "rivet_report" && !("kind" in value) && typeof value.status === "string") {
+    const { status, ...rest } = value;
+    return validate(name, { ...rest, kind: status });
+  }
   const properties = tool.inputSchema.properties as Record<string, { type: string; enum?: readonly string[]; minLength?: number; maxLength?: number; minimum?: number; maximum?: number }>;
   for (const key of tool.inputSchema.required) if (!(key in value)) throw new Error(`${key} is required`);
   for (const [key, v] of Object.entries(value)) {

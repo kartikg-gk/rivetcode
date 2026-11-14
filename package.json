@@ -36,7 +36,8 @@
     "zustand": "^5.0.16"
   },
   "bin": {
-    "rivet": "dist/cli/main.js"
+    "rivet": "dist/cli/main.js",
+    "rivet-code": "dist/cli/main.js"
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.96.0",

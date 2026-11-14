@@ -54,6 +54,13 @@ describe("MCP transport", () => {
     expect(r[2].error.message).toBe("initialize first");
     expect(r.slice(5).every((m) => m.result.isError)).toBe(true);
   });
+  it("takes status for kind in a report, as agents send before loading its schema", async () => {
+    const seen: unknown[] = [];
+    const r = await exchange([frame(1, "initialize"), frame(2, "tools/call", { name: "rivet_report", arguments: { status: "done", note: "ok" } })],
+      async (_name, args) => { seen.push(args); return {}; });
+    expect(r[1].result.isError).toBeFalsy();
+    expect(seen).toEqual([{ kind: "done", note: "ok" }]);
+  });
   it("cancels a waiting tool call by request id", async () => {
     const input = new PassThrough(); const replies: any[] = [];
     const served = serveMcp(input, (line) => replies.push(JSON.parse(line)), async (_name, _args, signal) => {
