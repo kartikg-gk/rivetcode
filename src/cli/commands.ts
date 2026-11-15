@@ -4,7 +4,7 @@ import { git } from "../git.js";
 import { projectIdFor } from "../paths.js";
 import { totalTokens, type TokenUse } from "../usage.js";
 import type { Run } from "../store.js";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { readRunFile } from "../runfile.js";
 import type { Probes } from "./doctor.js";
@@ -1083,8 +1083,13 @@ function viaNpx(): boolean {
 
 async function npmRun(args: string[], io: CliIo): Promise<boolean> {
   const { spawn } = await import("node:child_process");
+  // The npm beside the Node running Rivet: for the one-line install that is Rivet's own
+  // Node, so updates land where Rivet is (and need no npm on PATH).
+  const nodeDir = dirname(process.execPath);
+  const cli = [join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"), join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")].find((f) => existsSync(f));
   return new Promise((done) => {
-    const child = spawn(process.platform === "win32" ? "npm.cmd" : "npm", args, { stdio: "inherit", shell: process.platform === "win32" });
+    const child = cli ? spawn(process.execPath, [cli, ...args], { stdio: "inherit" })
+      : spawn(process.platform === "win32" ? "npm.cmd" : "npm", args, { stdio: "inherit", shell: process.platform === "win32" });
     child.on("error", (e) => { io.err(`rivet: npm could not run: ${e.message}`); done(false); });
     child.on("exit", (code) => done(code === 0));
   });
