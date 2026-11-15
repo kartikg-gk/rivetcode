@@ -1132,7 +1132,18 @@ async function uninstall(io: CliIo): Promise<number> {
     await callDaemon(io.env, "POST", "/shutdown", undefined, 10_000).catch(() => {});
   }
   const ok = await npmRun(["uninstall", "-g", PACKAGE], io);
-  io.out(ok ? `Removed the rivet command. Your sessions and settings stay in ${dataDirFrom(io.env)}; delete that folder to remove them too.` : `rivet: npm could not remove ${PACKAGE}; run: npm uninstall -g ${PACKAGE}`);
+  // The one-line installer also made a rivet command outside npm, and a private Node.
+  const { readFile: read, rm } = await import("node:fs/promises");
+  const { homedir } = await import("node:os");
+  const runtime = resolve(dirname(process.execPath), process.platform === "win32" ? "." : "..");
+  const own = /[\\/]\.rivet[\\/]runtime[\\/]node$/i.test(runtime);
+  if (own) {
+    const home = resolve(runtime, "..", "..");
+    for (const wrapper of [join(home, "bin", "rivet.cmd"), join(io.env.RIVET_BIN_DIR ?? join(homedir(), ".local", "bin"), "rivet")]) {
+      if ((await read(wrapper, "utf8").catch(() => "")).includes("installed by the Rivet installer")) await rm(wrapper, { force: true });
+    }
+  }
+  io.out(ok ? `Removed the rivet command.${own ? ` Its private Node stays in ${runtime}; delete that folder to remove it too.` : ""} Your sessions and settings stay in ${dataDirFrom(io.env)}; delete that folder to remove them too.` : `rivet: npm could not remove ${PACKAGE}; run: npm uninstall -g ${PACKAGE}`);
   return ok ? 0 : 1;
 }
 
