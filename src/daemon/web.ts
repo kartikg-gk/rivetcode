@@ -23,7 +23,11 @@ export function allowedRequest(headers: IncomingMessage["headers"]): boolean {
   if (origin === undefined) return true;
   try {
     const url = new URL(origin);
-    return (url.protocol === "http:" || url.protocol === "https:") && LOOPBACK.includes(url.hostname);
+    // Only the page this server itself served: a page on another local port (any other
+    // local web app) is a different site and is refused too.
+    const port = (u: URL) => u.port || (u.protocol === "https:" ? "443" : "80");
+    return (url.protocol === "http:" || url.protocol === "https:") && LOOPBACK.includes(url.hostname)
+      && port(url) === port(new URL(`http://${headers.host}`));
   } catch { return false; }
 }
 

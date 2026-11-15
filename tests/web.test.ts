@@ -22,6 +22,10 @@ describe("who may reach the daemon", () => {
     expect(allowedRequest({ host: "evil.example:4319" })).toBe(false);
     expect(allowedRequest({ host: "127.0.0.1:4319", "sec-fetch-site": "cross-site" })).toBe(false);
     expect(allowedRequest({})).toBe(false);
+    // Another local web app (another port) is another site; the dev proxy keeps its own host and origin.
+    expect(allowedRequest({ host: "127.0.0.1:4319", origin: "http://localhost:3000" })).toBe(false);
+    expect(allowedRequest({ host: "localhost:5173", origin: "http://localhost:5173" })).toBe(true);
+    expect(allowedRequest({ host: "127.0.0.1:4319", origin: "http://127.0.0.1:4319" })).toBe(true);
   });
 
   it("does not start work for a cross-site request", async () => {
