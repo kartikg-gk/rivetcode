@@ -1,2 +1,2 @@
 #!/bin/sh
-exec node --disable-warning=ExperimentalWarning "$(dirname "$0")/../dist/cli/main.js" "$@"
+exec "${RIVET_NODE:-node}" --disable-warning=ExperimentalWarning "$(dirname "$0")/../dist/cli/main.js" "$@"

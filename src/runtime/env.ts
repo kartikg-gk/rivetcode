@@ -52,5 +52,8 @@ export function agentEnv(o: {
     // Agent hooks call "rivet ..."; this makes them reach the daemon that started them,
     // even when another rivet (or none) is on the user's PATH.
     PATH: [rivetBinDir(), currentPath()].filter(Boolean).join(delimiter),
+    // The Node running this daemon: the rivet command an agent types runs on it too, so it works
+    // with no Node (or an older one) on PATH, as after the one-line install.
+    RIVET_NODE: process.execPath,
   };
 }
