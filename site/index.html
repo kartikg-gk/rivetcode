@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rivet: coding agents side by side</title>
+<meta name="description" content="Run Claude Code, Codex and local models on your own machine, each in its own copy of your project, from one app in your browser.">
+<style>
+  :root { --bg: #0d0e10; --panel: #15171a; --line: #262a30; --fg: #e8eaed; --muted: #9aa1ab; --accent: #6aa8ff; --ok: #5fc48a; }
+  @media (prefers-color-scheme: light) { :root { --bg: #fafafa; --panel: #ffffff; --line: #e3e5e8; --fg: #16181b; --muted: #5d6570; --accent: #2563eb; --ok: #1f8a4c; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 72px; display: grid; gap: 40px; }
+  h1 { font-size: clamp(2rem, 6vw, 2.8rem); line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h2 { font-size: 1.15rem; margin: 0 0 12px; }
+  p { margin: 0; color: var(--muted); }
+  .lede { font-size: 1.15rem; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 14px; font: inherit; font-size: 0.9rem; cursor: pointer; }
+  .tabs button[aria-selected="true"] { color: var(--fg); background: var(--panel); border-color: var(--accent); }
+  .cmd { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 12px 12px 16px; }
+  .cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font: 0.92rem ui-monospace, "Cascadia Code", Consolas, monospace; }
+  .cmd button { background: transparent; border: 1px solid var(--line); color: var(--fg); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 0.85rem; }
+  .note { font-size: 0.9rem; margin-top: 8px; }
+  ul { margin: 0; padding-left: 20px; color: var(--muted); display: grid; gap: 6px; }
+  li b { color: var(--fg); font-weight: 600; }
+  a { color: var(--accent); }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.95rem; }
+  footer { color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Rivet</h1>
+    <p class="lede">Run coding agents on your own machine, each in its own copy of your project, and follow their work from one app in your browser. Rivet uses the agents you already have, with their own logins.</p>
+  </header>
+
+  <section aria-labelledby="install">
+    <h2 id="install">Install</h2>
+    <div class="tabs" role="tablist">
+      <button role="tab" data-os="win">Windows</button>
+      <button role="tab" data-os="unix">macOS and Linux</button>
+      <button role="tab" data-os="npm">With Node.js</button>
+    </div>
+    <div class="cmd"><code id="command"></code><button id="copy" type="button">Copy</button></div>
+    <p class="note" id="where"></p>
+    <p class="note">Then run <code>rivet</code>. It opens in your browser and shows what is ready on this machine.</p>
+  </section>
+
+  <section>
+    <h2>What it does</h2>
+    <ul>
+      <li><b>One task, one worktree.</b> Each session gets its own git branch and folder, so agents never write over each other or over you.</li>
+      <li><b>Claude Code, Codex, or a local model.</b> Pick per thread; switch a session to another agent without losing its history.</li>
+      <li><b>See every change.</b> Each prompt shows the files it changed; roll a conversation back, with its files, to any turn.</li>
+      <li><b>Checks before a pull request.</b> Rivet runs your check and tests itself, then pushes and opens the PR; CI failures and review comments go back to the agent.</li>
+      <li><b>Answer from anywhere in the app.</b> Permission questions, queued messages, forks and branches, all in one place.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>What it needs</h2>
+    <ul>
+      <li>git, and a project in a git repository.</li>
+      <li>At least one agent: <a href="https://docs.anthropic.com/en/docs/claude-code/setup">Claude Code</a> (<code>claude auth login</code>) or <a href="https://developers.openai.com/codex/cli">Codex</a> (<code>codex login</code>), or <a href="https://ollama.com">Ollama</a> for local models.</li>
+      <li>Windows, macOS or Linux. The one-line install brings its own Node.js; <code>npx</code> needs Node.js 24.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Desktop app</h2>
+    <p>Prefer an app window? Download it from the <a href="https://github.com/kartikg-gk/rivetcode/releases/latest">latest release</a>. The builds are not signed yet: on Windows choose <i>More info → Run anyway</i>; on macOS run <code>xattr -cr /Applications/Rivet.app</code> once after moving it to Applications.</p>
+  </section>
+
+  <footer class="row">
+    <a href="https://github.com/kartikg-gk/rivetcode">Source</a>
+    <a href="https://github.com/kartikg-gk/rivetcode/releases">Releases</a>
+    <a href="https://www.npmjs.com/package/rivet-code">npm</a>
+    <span>MIT licensed</span>
+  </footer>
+</main>
+<script>
+  const base = location.origin + location.pathname.replace(/[^/]*$/, "");
+  const commands = {
+    win: { cmd: `irm ${base}install.ps1 | iex`, where: "In PowerShell. Installs to your user folder; no administrator rights needed." },
+    unix: { cmd: `curl -fsSL ${base}install.sh | sh`, where: "In a terminal. Installs to ~/.rivet and ~/.local/bin; no sudo needed." },
+    npm: { cmd: "npx rivet-code@latest", where: "Needs Node.js 24 or newer. It offers to install the rivet command for next time." },
+  };
+  const guess = /Win/.test(navigator.platform) ? "win" : "unix";
+  function show(os) {
+    for (const b of document.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.os === os));
+    document.getElementById("command").textContent = commands[os].cmd;
+    document.getElementById("where").textContent = commands[os].where;
+  }
+  for (const b of document.querySelectorAll(".tabs button")) b.addEventListener("click", () => show(b.dataset.os));
+  document.getElementById("copy").addEventListener("click", async (e) => {
+    try { await navigator.clipboard.writeText(document.getElementById("command").textContent); e.target.textContent = "Copied"; setTimeout(() => { e.target.textContent = "Copy"; }, 1500); } catch {}
+  });
+  show(guess);
+</script>
+</body>
+</html>

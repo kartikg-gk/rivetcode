@@ -1,0 +1,64 @@
+name: Installers
+# The one-line installers on each system, as a user runs them: a private Node 24 from
+# nodejs.org, this commit's package, a rivet command, and Rivet answering.
+on:
+  push:
+    paths: ['site/**', 'src/**', 'package.json', 'package-lock.json', '.github/workflows/installers.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Pack this commit
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+          echo "RIVET_PACKAGE=$(ls "$RUNNER_TEMP"/pack/rivet-code-*.tgz)" >> "$GITHUB_ENV"
+      - name: Install (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RIVET_HOME: ${{ runner.temp }}/home with space/.rivet
+          RIVET_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          sh site/install.sh
+          echo "$RIVET_BIN_DIR" >> "$GITHUB_PATH"
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RIVET_HOME: ${{ runner.temp }}\home with space\.rivet
+          RIVET_NO_PATH: '1'
+        run: |
+          ./site/install.ps1
+          "$env:RIVET_HOME\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Rivet answers
+        shell: bash
+        env:
+          RIVET_DATA_DIR: ${{ runner.temp }}/rivet data
+          RIVET_NO_INSTALL_PROMPT: '1'
+        run: |
+          export RIVET_RUN_FILE="$RIVET_DATA_DIR/running.json"
+          rivet=rivet; [ "$RUNNER_OS" = Windows ] && rivet=rivet.cmd
+          $rivet --version
+          $rivet serve > "$RUNNER_TEMP/serve.log" 2>&1 &
+          for i in $(seq 1 60); do [ -f "$RIVET_RUN_FILE" ] && break; sleep 1; done
+          port=$(node -p "require(process.env.RIVET_RUN_FILE).port")
+          curl -fsS "http://127.0.0.1:$port/healthz"
+          curl -fsS "http://127.0.0.1:$port/" | grep -q 'id="root"'
+          curl -fsS "http://127.0.0.1:$port/api/v1/setup" | head -c 300
+          $rivet daemon stop

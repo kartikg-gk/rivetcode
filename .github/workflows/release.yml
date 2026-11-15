@@ -1,0 +1,76 @@
+name: Release
+# Push a tag such as v0.1.0 (matching package.json) to build every desktop installer and
+# attach them, with the update files, to a draft GitHub release. Publishing the draft is
+# left to a person. With an NPM_TOKEN secret, the package also goes to npm as "next".
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Tag matches the version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          desktop=$(node -p "require('./desktop/package.json').version")
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but package.json says $version"; exit 1; }
+          [ "$version" = "$desktop" ] || { echo "desktop/package.json says $desktop, package.json says $version"; exit 1; }
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "Rivet ${GITHUB_REF_NAME#v}" --notes-file site/release-notes.txt
+  desktop:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm --prefix desktop ci
+      - name: Build
+        shell: bash
+        run: |
+          for v in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do unset "$v"; done
+          npm run desktop:package
+      # The installed Windows app must start before anything is published.
+      - if: matrix.os == 'windows-latest'
+        run: npm run smoke:desktop-install
+      - name: Attach to the draft release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(desktop/release/*.exe desktop/release/*.blockmap desktop/release/*.dmg desktop/release/*.zip desktop/release/*.AppImage desktop/release/*.deb desktop/release/latest*.yml)
+          ls -la "${files[@]}"
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+  npm:
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Publish to npm as next
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "No NPM_TOKEN secret: publish by hand with npm publish --tag next"; exit 0; fi
+          npm publish --tag next --provenance --access public

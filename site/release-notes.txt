@@ -1,0 +1,15 @@
+Install
+
+  Windows (PowerShell):   irm https://kartikg-gk.github.io/rivetcode/install.ps1 | iex
+  macOS and Linux:        curl -fsSL https://kartikg-gk.github.io/rivetcode/install.sh | sh
+  With Node.js 24:        npx rivet-code@latest
+
+Then run: rivet   (opens Rivet in your browser)
+
+Desktop app (the files below)
+
+  Windows: Rivet-Setup-<version>.exe. The app is not signed yet: on "Windows protected your PC" choose More info, then Run anyway.
+  macOS: Rivet-<version>-<arch>.dmg. Drag Rivet to Applications, then run once in Terminal: xattr -cr /Applications/Rivet.app
+  Linux: the .deb, or the .AppImage (needs FUSE).
+
+Rivet uses the coding agents you already have: Claude Code or Codex, installed and logged in, or local models through Ollama.
