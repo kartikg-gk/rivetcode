@@ -32,18 +32,27 @@ try {
   New-Item -ItemType Directory -Force -Path $runtime | Out-Null
   Expand-Archive -Path $zip -DestinationPath $tmp -Force
   $unpacked = Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like 'node-v24*' } | Select-Object -First 1
+  $new = $unpacked.FullName
+
+  # Rivet goes into the new copy first; the old one is replaced only once that worked, so a
+  # failed reinstall or update leaves the working install as it was.
+  Write-Host "Installing Rivet ($package)..."
+  & (Join-Path $new 'node.exe') (Join-Path $new 'node_modules\npm\bin\npm-cli.js') install -g --prefix $new --no-audit --no-fund --update-notifier=false --loglevel=error $package
+  if ($LASTEXITCODE -ne 0) { Fail 'npm could not install Rivet; nothing was changed' }
+  if (-not (Test-Path (Join-Path $new 'node_modules\rivet-code\dist\cli\main.js'))) { Fail 'Rivet did not install; nothing was changed' }
+
   # A running Rivet holds node.exe; it is stopped first so the files can be replaced.
   $oldMain = Join-Path $nodeDir 'node_modules\rivet-code\dist\cli\main.js'
-  if (Test-Path $oldMain) { & (Join-Path $nodeDir 'node.exe') $oldMain daemon stop 2>$null | Out-Null }
+  # "not running" on stderr is fine here; Windows PowerShell would otherwise stop on it.
+  if (Test-Path $oldMain) {
+    $ErrorActionPreference = 'Continue'
+    try { & (Join-Path $nodeDir 'node.exe') $oldMain daemon stop 2>&1 | Out-Null } catch { }
+    $ErrorActionPreference = 'Stop'
+  }
   if (Test-Path $nodeDir) { Remove-Item -Recurse -Force $nodeDir }
-  Move-Item $unpacked.FullName $nodeDir
+  Move-Item $new $nodeDir
   $node = Join-Path $nodeDir 'node.exe'
-
-  Write-Host "Installing Rivet ($package)..."
-  & $node (Join-Path $nodeDir 'node_modules\npm\bin\npm-cli.js') install -g --prefix $nodeDir --no-audit --no-fund --update-notifier=false --loglevel=error $package
-  if ($LASTEXITCODE -ne 0) { Fail 'npm could not install Rivet' }
   $main = Join-Path $nodeDir 'node_modules\rivet-code\dist\cli\main.js'
-  if (-not (Test-Path $main)) { Fail 'Rivet did not install' }
 
   $bin = Join-Path $home_ 'bin'
   New-Item -ItemType Directory -Force -Path $bin | Out-Null

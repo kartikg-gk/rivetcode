@@ -50,14 +50,19 @@ node_dir="$RIVET_HOME/runtime/node"
 rm -rf "$node_dir.new"
 mkdir -p "$node_dir.new"
 tar -xzf "$tmp/$file" -C "$node_dir.new" --strip-components=1
+
+# Rivet goes into the new copy first; the old one is replaced only once that worked, so a
+# failed reinstall or update leaves the working install as it was.
+say "Installing Rivet ($PACKAGE)..."
+"$node_dir.new/bin/node" "$node_dir.new/lib/node_modules/npm/bin/npm-cli.js" install -g --prefix "$node_dir.new" --no-audit --no-fund --update-notifier=false --loglevel=error "$PACKAGE"   || { rm -rf "$node_dir.new"; fail "npm could not install Rivet; nothing was changed"; }
+[ -f "$node_dir.new/lib/node_modules/rivet-code/dist/cli/main.js" ] || { rm -rf "$node_dir.new"; fail "Rivet did not install; nothing was changed"; }
+if [ -x "$node_dir/bin/node" ] && [ -f "$node_dir/lib/node_modules/rivet-code/dist/cli/main.js" ]; then
+  "$node_dir/bin/node" "$node_dir/lib/node_modules/rivet-code/dist/cli/main.js" daemon stop >/dev/null 2>&1 || true
+fi
 rm -rf "$node_dir"
 mv "$node_dir.new" "$node_dir"
 node="$node_dir/bin/node"
-
-say "Installing Rivet ($PACKAGE)..."
-"$node" "$node_dir/lib/node_modules/npm/bin/npm-cli.js" install -g --prefix "$node_dir" --no-audit --no-fund --update-notifier=false --loglevel=error "$PACKAGE"
 main="$node_dir/lib/node_modules/rivet-code/dist/cli/main.js"
-[ -f "$main" ] || fail "Rivet did not install"
 
 mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/rivet" <<EOF
