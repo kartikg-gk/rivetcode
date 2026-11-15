@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+// Rivet's store needs Node 24; an older Node would fail later with an obscure error.
+const nodeMajor = Number(process.versions.node.split(".")[0]);
+if (nodeMajor < 24) {
+  process.stderr.write(`Rivet needs Node.js 24 or newer; this is Node ${process.versions.node}.\nInstall the current Node from https://nodejs.org (or: nvm install 24), then run this again.\n`);
+  process.exit(1);
+}
 // Install before loading commands: their imports may initialize node:sqlite.
 const emitWarning = process.emitWarning;
 process.emitWarning = ((warning: string | Error, ...args: unknown[]) => {
