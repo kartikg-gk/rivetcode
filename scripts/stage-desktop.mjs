@@ -19,7 +19,7 @@ const result = execFileSync(process.execPath, [npm, "pack", "--json", "--ignore-
   cwd: root, windowsHide: true, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
 });
 const [{ filename }] = JSON.parse(result);
-execFileSync(process.execPath, [npm, "install", "--prefix", runtime, join(temporary, filename), "--omit=optional", "--no-audit", "--no-fund"], {
+execFileSync(process.execPath, [npm, "install", "--prefix", runtime, join(temporary, filename), "--no-audit", "--no-fund"], {
   cwd: root, windowsHide: true, stdio: "inherit",
 });
 

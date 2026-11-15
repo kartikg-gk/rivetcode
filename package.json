@@ -7,7 +7,7 @@
   },
   "scripts": {
     "prepare": "npm run build",
-    "build": "tsc -p tsconfig.build.json && node -e \"require('node:fs').copyFileSync('src/agents/fake-agent.mjs','dist/agents/fake-agent.mjs')\" && vite build --config web/vite.config.ts",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node -e \"require('node:fs').copyFileSync('src/agents/fake-agent.mjs','dist/agents/fake-agent.mjs')\" && vite build --config web/vite.config.ts",
     "dev:web": "vite --config web/vite.config.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
@@ -42,7 +42,6 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.96.0",
     "mammoth": "1.13.0",
-    "node-pty": "^1.1.0",
     "pdf-parse": "2.4.5",
     "ws": "^8.22.1",
     "yaml": "^2.9.1"
@@ -56,5 +55,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kartikg-gk/rivetcode.git"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   }
 }
