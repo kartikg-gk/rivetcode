@@ -1,2 +1,4 @@
 bin/rivet text eol=lf
 *.sh text eol=lf
+*.sh text eol=lf
+bin/* text eol=lf
