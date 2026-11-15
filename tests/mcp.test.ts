@@ -60,6 +60,10 @@ describe("MCP transport", () => {
       async (_name, args) => { seen.push(args); return {}; });
     expect(r[1].result.isError).toBeFalsy();
     expect(seen).toEqual([{ kind: "done", note: "ok" }]);
+    const flagged: unknown[] = [];
+    await exchange([frame(1, "initialize"), frame(2, "tools/call", { name: "rivet_report", arguments: { done: "true", note: "ok" } })],
+      async (_name, args) => { flagged.push(args); return {}; });
+    expect(flagged).toEqual([{ kind: "done", note: "ok" }]);
   });
   it("cancels a waiting tool call by request id", async () => {
     const input = new PassThrough(); const replies: any[] = [];

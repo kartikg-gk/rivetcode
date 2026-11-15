@@ -57,9 +57,17 @@ function validate(name: string, value: unknown): ObjectValue {
   if (!object(value)) throw new Error("arguments must be an object");
   // Before an agent has loaded the report tool's schema it tends to say status for kind;
   // taken as meant, so the report does not cost a failed call and a retry.
-  if (name === "rivet_report" && !("kind" in value) && typeof value.status === "string") {
-    const { status, ...rest } = value;
-    return validate(name, { ...rest, kind: status });
+  if (name === "rivet_report" && !("kind" in value)) {
+    if (typeof value.status === "string") {
+      const { status, ...rest } = value;
+      return validate(name, { ...rest, kind: status });
+    }
+    // Or the kind as a flag, as the rivet report command line spells it: {"done": true}.
+    const flag = ["done", "blocked", "question"].find((k) => value[k] === true || value[k] === "true");
+    if (flag) {
+      const { done: _d, blocked: _b, question: _q, ...rest } = value;
+      return validate(name, { ...rest, kind: flag });
+    }
   }
   const properties = tool.inputSchema.properties as Record<string, { type: string; enum?: readonly string[]; minLength?: number; maxLength?: number; minimum?: number; maximum?: number }>;
   for (const key of tool.inputSchema.required) if (!(key in value)) throw new Error(`${key} is required`);
